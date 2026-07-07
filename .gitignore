@@ -1,0 +1,18 @@
+# Build artifacts
+zig-out/
+.zig-cache/
+*.o
+*.obj
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large binary files (use releases instead)
+*.iso
