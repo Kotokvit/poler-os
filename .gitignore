@@ -1,0 +1,30 @@
+# Build artifacts
+zig-cache/
+zig-out/
+*.o
+*.bin
+*.iso
+*.elf
+.zig-cache/
+
+# Tools (install separately)
+tools/
+download/
+upload/
+
+# Secrets - NEVER commit
+.env
+*.pem
+*.key
+*.secret
+credentials.json
+gdrive_page.json
+
+# OS / IDE
+.DS_Store
+.vscode/
+*.swp
+
+# Dependencies
+node_modules/
+skills/
