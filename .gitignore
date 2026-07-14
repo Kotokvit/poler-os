@@ -1,0 +1,111 @@
+# ============================================================================
+# POLER-OS .gitignore — Только исходный код ядра принадлежит этому репо
+# ============================================================================
+
+# Build artifacts
+zig-out/
+.zig-cache/
+.zig-cache-dbg/
+*.o
+*.obj
+*.elf
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Binary files — НИКОГДА не пушить (используйте GitHub Releases)
+*.iso
+*.img
+*.qcow2
+*.snapshot
+*.zip
+*.deb
+*.rpm
+*.vdi
+*.vmdk
+*.ppm
+*.png
+*.jpg
+*.gif
+*.bmp
+*.pdf
+*.epub
+
+# Logs
+*.log
+serial_*.txt
+serial-*.log
+
+# Prebuilt kernel binaries (собираются из исходников!)
+poler-os64
+poler-os64-debug
+poler-os32
+poler-debug
+poler-test
+poler-os-boot.elf
+core.img
+eltorito.img
+*.EFI
+disk.img
+
+# QEMU
+qemu-extracted/
+qemu-static/
+qemu-capture/
+
+# Download / Upload
+download/
+upload/
+
+# Workspace / sandbox — НИКОГДА не пушить
+.env
+.env.local
+worklog.md
+tool-results/
+scripts/
+skills/
+node_modules/
+__pycache__/
+*.pyc
+.zscripts/
+Caddyfile
+bun.lock
+components.json
+db/
+
+# Non-project directories — НИКОГДА не пушить
+file-explorer/
+fpga/
+rust-core/
+verification/
+reference/
+drafts/
+docs/
+
+# ISO build dirs (пересоздаются при каждой сборке)
+iso_build/
+iso_final/
+iso2/
+iso3/
+iso64/
+
+# Prebuilt kernel binaries in ISO dirs
+zig-kernel/iso/boot/poler-os
+zig-kernel/iso/boot/poler-os64
+zig-kernel/iso/boot/initrd.cpio
+zig-kernel/iso-efi/boot/poler-os
+zig-kernel/iso-minimal/boot/poler-os
+
+# Initrd temp
+initrd_tmp/
+
+# Temporary / backup
+*.tmp
+*.bak
