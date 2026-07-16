@@ -109,3 +109,18 @@ initrd_tmp/
 # Temporary / backup
 *.tmp
 *.bak
+
+# === ЗАЩИТА ОТ МУСОРА — НИКОГДА не пушить ===
+# Субмодули / вложенные копии репо
+poler-os-clean/
+poler-os-work/
+poler-os/
+
+# Сессионный мусор AI-агентов
+poler-os-valuable/
+agent-ctx/
+super-z-skills/
+
+# Security scan artifacts
+secret_scanning.json
+pentest_report.json

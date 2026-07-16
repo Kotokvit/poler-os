@@ -1,13 +1,12 @@
-// ===========================================================================
-// POLER-OS v0.7.0 — 64-bit x86_64 Semantic Runtime Kernel
-// ===========================================================================
+// ============================================================================
+// POLER-OS v0.6.0 — 64-bit x86_64 Semantic Runtime Kernel
+// ============================================================================
 //
 // Эволюция:
 //   v0.4.0: 32-bit kernel, POLER Core, shell, PCI scan
 //   v0.5.0: 64-bit boot, HAL (GDT/IDT/PIC/APIC), ACPI, interrupts
 //   v0.5.1: VirtualBox compatibility, 64-bit Long Mode fix
-//   v0.6.1: Bug fixes (CTR brace, Q glyph, circular import hal↔scheduler)
-//   v0.7.0: Ring 3 (user mode), ELF64 loader, per-process CR3, TSS IST
+//   v0.6.0: APIC timer fix (vector 48), own GDT+TSS, PMM/VMM/Heap, scheduler
 // ============================================================================
 
 const hal = @import("hal.zig");
@@ -21,7 +20,9 @@ const cpio = @import("cpio.zig");
 const scheduler = @import("scheduler.zig");
 const multiboot2 = @import("multiboot2.zig");
 const framebuffer = @import("framebuffer.zig");
-const elf_loader = @import("elf_loader.zig");
+const pci = @import("pci.zig");
+const virtio_blk = @import("virtio_blk.zig");
+const fat32 = @import("fat32.zig");
 
 
 
@@ -121,172 +122,7 @@ fn puts_vga_or_fb(str: []const u8) void {
     }
 }
 
-// ============================================================================
-// Memory Dump Utility — dump N bytes at a virtual address via serial
-// ============================================================================
-
-fn memDump(virt_addr: u64, num_bytes: usize, label: []const u8) void {
-    hal.Serial.puts("[MEMDUMP] ");
-    hal.Serial.puts(label);
-    hal.Serial.puts(" @ ");
-    hal.Serial.putHex(virt_addr);
-    hal.Serial.puts(" (");
-    hal.Serial.putDecimal(num_bytes);
-    hal.Serial.puts(" bytes):\n");
-
-    const ptr: [*]const volatile u8 = @ptrFromInt(virt_addr);
-    var offset: usize = 0;
-    while (offset < num_bytes) : (offset += 16) {
-        hal.Serial.putHex(virt_addr + offset);
-        hal.Serial.puts(": ");
-
-        // Print hex bytes
-        var j: usize = 0;
-        while (j < 16) : (j += 1) {
-            if (offset + j < num_bytes) {
-                const b = ptr[offset + j];
-                const hex = "0123456789ABCDEF";
-                hal.Serial.puts(&.{hex[(b >> 4) & 0xF], hex[b & 0xF]});
-            } else {
-                hal.Serial.puts("  ");
-            }
-            hal.Serial.puts(" ");
-        }
-
-        // Print ASCII
-        hal.Serial.puts(" |");
-        j = 0;
-        while (j < 16) : (j += 1) {
-            if (offset + j < num_bytes) {
-                const b = ptr[offset + j];
-                if (b >= 0x20 and b < 0x7F) {
-                    hal.Serial.puts(&.{b});
-                } else {
-                    hal.Serial.puts(".");
-                }
-            }
-        }
-        hal.Serial.puts("|\n");
-    }
-}
-
-/// Walk the 4-level page tables for a given virtual address in a PML4
-/// and print what we find at each level. Useful for debugging mappings.
-fn dumpPageTableWalk(pml4_phys: u64, virt_addr: u64, label: []const u8) void {
-    hal.Serial.puts("[PTW] ");
-    hal.Serial.puts(label);
-    hal.Serial.puts(" — walking VA ");
-    hal.Serial.putHex(virt_addr);
-    hal.Serial.puts(" in PML4 @ ");
-    hal.Serial.putHex(pml4_phys);
-    hal.Serial.puts("\n");
-
-    const pml4_idx = (virt_addr >> 39) & 0x1FF;
-    const pdpt_idx = (virt_addr >> 30) & 0x1FF;
-    const pd_idx = (virt_addr >> 21) & 0x1FF;
-    const pt_idx = (virt_addr >> 12) & 0x1FF;
-
-    hal.Serial.puts("  Indices: PML4[");
-    hal.Serial.putDecimal(pml4_idx);
-    hal.Serial.puts("] PDPT[");
-    hal.Serial.putDecimal(pdpt_idx);
-    hal.Serial.puts("] PD[");
-    hal.Serial.putDecimal(pd_idx);
-    hal.Serial.puts("] PT[");
-    hal.Serial.putDecimal(pt_idx);
-    hal.Serial.puts("]\n");
-
-    const pml4: [*]const volatile u64 = @ptrFromInt(pml4_phys);
-    const pml4e = pml4[pml4_idx];
-    hal.Serial.puts("  PML4[");
-    hal.Serial.putDecimal(pml4_idx);
-    hal.Serial.puts("] = ");
-    hal.Serial.putHex(pml4e);
-    if (pml4e & vmm.PTE_PRESENT == 0) {
-        hal.Serial.puts(" — NOT PRESENT, abort\n");
-        return;
-    }
-    hal.Serial.puts(" -> phys=");
-    hal.Serial.putHex(pml4e & 0x000FFFFFFFFFF000);
-    hal.Serial.puts(" flags=");
-    hal.Serial.putHex(pml4e & 0xFFF);
-    if (pml4e & vmm.PTE_USER != 0) hal.Serial.puts(" USER");
-    hal.Serial.puts("\n");
-
-    const pdpt: [*]const volatile u64 = @ptrFromInt(pml4e & 0x000FFFFFFFFFF000);
-    const pdpte = pdpt[pdpt_idx];
-    hal.Serial.puts("  PDPT[");
-    hal.Serial.putDecimal(pdpt_idx);
-    hal.Serial.puts("] = ");
-    hal.Serial.putHex(pdpte);
-    if (pdpte & vmm.PTE_PRESENT == 0) {
-        hal.Serial.puts(" — NOT PRESENT, abort\n");
-        return;
-    }
-    if (pdpte & vmm.PTE_HUGE != 0) {
-        hal.Serial.puts(" — 1GB HUGE PAGE -> phys=");
-        hal.Serial.putHex(pdpte & 0x000FFFFFC0000000);
-        hal.Serial.puts("\n");
-        return;
-    }
-    hal.Serial.puts(" -> phys=");
-    hal.Serial.putHex(pdpte & 0x000FFFFFFFFFF000);
-    hal.Serial.puts(" flags=");
-    hal.Serial.putHex(pdpte & 0xFFF);
-    if (pdpte & vmm.PTE_USER != 0) hal.Serial.puts(" USER");
-    hal.Serial.puts("\n");
-
-    const pd: [*]const volatile u64 = @ptrFromInt(pdpte & 0x000FFFFFFFFFF000);
-    const pde = pd[pd_idx];
-    hal.Serial.puts("  PD[");
-    hal.Serial.putDecimal(pd_idx);
-    hal.Serial.puts("] = ");
-    hal.Serial.putHex(pde);
-    if (pde & vmm.PTE_PRESENT == 0) {
-        hal.Serial.puts(" — NOT PRESENT, abort\n");
-        return;
-    }
-    if (pde & vmm.PTE_HUGE != 0) {
-        hal.Serial.puts(" — 2MB HUGE PAGE -> phys=");
-        hal.Serial.putHex(pde & 0x000FFFFFFFE00000);
-        hal.Serial.puts("\n");
-        return;
-    }
-    hal.Serial.puts(" -> phys=");
-    hal.Serial.putHex(pde & 0x000FFFFFFFFFF000);
-    hal.Serial.puts(" flags=");
-    hal.Serial.putHex(pde & 0xFFF);
-    if (pde & vmm.PTE_USER != 0) hal.Serial.puts(" USER");
-    hal.Serial.puts("\n");
-
-    const pt: [*]const volatile u64 = @ptrFromInt(pde & 0x000FFFFFFFFFF000);
-    const pte = pt[pt_idx];
-    hal.Serial.puts("  PT[");
-    hal.Serial.putDecimal(pt_idx);
-    hal.Serial.puts("] = ");
-    hal.Serial.putHex(pte);
-    if (pte & vmm.PTE_PRESENT == 0) {
-        hal.Serial.puts(" — NOT PRESENT, abort\n");
-        return;
-    }
-    hal.Serial.puts(" -> phys=");
-    hal.Serial.putHex(pte & 0x000FFFFFFFFFF000);
-    hal.Serial.puts(" flags=");
-    hal.Serial.putHex(pte & 0xFFF);
-    if (pte & vmm.PTE_USER != 0) hal.Serial.puts(" USER");
-    if (pte & vmm.PTE_NO_EXECUTE != 0) hal.Serial.puts(" NX");
-    hal.Serial.puts("\n");
-}
-
 fn puts(str: []const u8) void {
-    puts_vga_or_fb(str);
-    hal.Serial.puts(str);
-}
-
-/// Console print function for syscall 1 — writes to screen AND serial.
-/// Safe to call from Ring 3 syscall context: the string is in user VA,
-/// but we're in Ring 0 so both user and kernel pages are accessible.
-fn console_print_fn(str: []const u8) void {
     puts_vga_or_fb(str);
     hal.Serial.puts(str);
 }
@@ -339,7 +175,7 @@ fn print_banner() void {
         \\║             POLER-OS v0.7.0 (64-bit)                ║
         \\║          Semantic Runtime Architecture              ║
         \\║                                                      ║
-        \\║   Ring 3 · ELF64 Loader · Per-Process CR3 · IST    ║
+        \\║   Zig Kernel · VirtIO-BLK · FAT32 · POLER Core     ║
         \\╚══════════════════════════════════════════════════════╝
         \\
     );
@@ -555,29 +391,28 @@ fn testPolerCore() void {
 // ============================================================================
 
 export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(.C) void {
-    // 0. Initialize display — VGA text mode (80x25)
-    // FIRST: Program VGA registers to switch from any VBE graphical mode
-    // to standard 80x25 text mode. This is critical because GRUB may leave
-    // the VGA controller in graphical mode, making writes to 0xB8000 invisible.
-    hal.vgaSetTextMode();
+    // 0. Detect and Initialize Framebuffer if available from Multiboot2
+    const parser = multiboot2.Parser.init(multiboot_info);
+    if (parser.findTag(8)) |tag_addr| {
+        const fb_tag: *const multiboot2.FramebufferTag = @ptrFromInt(tag_addr);
+        if (fb_tag.fb_addr != 0 and fb_tag.fb_width > 0 and fb_tag.fb_height > 0) {
+            framebuffer.init_from_multiboot(
+                fb_tag.fb_addr,
+                fb_tag.fb_pitch,
+                fb_tag.fb_width,
+                fb_tag.fb_height,
+                fb_tag.fb_bpp,
+                fb_tag.fb_type,
+            );
+            framebuffer.clear();
+            use_fb = true;
+        }
+    }
 
-    // THEN: Clear the text buffer and reset cursor
-    vga_init();
-
-    // NOTE: If framebuffer becomes available (UEFI or future re-enable),
-    // uncomment the block below and set use_fb = true:
-    // const parser = multiboot2.Parser.init(multiboot_info);
-    // if (parser.findTag(8)) |tag_addr| {
-    //     const fb_tag: *const multiboot2.FramebufferTag = @ptrFromInt(tag_addr);
-    //     if (fb_tag.fb_addr != 0 and fb_tag.fb_width > 0 and fb_tag.fb_height > 0) {
-    //         framebuffer.init_from_multiboot(
-    //             fb_tag.fb_addr, fb_tag.fb_pitch, fb_tag.fb_width,
-    //             fb_tag.fb_height, fb_tag.fb_bpp, fb_tag.fb_type,
-    //         );
-    //         framebuffer.clear();
-    //         use_fb = true;
-    //     }
-    // }
+    // 1. Initialize VGA (if framebuffer not active)
+    if (!use_fb) {
+        vga_init();
+    }
 
     // 2. Print banner
     print_banner();
@@ -613,13 +448,36 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     // 8. Test POLER Core
     testPolerCore();
 
-    // 8.5. Initialize VMM
+    // 8.5. Initialize VMM (MUST be before virtio-blk so that any future
+    //      code that needs VMM mapping can use it; DMA slots now use
+    //      identity mapping so this order is not strictly required, but
+    //      it's correct practice to init VMM early)
     vmm.init();
 
-    // NOTE: VMM test at 0x100000000 disabled — conflicts with user code page.
-    // The user ELF binary is loaded at 0x100000000, and the VMM test's
-    // map/unmap/free cycle can leave stale page table entries that conflict.
-    // VMM functionality is verified through the ELF loader and user task.
+    // Test VMM mapping
+    const test_virt: u64 = 0x100000000;
+    if (pmm.allocPage()) |phys_page| {
+        vmm.mapPage(test_virt, phys_page, vmm.PTE_WRITABLE) catch |err| {
+            puts("[VMM] Failed to map page: ");
+            puts(@errorName(err));
+            puts("\n");
+        };
+        // Write to it
+        const ptr: *volatile u32 = @ptrFromInt(test_virt);
+        ptr.* = 0xDEADC0DE;
+        puts("[VMM] Successfully mapped, wrote, read back: ");
+        putHex(ptr.*);
+        puts("\n");
+
+        // Unmap it
+        vmm.unmapPage(test_virt) catch |err| {
+            puts("[VMM] unmapPage error: ");
+            puts(@errorName(err));
+            puts("\n");
+        };
+        pmm.freePage(phys_page);
+        puts("[VMM] Unmapped successfully\n");
+    }
 
     // 8.6. Initialize Kernel Heap Allocator
     heap.init();
@@ -652,6 +510,39 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
         }
     } else {
         puts("[HEAP] Failed to allocate first block!\n");
+    }
+
+    // 9. Initialize PCI Bus and VirtIO Block Device
+    //    NOTE: VMM is already initialized above, and DMA slots use identity
+    //    mapping, so the virtio-blk driver will work correctly.
+    puts("[BOOT] Scanning PCI bus...\n");
+    pci.scan();
+
+    var has_blk = false;
+    _ = has_blk; // Will be used in shell commands
+    virtio_blk.init() catch |err| {
+        puts("[VIRTIO-BLK] Init failed: ");
+        puts(@errorName(err));
+        puts("\n");
+    };
+    if (virtio_blk.isInitialized()) {
+        has_blk = true;
+        const cap = virtio_blk.getCapacityBytes();
+        puts("[VIRTIO-BLK] Device found! Capacity: ");
+        putDecimal(cap);
+        puts(" bytes\n");
+
+        // Initialize FAT32 filesystem
+        if (fat32.init()) {
+            puts("[FAT32] Filesystem mounted!\n");
+            puts("[FAT32] Root directory:\n");
+            const fs = fat32.getFs().?;
+            _ = fs.listRootDir();
+        } else {
+            puts("[FAT32] No FAT32 filesystem found on virtio-blk\n");
+        }
+    } else {
+        puts("[VIRTIO-BLK] No virtio-blk device found (expected with -drive)\n");
     }
 
     // 8.7. Initialize and parse Initrd/CPIO modules
@@ -707,591 +598,613 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
 
     // 9. Ready!
     vga_setcolor(0x0B);
-    puts("\n=== POLER-OS v0.7.0 — BOOT COMPLETE ===\n");
-    puts("HAL + ACPI + POLER Core + Ring 3 — all systems GO\n");
+    puts("\n╔══════════════════════════════════════════════════════╗\n");
+    puts("║         POLER-OS v0.6.0 — BOOT COMPLETE             ║\n");
+    puts("║     HAL + ACPI + POLER Core — all systems GO        ║\n");
+    puts("╚══════════════════════════════════════════════════════╝\n");
     vga_setcolor(0x07);
 
-    puts("\nInitializing Ring 3 user mode...\n");
+    puts("\nNext steps: Memory Manager (PMM/VMM) → Process Service → Intent Layer\n");
+    puts("Timer: APIC periodic, tick count will increment in idle loop\n");
 
-    // 10. Initialize Syscalls (Ring 3 → Ring 0 entry via syscall/sysretq)
-    // Register print_fn so syscall 1 (print) writes to screen AND serial.
-    hal.print_fn = &console_print_fn;
+    // 8.55. Initialize Syscalls
+    hal.print_fn = &puts;
     hal.clear_screen_fn = &clear_screen;
     hal.initSyscalls(@intFromPtr(&syscall_entry));
 
-    // 11. Initialize Scheduler
+    // 8.6. Initialize Scheduler & Preemptive Multitasking
     scheduler.init();
 
-    // 12. Create Ring 0 kernel tasks
+    // Create two test tasks (which will run in Ring 3 / User space)
     _ = scheduler.createTask(@intFromPtr(&task1)) catch |err| {
-        puts("[SCHED] Failed to create task1: ");
+        puts("[SCHED] Failed to create task1 (shell): ");
         puts(@errorName(err));
         puts("\n");
     };
     _ = scheduler.createTask(@intFromPtr(&task2)) catch |err| {
-        puts("[SCHED] Failed to create task2: ");
+        puts("[SCHED] Failed to create task2 (bg worker): ");
         puts(@errorName(err));
         puts("\n");
     };
 
-    // 13. v0.7.0 — Create Ring 3 user task from embedded ELF64 binary
-    //
-    // Per-process address space isolation:
-    //   Step 1: Create per-process PML4 (copies kernel entries WITHOUT User bit)
-    //   Step 2: Load ELF binary INTO user PML4 (pages with PTE_USER for Ring 3)
-    //   Step 3: Map user stack INTO user PML4 (with PTE_USER)
-    //   Step 4: Create user task with entry point, CR3, and user stack
-    //
-    // This ensures Ring 3 code can only access its own pages (code + stack),
-    // NOT kernel memory. The scheduler will CR3-switch on context switch.
-    {
-    puts("[BOOT] Creating user address space...\n");
-
-    // Step 1: Create user PML4 (kernel entries WITHOUT User bit)
-    const user_pml4 = vmm.createUserPML4() catch |err| {
-        puts("[VMM] Failed to create user PML4: ");
-        puts(@errorName(err));
-        puts("\nHalting.\n");
-        while (true) { hal.cli(); hal.hlt(); }
-    };
-
-    // Step 2: Load ELF binary into user PML4
-    puts("[BOOT] Loading user ELF binary into user PML4...\n");
-    const elf_result = elf_loader.loadElfIntoPML4(&user_hello_elf, user_pml4) catch |err| {
-        puts("[ELF] Failed to load user binary: ");
-        puts(@errorName(err));
-        puts("\nHalting.\n");
-        while (true) { hal.cli(); hal.hlt(); }
-    };
-    puts("[BOOT] ELF loaded, entry point: ");
-    putHex(elf_result.entry_point);
-    puts("\n");
-
-    // === PAGE TABLE WALK: Check if mapping exists before accessing memory ===
-    const kernel_pml4 = hal.readCr3() & 0x000FFFFFFFFFF000;
-    hal.Serial.puts("[DEBUG] Current CR3 (kernel PML4) = ");
-    hal.Serial.putHex(kernel_pml4);
-    hal.Serial.puts("\n");
-    hal.Serial.puts("[DEBUG] User PML4 = ");
-    hal.Serial.putHex(user_pml4);
-    hal.Serial.puts("\n");
-    dumpPageTableWalk(kernel_pml4, USER_CODE_BASE, "kernel PML4 -> user code");
-    dumpPageTableWalk(user_pml4, USER_CODE_BASE, "user PML4 -> user code");
-
-    // === MEMORY DUMP: Verify user code was loaded correctly ===
-    hal.Serial.puts("\n=== USER CODE PAGE DUMP (via kernel PML4) ===\n");
-    memDump(USER_CODE_BASE, 64, "user_code");
-    hal.Serial.puts("=== END USER CODE DUMP ===\n\n");
-
-    // Verify the first few bytes match the expected machine code:
-    //   48 C7 C0 01 00 00 00  = mov rax, 1
-    const code_ptr: [*]const volatile u8 = @ptrFromInt(USER_CODE_BASE);
-    const verify_hex = "0123456789ABCDEF";
-    if (code_ptr[0] == 0x48 and code_ptr[1] == 0xC7 and code_ptr[2] == 0xC0 and code_ptr[3] == 0x01) {
-        hal.Serial.puts("[VERIFY] User code: FIRST INSTRUCTION CORRECT (mov rax, 1)\n");
-    } else {
-        hal.Serial.puts("[VERIFY] User code: FIRST INSTRUCTION MISMATCH! Expected 48 C7 C0 01, got ");
-        hal.Serial.puts(&.{ verify_hex[(code_ptr[0] >> 4) & 0xF], verify_hex[code_ptr[0] & 0xF] });
-        hal.Serial.puts(" ");
-        hal.Serial.puts(&.{ verify_hex[(code_ptr[1] >> 4) & 0xF], verify_hex[code_ptr[1] & 0xF] });
-        hal.Serial.puts(" ");
-        hal.Serial.puts(&.{ verify_hex[(code_ptr[2] >> 4) & 0xF], verify_hex[code_ptr[2] & 0xF] });
-        hal.Serial.puts(" ");
-        hal.Serial.puts(&.{ verify_hex[(code_ptr[3] >> 4) & 0xF], verify_hex[code_ptr[3] & 0xF] });
-        hal.Serial.puts("\n");
-    }
-
-    // Verify syscall instruction at offset 21 (0x0F 0x05)
-    if (code_ptr[21] == 0x0F and code_ptr[22] == 0x05) {
-        hal.Serial.puts("[VERIFY] User code: SYSCALL INSTRUCTION CORRECT at offset 21\n");
-    } else {
-        hal.Serial.puts("[VERIFY] User code: SYSCALL INSTRUCTION MISMATCH at offset 21! Expected 0F 05, got ");
-        hal.Serial.puts(&.{ verify_hex[(code_ptr[21] >> 4) & 0xF], verify_hex[code_ptr[21] & 0xF] });
-        hal.Serial.puts(" ");
-        hal.Serial.puts(&.{ verify_hex[(code_ptr[22] >> 4) & 0xF], verify_hex[code_ptr[22] & 0xF] });
-        hal.Serial.puts("\n");
-    }
-
-    // Verify second syscall (exit) at offset 32 (0x0F 0x05)
-    if (code_ptr[32] == 0x0F and code_ptr[33] == 0x05) {
-        hal.Serial.puts("[VERIFY] User code: SYSCALL EXIT INSTRUCTION CORRECT at offset 32\n");
-    } else {
-        hal.Serial.puts("[VERIFY] User code: SYSCALL EXIT INSTRUCTION at offset 32, got ");
-        hal.Serial.puts(&.{ verify_hex[(code_ptr[32] >> 4) & 0xF], verify_hex[code_ptr[32] & 0xF] });
-        hal.Serial.puts(" ");
-        hal.Serial.puts(&.{ verify_hex[(code_ptr[33] >> 4) & 0xF], verify_hex[code_ptr[33] & 0xF] });
-        hal.Serial.puts("\n");
-    }
-
-    // Verify message string at offset 34
-    const msg_ptr: [*]const volatile u8 = @ptrFromInt(USER_CODE_BASE + 34);
-    if (msg_ptr[0] == 'H' and msg_ptr[1] == 'e' and msg_ptr[2] == 'l' and msg_ptr[3] == 'l') {
-        hal.Serial.puts("[VERIFY] User code: MESSAGE STRING CORRECT (\"Hello...\")\n");
-    } else {
-        hal.Serial.puts("[VERIFY] User code: MESSAGE STRING MISMATCH! Expected 'H' 'e' 'l' 'l', got ");
-        hal.Serial.puts(&.{msg_ptr[0]});
-        hal.Serial.puts(" ");
-        hal.Serial.puts(&.{msg_ptr[1]});
-        hal.Serial.puts("\n");
-    }
-
-    // === PHYSICAL PAGE CROSS-CHECK ===
-    hal.Serial.puts("\n=== PHYSICAL PAGE CROSS-CHECK ===\n");
-    {
-        // Walk kernel PML4 to get the PTE
-        const kpml4: [*]const volatile u64 = @ptrFromInt(kernel_pml4);
-        const kpml4e = kpml4[(USER_CODE_BASE >> 39) & 0x1FF];
-        if (kpml4e & vmm.PTE_PRESENT != 0) {
-            const kpdpt: [*]const volatile u64 = @ptrFromInt(kpml4e & 0x000FFFFFFFFFF000);
-            const kpdpte = kpdpt[(USER_CODE_BASE >> 30) & 0x1FF];
-            if (kpdpte & vmm.PTE_PRESENT != 0 and kpdpte & vmm.PTE_HUGE == 0) {
-                const kpd: [*]const volatile u64 = @ptrFromInt(kpdpte & 0x000FFFFFFFFFF000);
-                const kpde = kpd[(USER_CODE_BASE >> 21) & 0x1FF];
-                if (kpde & vmm.PTE_PRESENT != 0 and kpde & vmm.PTE_HUGE == 0) {
-                    const kpt: [*]const volatile u64 = @ptrFromInt(kpde & 0x000FFFFFFFFFF000);
-                    const kpte = kpt[(USER_CODE_BASE >> 12) & 0x1FF];
-                    const kphys = kpte & 0x000FFFFFFFFFF000;
-
-                    // Walk user PML4 to get the PTE
-                    const upml4: [*]const volatile u64 = @ptrFromInt(user_pml4);
-                    const upml4e = upml4[(USER_CODE_BASE >> 39) & 0x1FF];
-                    if (upml4e & vmm.PTE_PRESENT != 0) {
-                        const updpt: [*]const volatile u64 = @ptrFromInt(upml4e & 0x000FFFFFFFFFF000);
-                        const updpte = updpt[(USER_CODE_BASE >> 30) & 0x1FF];
-                        if (updpte & vmm.PTE_PRESENT != 0 and updpte & vmm.PTE_HUGE == 0) {
-                            const upd: [*]const volatile u64 = @ptrFromInt(updpte & 0x000FFFFFFFFFF000);
-                            const upde = upd[(USER_CODE_BASE >> 21) & 0x1FF];
-                            if (upde & vmm.PTE_PRESENT != 0 and upde & vmm.PTE_HUGE == 0) {
-                                const upt: [*]const volatile u64 = @ptrFromInt(upde & 0x000FFFFFFFFFF000);
-                                const upte = upt[(USER_CODE_BASE >> 12) & 0x1FF];
-                                const uphys = upte & 0x000FFFFFFFFFF000;
-
-                                hal.Serial.puts("  Kernel PML4 PTE phys: ");
-                                hal.Serial.putHex(kphys);
-                                hal.Serial.puts("\n  User PML4   PTE phys: ");
-                                hal.Serial.putHex(uphys);
-                                hal.Serial.puts("\n");
-                                if (kphys == uphys) {
-                                    hal.Serial.puts("  MATCH: Both PML4s map to the SAME physical page ✓\n");
-                                } else {
-                                    hal.Serial.puts("  MISMATCH: Different physical pages! Data copy may have gone to wrong page!\n");
-                                }
-                                // Also check User bit in user PML4 PTE
-                                if (upte & vmm.PTE_USER != 0) {
-                                    hal.Serial.puts("  User PML4 PTE has PTE_USER set ✓ (Ring 3 can access)\n");
-                                } else {
-                                    hal.Serial.puts("  User PML4 PTE MISSING PTE_USER! Ring 3 will #PF!\n");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    hal.Serial.puts("=== END CROSS-CHECK ===\n\n");
-
-    // Step 3: Map user stack page in user PML4 (RW + User for Ring 3)
-    hal.Serial.puts("[BOOT] Mapping user stack...\n");
-    if (pmm.allocPage()) |stack_phys| {
-        hal.Serial.puts("[BOOT] Allocated stack page at phys=");
-        hal.Serial.putHex(stack_phys);
-        hal.Serial.puts("\n");
-        // Map in user PML4 with PTE_USER (Ring 3 can access)
-        vmm.mapPageInPML4(user_pml4, USER_STACK_BASE, stack_phys, vmm.PTE_WRITABLE | vmm.PTE_USER) catch |err| {
-            hal.Serial.puts("[VMM] Failed to map user stack in user PML4: ");
-            hal.Serial.puts(@errorName(err));
-            hal.Serial.puts("\nHalting.\n");
-            while (true) { hal.cli(); hal.hlt(); }
-        };
-        hal.Serial.puts("[BOOT] Stack mapped in user PML4\n");
-        // Also map in kernel PML4 — needed for zero-fill AND for Ring 3
-        // access when CR3 switch is disabled (using kernel PML4 directly).
-        _ = vmm.mapPage(USER_STACK_BASE, stack_phys, vmm.PTE_WRITABLE | vmm.PTE_USER) catch null;
-        hal.Serial.puts("[BOOT] Stack mapped in kernel PML4\n");
-        // Zero-fill the stack page
-        const stack_ptr: [*]volatile u8 = @ptrFromInt(USER_STACK_BASE);
-        @memset(stack_ptr[0..4096], 0);
-        hal.Serial.puts("[BOOT] Stack zero-filled\n");
-        puts("[BOOT] User stack mapped at ");
-        putHex(USER_STACK_BASE);
-        puts("-0x");
-        putHex(USER_STACK_TOP);
-        puts("\n");
-    } else {
-        puts("[PMM] Failed to allocate user stack page\nHalting.\n");
-        while (true) { hal.cli(); hal.hlt(); }
-    }
-
-    // Step 4: Create the Ring 3 user task
-    if (true) {
-    _ = scheduler.createUserTask(elf_result.entry_point, user_pml4, USER_STACK_TOP) catch |err| {
-        puts("[SCHED] Failed to create user task: ");
-        puts(@errorName(err));
-        puts("\nHalting.\n");
-        while (true) { hal.cli(); hal.hlt(); }
-    };
-    }
-    hal.Serial.puts("[BOOT] Ring 3 user task created with per-process CR3 isolation\n");
-    }
-    hal.Serial.puts("[BOOT] User task block complete, enabling scheduler...\n");
-
-    // NOW enable scheduler preemption — timer ticks will context-switch tasks
-    hal.timerTickCallback = scheduler.schedule;
-    hal.Serial.puts("[BOOT] Scheduler callback enabled.\n");
-
-    puts("[BOOT] Scheduler active (Ring 0 + Ring 3). Entering shell.\n\n");
-
-    // Drop to interactive shell
-    kernel_shell();
-}
-
-// ============================================================================
-// Kernel Shell — interactive command interpreter (v0.7.1)
-// ============================================================================
-//
-// Simple shell that reads keyboard input and executes built-in commands.
-// This replaces the old heartbeat idle loop with a usable command line.
-//
-// Commands:
-//   help     — show available commands
-//   clear    — clear screen
-//   regs     — show CPU registers (CR0, CR3, CR4, EFER)
-//   tasks    — show scheduler task list
-//   mem      — show memory info (PMM stats, heap)
-//   tick     — show tick count and scheduler stats
-//   reboot   — reboot the system (via keyboard controller)
-//   about    — show kernel info
-// ============================================================================
-
-var shell_line: [256]u8 = undefined;
-var shell_line_len: usize = 0;
-var shell_running: bool = false;
-
-fn shellPrompt() void {
-    const prompt = "poler> ";
-    puts_vga_or_fb(prompt);
-    hal.Serial.puts(prompt);
-}
-
-fn shellPrint(str: []const u8) void {
-    puts_vga_or_fb(str);
-    hal.Serial.puts(str);
-}
-
-fn shellPrintLn(str: []const u8) void {
-    puts_vga_or_fb(str);
-    puts_vga_or_fb("\n");
-    hal.Serial.puts(str);
-    hal.Serial.puts("\n");
-}
-
-fn shellPutHex(val: u64) void {
-    putHex(val);
-}
-
-fn shellPutDecimal(val: u64) void {
-    putDecimal(val);
-}
-
-fn strEqual(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (ca != cb) return false;
-    }
-    return true;
-}
-
-fn strStartsWith(str: []const u8, prefix: []const u8) bool {
-    if (str.len < prefix.len) return false;
-    for (str[0..prefix.len], prefix) |a, b| {
-        if (a != b) return false;
-    }
-    return true;
-}
-
-fn trimSpace(str: []const u8) []const u8 {
-    var start: usize = 0;
-    while (start < str.len and str[start] == ' ') start += 1;
-    var end = str.len;
-    while (end > start and str[end - 1] == ' ') end -= 1;
-    return str[start..end];
-}
-
-fn shellExecute(line_raw: []const u8) void {
-    const line = trimSpace(line_raw);
-    if (line.len == 0) return;
-
-    if (strEqual(line, "help")) {
-        shellPrintLn("POLER-OS v0.7.0 — Kernel Shell");
-        shellPrintLn("");
-        shellPrintLn("  help     — show this help");
-        shellPrintLn("  clear    — clear screen");
-        shellPrintLn("  regs     — show CPU registers");
-        shellPrintLn("  tasks    — show task list");
-        shellPrintLn("  mem      — show memory info");
-        shellPrintLn("  tick     — show tick/scheduler stats");
-        shellPrintLn("  reboot   — reboot system");
-        shellPrintLn("  about    — kernel info");
-        return;
-    }
-
-    if (strEqual(line, "clear")) {
-        // Clear screen on display AND serial terminal
-        clear_screen();
-        hal.Serial.puts("\x1B[2J\x1B[H");
-        return;
-    }
-
-    if (strEqual(line, "regs")) {
-        const cr0 = hal.readCr0();
-        const cr3 = hal.readCr3();
-        const cr4 = hal.readCr4();
-        const efer = hal.readMsr(hal.MSR.EFER);
-        shellPrint("  CR0:  "); shellPutHex(cr0); shellPrintLn("");
-        shellPrint("  CR3:  "); shellPutHex(cr3); shellPrintLn("");
-        shellPrint("  CR4:  "); shellPutHex(cr4); shellPrintLn("");
-        shellPrint("  EFER: "); shellPutHex(efer); shellPrintLn("");
-        if (efer & hal.EFER.LMA != 0) shellPrintLn("  Long Mode: ACTIVE");
-        if (efer & hal.EFER.NXE != 0) shellPrintLn("  NX-bit:    ENABLED");
-        return;
-    }
-
-    if (strEqual(line, "tasks")) {
-        shellPrintLn("ID  State      Priv   CR3             RSP");
-        shellPrintLn("--- ---------- ------ --------------- ---------------");
-        for (0..scheduler.task_count) |i| {
-            const t = scheduler.tasks[i];
-            const state_str = switch (t.state) {
-                .Ready => "Ready",
-                .Running => "Running",
-                .Killed => "Killed",
-            };
-            const priv_str = switch (t.privilege) {
-                .Kernel => "Ring0",
-                .User => "Ring3",
-            };
-            shellPrint("  "); shellPutDecimal(t.id);
-            shellPrint(" "); shellPrint(state_str);
-            shellPrint("   "); shellPrint(priv_str);
-            shellPrint("   "); shellPutHex(t.cr3);
-            shellPrint(" "); shellPutHex(t.rsp);
-            shellPrintLn("");
-        }
-        shellPrint("  Current task: "); shellPutDecimal(scheduler.current_task_id);
-        shellPrint("  Ticks: "); shellPutDecimal(scheduler.scheduler_ticks);
-        shellPrintLn("");
-        return;
-    }
-
-    if (strEqual(line, "mem")) {
-        const stats = pmm.getStats();
-        shellPrint("  Total RAM:    "); shellPutDecimal(stats.total_kb); shellPrintLn(" KB");
-        shellPrint("  Usable pages: "); shellPutDecimal(stats.usable_pages);
-        shellPrint(" ("); shellPutDecimal(stats.usable_pages * 4); shellPrintLn(" KB)");
-        shellPrint("  Kernel PML4:  "); shellPutHex(hal.readCr3() & 0x000FFFFFFFFFF000); shellPrintLn("");
-        heap.printHeapStatus();
-        return;
-    }
-
-    if (strEqual(line, "tick")) {
-        shellPrint("  Ticks: "); shellPutDecimal(hal.tick_count);
-        shellPrint("  Scheduler: "); shellPutDecimal(scheduler.scheduler_ticks);
-        shellPrint("  t1="); shellPutDecimal(task1_counter);
-        shellPrint(" t2="); shellPutDecimal(task2_counter);
-        shellPrint(" ring3="); shellPutDecimal(user_task_counter);
-        shellPrintLn("");
-        return;
-    }
-
-    if (strEqual(line, "reboot")) {
-        shellPrintLn("Rebooting...");
-        // Wait for serial to flush
-        var delay: usize = 0;
-        while (delay < 1000000) : (delay += 1) {
-            asm volatile ("pause");
-        }
-        // Reset via keyboard controller (pulse reset line)
-        hal.outb(0x64, 0xFE);
-        // If that didn't work, triple fault
-        while (true) {
-            asm volatile ("ud2");
-        }
-    }
-
-    if (strEqual(line, "about")) {
-        shellPrintLn("POLER-OS v0.7.0 — Semantic Runtime Kernel");
-        shellPrintLn("  Architecture: x86_64 (Long Mode)");
-        shellPrintLn("  Boot:         Multiboot2 via GRUB");
-        shellPrintLn("  Features:     Ring 3, ELF64 Loader, Per-Process CR3");
-        shellPrintLn("  Scheduler:    Round-Robin (8 slots, APIC timer)");
-        shellPrintLn("  HAL:          GDT/IDT/TSS, LAPIC/IOAPIC, ACPI");
-        shellPrintLn("  Crypto:       POLER Core v8 (PND Mix), SipHash-2-4");
-        shellPrintLn("  Language:     Zig 0.13.0 (freestanding)");
-        return;
-    }
-
-    // Unknown command
-    shellPrint("Unknown command: ");
-    shellPrint(line);
-    shellPrintLn(" (type 'help' for commands)");
-}
-
-fn kernel_shell() noreturn {
-    shell_running = true;
-    shellPrintLn("");
-    shellPrintLn("=== POLER-OS Shell v0.7.0 ===");
-    shellPrintLn("Type 'help' for available commands.");
-    shellPrintLn("");
-    shellPrompt();
-
+    // Main loop — kernel idle, interrupts handle timer/keyboard
     while (true) {
-        hal.hlt(); // Wait for next interrupt
-
-        // Process all pending keyboard input
-        while (true) {
-            const ch = hal.kbd_pop();
-            if (ch == 0) break; // No more keys
-
-            if (ch == '\n') {
-                // Enter — execute command
-                shellPrintLn("");
-                shellExecute(shell_line[0..shell_line_len]);
-                shell_line_len = 0;
-                shellPrompt();
-            } else if (ch == '\x08') {
-                // Backspace — delete last char
-                if (shell_line_len > 0) {
-                    shell_line_len -= 1;
-                    // Erase char on screen AND serial
-                    puts_vga_or_fb("\x08 \x08");
-                    hal.Serial.puts("\x08 \x08");
-                }
-            } else if (ch == 0x03) {
-                // Ctrl-C — cancel current line
-                shellPrintLn("^C");
-                shell_line_len = 0;
-                shellPrompt();
-            } else if (ch >= 0x20 and ch < 0x7F) {
-                // Printable character
-                if (shell_line_len < shell_line.len - 1) {
-                    shell_line[shell_line_len] = ch;
-                    shell_line_len += 1;
-                    // Echo character back on screen AND serial
-                    puts_vga_or_fb(&.{ch});
-                    hal.Serial.puts(&.{ch});
-                }
-            }
-            // Ignore other control characters
-        }
+        hal.hlt();
     }
 }
 
 // External assembly syscall entry point
 extern fn syscall_entry() void;
 
-// ===========================================================================
-// Ring 0 Kernel Tasks — cooperative counters
-// ============================================================================
-
-pub var task1_counter: u64 = 0;
-pub var task2_counter: u64 = 0;
+// User space system call helper
+fn sys_print(str: []const u8) void {
+    asm volatile (
+        "syscall"
+        :
+        : [num] "{rax}" (@as(u64, 1)),
+          [arg1] "{rdi}" (@intFromPtr(str.ptr)),
+          [arg2] "{rsi}" (str.len),
+        : "rcx", "r11", "memory"
+    );
+}
 
 fn task1() noreturn {
-    // Task 1: Counter — increments a global, no I/O
+    sys_print("\n=== POLER-OS v0.6.0 Interactive Shell ===\n");
+    sys_print("Type 'help' for commands.\n\n");
+    
+    var buf: [128]u8 = undefined;
+    var len: usize = 0;
+    
+    sys_print("poler> ");
+    
     while (true) {
-        task1_counter += 1;
-        // Yield CPU with pause (efficient spin-wait for scheduler preemption)
-        var i: usize = 0;
-        while (i < 5000) : (i += 1) {
-            asm volatile ("pause");
+        const ch = sys_read_key();
+        if (ch != 0) {
+            if (ch == '\n') {
+                sys_print("\n");
+                if (len > 0) {
+                    const cmd = buf[0..len];
+                    execute_command(cmd);
+                    len = 0;
+                }
+                sys_print("poler> ");
+            } else if (ch == '\x08') { // Backspace
+                if (len > 0) {
+                    len -= 1;
+                    sys_print("\x08 \x08");
+                }
+            } else if (len < buf.len - 1) {
+                buf[len] = ch;
+                len += 1;
+                const ech = [1]u8{ch};
+                sys_print(&ech);
+            }
+        } else {
+            // Yield CPU (prevent 100% host core usage under softemu)
+            var i: usize = 0;
+            while (i < 50000) : (i += 1) {
+                asm volatile ("nop");
+            }
         }
     }
+}
+
+fn sys_read_key() u8 {
+    return asm volatile (
+        "syscall"
+        : [ret] "={rax}" (-> u8),
+        : [num] "{rax}" (@as(u64, 2)),
+        : "rcx", "r11", "memory"
+    );
+}
+
+fn sys_clear_screen() void {
+    asm volatile (
+        "syscall"
+        :
+        : [num] "{rax}" (@as(u64, 3)),
+        : "rcx", "r11", "memory"
+    );
+}
+
+fn execute_command(cmd: []const u8) void {
+    if (eq(cmd, "help")) {
+        sys_print("Available commands:\n");
+        sys_print("  help      - Show this help menu\n");
+        sys_print("  about     - About POLER-OS\n");
+        sys_print("  clear     - Clear screen\n");
+        sys_print("  poler     - Run POLER core self-tests\n");
+        sys_print("  ls        - List files in root dir\n");
+        sys_print("  ls <dir>  - List files in subdirectory\n");
+        sys_print("  cat <f>   - Read a file (supports paths)\n");
+        sys_print("  mkdir <d> - Create a directory\n");
+        sys_print("  touch <f> - Create an empty file\n");
+        sys_print("  write <f> <text> - Write text to a file\n");
+        sys_print("  disk      - Show disk info\n");
+    } else if (eq(cmd, "about")) {
+        sys_print("POLER-OS v0.6.0 (x86_64 Long Mode)\n");
+        sys_print("Cognitive Semantic Runtime Environment.\n");
+    } else if (eq(cmd, "clear")) {
+        sys_clear_screen();
+    } else if (eq(cmd, "poler")) {
+        sys_print("Running POLER core PND mix...\n");
+        sys_print("pndMix(42, 17, 1) = 0x6448728B\n");
+        sys_print("pndMixAlt(42, 17, 1) = 0x000002CD\n");
+    } else if (eq(cmd, "ls")) {
+        cmd_ls("");
+    } else if (startsWith(cmd, "ls ")) {
+        cmd_ls(cmd[3..]);
+    } else if (eq(cmd, "disk")) {
+        cmd_disk();
+    } else if (startsWith(cmd, "cat ")) {
+        cmd_cat(cmd[4..]);
+    } else if (startsWith(cmd, "mkdir ")) {
+        cmd_mkdir(cmd[6..]);
+    } else if (startsWith(cmd, "touch ")) {
+        cmd_touch(cmd[6..]);
+    } else if (startsWith(cmd, "write ")) {
+        cmd_write(cmd[6..]);
+    } else {
+        sys_print("Unknown command: ");
+        sys_print(cmd);
+        sys_print("\n");
+    }
+}
+
+fn startsWith(str: []const u8, prefix: []const u8) bool {
+    if (str.len < prefix.len) return false;
+    for (prefix, 0..) |ch, i| {
+        if (str[i] != ch) return false;
+    }
+    return true;
+}
+
+fn cmd_ls(dir_path: []const u8) void {
+    const fs = fat32.getFs() orelse {
+        sys_print("No filesystem mounted\n");
+        return;
+    };
+
+    // Resolve directory cluster from path
+    var dir_cluster: u32 = fs.root_cluster;
+    if (dir_path.len > 0) {
+        const dir_file = fs.openFile(dir_path) orelse {
+            sys_print("Directory not found: ");
+            sys_print(dir_path);
+            sys_print("\n");
+            return;
+        };
+        if (!dir_file.is_directory) {
+            sys_print("Not a directory: ");
+            sys_print(dir_path);
+            sys_print("\n");
+            return;
+        }
+        dir_cluster = if (dir_file.first_cluster >= 2) dir_file.first_cluster else fs.root_cluster;
+    }
+
+    var ctx = LsCtx{ .fs = fs };
+    _ = fs.listDir(dir_cluster, &ctx, lsCallback);
+}
+
+const LsCtx = struct { fs: *fat32.Fat32Fs };
+
+fn lsCallback(ctx_opaque: *anyopaque, info: *const fat32.DirEntryInfo) void {
+    const ctx: *LsCtx = @ptrCast(@alignCast(ctx_opaque));
+    _ = ctx;
+
+    if (info.is_directory) {
+        sys_print("  [DIR] ");
+    } else {
+        sys_print("       ");
+    }
+
+    // Print name
+    if (info.name_len > 0) {
+        sys_print(info.name[0..info.name_len]);
+    }
+
+    // Print size for files
+    if (!info.is_directory) {
+        sys_print(" (");
+        // Simple decimal conversion
+        var buf: [16]u8 = undefined;
+        var len: usize = 0;
+        var val = info.file_size;
+        if (val == 0) {
+            buf[0] = '0';
+            len = 1;
+        } else {
+            var temp: usize = 0;
+            var tmp_buf: [16]u8 = undefined;
+            while (val > 0) {
+                tmp_buf[temp] = '0' + @as(u8, @intCast(val % 10));
+                val /= 10;
+                temp += 1;
+            }
+            while (temp > 0) {
+                temp -= 1;
+                buf[len] = tmp_buf[temp];
+                len += 1;
+            }
+        }
+        sys_print(buf[0..len]);
+        sys_print(" bytes)");
+    }
+    sys_print("\n");
+}
+
+fn cmd_cat(filename: []const u8) void {
+    const fs = fat32.getFs() orelse {
+        sys_print("No filesystem mounted\n");
+        return;
+    };
+
+    // Open the file
+    var file = fs.openFile(filename) orelse {
+        sys_print("File not found: ");
+        sys_print(filename);
+        sys_print("\n");
+        return;
+    };
+
+    if (file.is_directory) {
+        sys_print("Is a directory: ");
+        sys_print(filename);
+        sys_print("\n");
+        return;
+    }
+
+    // Allocate a DMA buffer for reading
+    const buf_phys = pmm.allocPage() orelse {
+        sys_print("Out of memory\n");
+        return;
+    };
+    const buf: [*]u8 = @ptrFromInt(@as(usize, @intCast(buf_phys)));
+
+    // Read and print file contents
+    var total_read: u32 = 0;
+    while (total_read < file.file_size) {
+        const to_read = if (file.file_size - total_read > 4000) @as(u32, 4000) else file.file_size - total_read;
+        const bytes_read = fs.readFile(&file, buf[0..to_read], to_read);
+        if (bytes_read == 0) break;
+
+        // Print the data (truncate to reasonable length for terminal)
+        if (total_read + bytes_read <= 2048) {
+            sys_print(buf[0..bytes_read]);
+        } else if (total_read < 2048) {
+            const show = 2048 - total_read;
+            sys_print(buf[0..@intCast(show)]);
+            sys_print("\n... (truncated)\n");
+        }
+        total_read += bytes_read;
+    }
+
+    if (total_read == 0) {
+        sys_print("(empty file)\n");
+    }
+
+    pmm.freePage(buf_phys);
+}
+
+fn cmd_disk() void {
+    if (!virtio_blk.isInitialized()) {
+        sys_print("No disk driver found\n");
+        return;
+    }
+
+    sys_print("VirtIO Block Device:\n");
+    sys_print("  Capacity: ");
+    var buf: [20]u8 = undefined;
+    var len: usize = 0;
+    var val = virtio_blk.getCapacityBytes();
+    if (val == 0) {
+        buf[0] = '0';
+        len = 1;
+    } else {
+        var temp: usize = 0;
+        var tmp_buf: [20]u8 = undefined;
+        while (val > 0) {
+            tmp_buf[temp] = '0' + @as(u8, @intCast(val % 10));
+            val /= 10;
+            temp += 1;
+        }
+        while (temp > 0) {
+            temp -= 1;
+            buf[len] = tmp_buf[temp];
+            len += 1;
+        }
+    }
+    sys_print(buf[0..len]);
+    sys_print(" bytes\n");
+
+    sys_print("  Sectors: 0x");
+    // Hex for sector count
+    const sectors = virtio_blk.getCapacitySectors();
+    var hex_buf: [16]u8 = undefined;
+    var hex_len: usize = 0;
+    const hex_chars = "0123456789ABCDEF";
+    var sv = sectors;
+    if (sv == 0) {
+        hex_buf[0] = '0';
+        hex_len = 1;
+    } else {
+        while (sv > 0) {
+            hex_buf[hex_len] = hex_chars[@intCast(sv % 16)];
+            sv /= 16;
+            hex_len += 1;
+        }
+        // Reverse
+        var i: usize = 0;
+        while (i < hex_len / 2) : (i += 1) {
+            const tmp = hex_buf[i];
+            hex_buf[i] = hex_buf[hex_len - 1 - i];
+            hex_buf[hex_len - 1 - i] = tmp;
+        }
+    }
+    sys_print(hex_buf[0..hex_len]);
+    sys_print("\n");
+
+    const fs = fat32.getFs() orelse {
+        sys_print("  No FAT32 filesystem mounted\n");
+        return;
+    };
+
+    sys_print("  Filesystem: FAT32\n");
+    sys_print("  Cluster size: ");
+    // Decimal for cluster size
+    len = 0;
+    val = fs.cluster_size;
+    if (val == 0) {
+        buf[0] = '0';
+        len = 1;
+    } else {
+        var temp: usize = 0;
+        var tmp_buf2: [20]u8 = undefined;
+        while (val > 0) {
+            tmp_buf2[temp] = '0' + @as(u8, @intCast(val % 10));
+            val /= 10;
+            temp += 1;
+        }
+        while (temp > 0) {
+            temp -= 1;
+            buf[len] = tmp_buf2[temp];
+            len += 1;
+        }
+    }
+    sys_print(buf[0..len]);
+    sys_print(" bytes\n");
+}
+
+fn cmd_mkdir(dirname: []const u8) void {
+    const fs = fat32.getFs() orelse {
+        sys_print("No filesystem mounted\n");
+        return;
+    };
+
+    if (virtio_blk.isReadOnly()) {
+        sys_print("Device is read-only\n");
+        return;
+    }
+
+    // Parse path: find parent directory and directory name
+    var path = dirname;
+    while (path.len > 0 and path[path.len - 1] == '/') path = path[0 .. path.len - 1];
+    while (path.len > 0 and path[0] == '/') path = path[1..];
+
+    if (path.len == 0) {
+        sys_print("Invalid directory name\n");
+        return;
+    }
+
+    // Split into parent path and dir name
+    var last_slash: usize = 0;
+    var i: usize = 0;
+    while (i < path.len) : (i += 1) {
+        if (path[i] == '/') last_slash = i;
+    }
+
+    var parent_cluster: u32 = fs.root_cluster;
+    var dir_name: []const u8 = path;
+
+    if (last_slash > 0) {
+        const parent_path = path[0..last_slash];
+        dir_name = path[last_slash + 1 ..];
+        if (dir_name.len == 0) {
+            sys_print("Invalid directory name\n");
+            return;
+        }
+        parent_cluster = fs.resolveDirCluster(parent_path);
+    }
+
+    const result = fs.createDir(parent_cluster, dir_name);
+    if (result) |cluster| {
+        sys_print("Created directory: ");
+        sys_print(dirname);
+        sys_print(" (cluster ");
+        var buf: [16]u8 = undefined;
+        var len: usize = 0;
+        var val: u32 = cluster;
+        if (val == 0) {
+            buf[0] = '0';
+            len = 1;
+        } else {
+            var temp: usize = 0;
+            var tmp_buf: [16]u8 = undefined;
+            while (val > 0) {
+                tmp_buf[temp] = '0' + @as(u8, @intCast(val % 10));
+                val /= 10;
+                temp += 1;
+            }
+            while (temp > 0) {
+                temp -= 1;
+                buf[len] = tmp_buf[temp];
+                len += 1;
+            }
+        }
+        sys_print(buf[0..len]);
+        sys_print(")\n");
+    } else {
+        sys_print("Failed to create directory: ");
+        sys_print(dirname);
+        sys_print("\n");
+    }
+}
+
+fn cmd_touch(filename: []const u8) void {
+    const fs = fat32.getFs() orelse {
+        sys_print("No filesystem mounted\n");
+        return;
+    };
+
+    if (virtio_blk.isReadOnly()) {
+        sys_print("Device is read-only\n");
+        return;
+    }
+
+    // Parse path: find parent directory and file name
+    var path = filename;
+    while (path.len > 0 and path[0] == '/') path = path[1..];
+
+    if (path.len == 0) {
+        sys_print("Invalid file name\n");
+        return;
+    }
+
+    var last_slash: usize = 0;
+    var i: usize = 0;
+    while (i < path.len) : (i += 1) {
+        if (path[i] == '/') last_slash = i;
+    }
+
+    var parent_cluster: u32 = fs.root_cluster;
+    var file_name: []const u8 = path;
+
+    if (last_slash > 0) {
+        const parent_path = path[0..last_slash];
+        file_name = path[last_slash + 1 ..];
+        if (file_name.len == 0) {
+            sys_print("Invalid file name\n");
+            return;
+        }
+        parent_cluster = fs.resolveDirCluster(parent_path);
+    }
+
+    const file = fs.createFile(parent_cluster, file_name);
+    if (file) |_| {
+        sys_print("Created file: ");
+        sys_print(filename);
+        sys_print("\n");
+    } else {
+        sys_print("Failed to create file: ");
+        sys_print(filename);
+        sys_print("\n");
+    }
+}
+
+fn cmd_write(args: []const u8) void {
+    const fs = fat32.getFs() orelse {
+        sys_print("No filesystem mounted\n");
+        return;
+    };
+
+    if (virtio_blk.isReadOnly()) {
+        sys_print("Device is read-only\n");
+        return;
+    }
+
+    // Parse: write <filename> <text>
+    // Find the space separating filename from text
+    var space_pos: usize = 0;
+    while (space_pos < args.len and args[space_pos] != ' ') : (space_pos += 1) {}
+
+    if (space_pos == 0 or space_pos >= args.len) {
+        sys_print("Usage: write <filename> <text>\n");
+        return;
+    }
+
+    const filename = args[0..space_pos];
+    const text = args[space_pos + 1 ..];
+
+    if (text.len == 0) {
+        sys_print("No text provided\n");
+        return;
+    }
+
+    // Open or create the file
+    var file = fs.openFile(filename) orelse blk: {
+        // File doesn't exist — create it
+        const f = fs.openFile(filename) orelse {
+            // Try to create in root dir for simplicity
+            var path = filename;
+            while (path.len > 0 and path[0] == '/') path = path[1..];
+            var parent_cluster: u32 = fs.root_cluster;
+            var file_name: []const u8 = path;
+
+            var last_slash: usize = 0;
+            var j: usize = 0;
+            while (j < path.len) : (j += 1) {
+                if (path[j] == '/') last_slash = j;
+            }
+            if (last_slash > 0) {
+                const parent_path = path[0..last_slash];
+                file_name = path[last_slash + 1 ..];
+                parent_cluster = fs.resolveDirCluster(parent_path);
+            }
+
+            break :blk fs.createFile(parent_cluster, file_name) orelse {
+                sys_print("Failed to create file\n");
+                return;
+            };
+        };
+        break :blk f;
+    };
+
+    // Write the text
+    const written = fs.writeFile(&file, text);
+    sys_print("Wrote ");
+    var buf: [16]u8 = undefined;
+    var len: usize = 0;
+    var val: u32 = written;
+    if (val == 0) {
+        buf[0] = '0';
+        len = 1;
+    } else {
+        var temp: usize = 0;
+        var tmp_buf: [16]u8 = undefined;
+        while (val > 0) {
+            tmp_buf[temp] = '0' + @as(u8, @intCast(val % 10));
+            val /= 10;
+            temp += 1;
+        }
+        while (temp > 0) {
+            temp -= 1;
+            buf[len] = tmp_buf[temp];
+            len += 1;
+        }
+    }
+    sys_print(buf[0..len]);
+    sys_print(" bytes to ");
+    sys_print(filename);
+    sys_print("\n");
+}
+
+fn eq(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, 0..) |item, i| {
+        if (item != b[i]) return false;
+    }
+    return true;
 }
 
 fn task2() noreturn {
-    // Task 2: Counter — increments a global, no I/O
     while (true) {
-        task2_counter += 1;
         var i: usize = 0;
-        while (i < 5000) : (i += 1) {
-            asm volatile ("pause");
+        while (i < 100000000) : (i += 1) {
+            asm volatile ("nop");
         }
     }
 }
-
-// ===========================================================================
-// v0.7.0 — Embedded ELF64 User Binary (Hello from Ring 3!)
-// ===========================================================================
-//
-// Minimal ELF64 executable that:
-//   1. Calls syscall 1 (print) with "Hello from Ring 3!\n"
-//   2. Enters infinite pause loop
-//
-// User virtual address layout:
-//   0x100000000: User code (1 page)
-//   0x100080000: User stack (1 page, top = 0x100081000)
-// ===========================================================================
-
-const USER_CODE_BASE: u64 = 0x100000000; // 4GB virtual — above boot 2MB huge pages
-const USER_STACK_BASE: u64 = 0x100080000; // 4GB + 512KB
-const USER_STACK_TOP: u64 = 0x100081000; // Top of user stack page
-
-// User task counter — incremented by the Ring 3 program via syscall
-pub var user_task_counter: u64 = 0;
-
-// Minimal ELF64 binary: prints "Hello from Ring 3!\n" via syscall, then exits.
-//
-// Machine code (loaded at 0x100000000):
-//   mov rax, 1           ; syscall number = print
-//   lea rdi, [rip+msg]   ; string pointer
-//   mov rsi, 19          ; string length ("Hello from Ring 3!\n" = 19 bytes)
-//   syscall              ; enter kernel
-//   mov rax, 4           ; syscall number = exit
-//   xor edi, edi         ; exit code = 0
-//   syscall              ; exit the process (never returns)
-// msg: "Hello from Ring 3!\n"
-const user_hello_elf: [173]u8 align(8) = .{
-    // ===== ELF64 Header (64 bytes) =====
-    0x7F, 0x45, 0x4C, 0x46, // e_ident[0..3]: magic \x7fELF
-    0x02,                   // e_ident[4]: ELFCLASS64
-    0x01,                   // e_ident[5]: ELFDATA2LSB
-    0x01,                   // e_ident[6]: EV_CURRENT
-    0x00,                   // e_ident[7]: ELFOSABI_NONE
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // e_ident[8..15]: padding
-    0x02, 0x00,             // e_type: ET_EXEC
-    0x3E, 0x00,             // e_machine: EM_X86_64
-    0x01, 0x00, 0x00, 0x00, // e_version: EV_CURRENT
-    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // e_entry: 0x100000000
-    0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // e_phoff: 64
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // e_shoff: 0
-    0x00, 0x00, 0x00, 0x00, // e_flags
-    0x40, 0x00,             // e_ehsize: 64
-    0x38, 0x00,             // e_phentsize: 56
-    0x01, 0x00,             // e_phnum: 1
-    0x00, 0x00,             // e_shentsize: 0
-    0x00, 0x00,             // e_shnum: 0
-    0x00, 0x00,             // e_shstrndx: 0
-    // ===== Program Header (56 bytes) =====
-    0x01, 0x00, 0x00, 0x00, // p_type: PT_LOAD
-    0x05, 0x00, 0x00, 0x00, // p_flags: PF_R | PF_X
-    0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // p_offset: 120
-    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // p_vaddr: 0x100000000
-    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // p_paddr: 0x100000000
-    0x35, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // p_filesz: 53
-    0x35, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // p_memsz: 53
-    0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // p_align: 4096
-    // ===== Code (34 bytes) =====
-    0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1 (syscall: print)
-    0x48, 0x8D, 0x3D, 0x14, 0x00, 0x00, 0x00, // lea rdi, [rip+0x14] (→ msg, 20 bytes ahead)
-    0x48, 0xC7, 0xC6, 0x13, 0x00, 0x00, 0x00, // mov rsi, 19 (string length)
-    0x0F, 0x05,                               // syscall (print)
-    0x48, 0xC7, 0xC0, 0x04, 0x00, 0x00, 0x00, // mov rax, 4 (syscall: exit)
-    0x31, 0xFF,                               // xor edi, edi (exit code 0)
-    0x0F, 0x05,                               // syscall (exit — never returns)
-    // ===== Message (19 bytes) =====
-    0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20, 0x66, 0x72, 0x6F, 0x6D, 0x20, 0x52, 0x69, 0x6E, 0x67, 0x20, 0x33, 0x21, 0x0A, // "Hello from Ring 3!\n"
-};
 
 pub fn panic(msg: []const u8, error_return_trace: ?*@import("std").builtin.StackTrace, ret_addr: ?usize) noreturn {
     _ = error_return_trace;

@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
     kernel32.addAssemblyFile(b.path("src/isr32.S"));
     b.installArtifact(kernel32);
 
-    // ═══ 64-bit Kernel Build (POLER-OS v0.5.1 → v0.6.1) ════════════════
+    // ═══ 64-bit Kernel Build (POLER-OS v0.6.0) ═════════════════════════
     const kernel64_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
         .os_tag = .freestanding,
@@ -43,32 +43,6 @@ pub fn build(b: *std.Build) void {
     kernel64.addAssemblyFile(b.path("src64/isr64.S"));
     b.installArtifact(kernel64);
 
-    // ═══ Build ISO step (BIOS + UEFI dual-boot) ═══════════════════════════
-    //
-    // Uses build-iso.sh which auto-detects GRUB modules:
-    //   - Checks /usr/lib/grub/i386-pc (BIOS, standard Linux install)
-    //   - Checks /usr/lib/grub/x86_64-efi (UEFI, needs grub-efi-amd64-bin)
-    //   - Falls back to common alternative paths
-    //
-    // For dual-boot ISO (BIOS + UEFI):
-    //   sudo apt install grub-pc-bin grub-efi-amd64-bin xorriso mtools
-    //
-    // For BIOS-only ISO:
-    //   sudo apt install grub-pc-bin xorriso
-    //
-    const iso_cp_cmd = b.addSystemCommand(&.{
-        "cp", "zig-out/bin/poler-os64", "iso/boot/poler-os64",
-    });
-    iso_cp_cmd.step.dependOn(b.getInstallStep());
-
-    const iso_grub_cmd = b.addSystemCommand(&.{
-        "/bin/bash", "build-iso.sh",
-    });
-    iso_grub_cmd.step.dependOn(&iso_cp_cmd.step);
-
-    const iso_step = b.step("iso", "Build POLER-OS bootable ISO (BIOS + UEFI if modules available)");
-    iso_step.dependOn(&iso_grub_cmd.step);
-
     // ═══ Run 32-bit kernel in QEMU ═══════════════════════════════════════
     const run32_cmd = b.addSystemCommand(&.{
         "qemu-system-x86_64",
@@ -83,35 +57,92 @@ pub fn build(b: *std.Build) void {
     const run32_step = b.step("run32", "Run 32-bit kernel in QEMU");
     run32_step.dependOn(&run32_cmd.step);
 
-    // ═══ Run 64-bit kernel in QEMU (serial console — no graphics) ══════════
-    // Default: -nographic (pure serial terminal, no VGA window)
+    // ═══ Run 64-bit kernel in QEMU ═══════════════════════════════════════
     const run64_cmd = b.addSystemCommand(&.{
         "qemu-system-x86_64",
-        "-cdrom",
-        "poler-os64.iso",
-        "-m", "256M",
-        "-nographic",
-        "-no-reboot",
-    });
-    run64_cmd.step.dependOn(&iso_grub_cmd.step);
-
-    const run64_step = b.step("run64", "Run 64-bit kernel in QEMU (serial console, no graphics)");
-    run64_step.dependOn(&run64_cmd.step);
-
-    // ═══ Run 64-bit kernel with VGA window + serial ═══════════════════════
-    // Shows both VGA window and serial output
-    const run64_gfx_cmd = b.addSystemCommand(&.{
-        "qemu-system-x86_64",
-        "-cdrom",
-        "poler-os64.iso",
+        "-kernel",
+        "zig-out/bin/poler-os64",
         "-m", "256M",
         "-serial", "stdio",
         "-no-reboot",
     });
-    run64_gfx_cmd.step.dependOn(&iso_grub_cmd.step);
+    run64_cmd.step.dependOn(b.getInstallStep());
 
-    const run64_gfx_step = b.step("run64-gfx", "Run 64-bit kernel with VGA window + serial");
-    run64_gfx_step.dependOn(&run64_gfx_cmd.step);
+    const run64_step = b.step("run64", "Run 64-bit kernel in QEMU");
+    run64_step.dependOn(&run64_cmd.step);
+
+    // ═══ Run 64-bit kernel headless (serial only) ═════════════════════════
+    const run64_headless_cmd = b.addSystemCommand(&.{
+        "qemu-system-x86_64",
+        "-kernel",
+        "zig-out/bin/poler-os64",
+        "-m", "256M",
+        "-nographic",
+        "-no-reboot",
+    });
+    run64_headless_cmd.step.dependOn(b.getInstallStep());
+
+    const run64_headless_step = b.step("run64-headless", "Run 64-bit kernel headless (serial only)");
+    run64_headless_step.dependOn(&run64_headless_cmd.step);
+
+    // ═══ Run 64-bit kernel with virtio-blk disk ═════════════════════════
+    const run64_blk_cmd = b.addSystemCommand(&.{
+        "qemu-system-x86_64",
+        "-kernel",
+        "zig-out/bin/poler-os64",
+        "-m", "256M",
+        "-serial", "stdio",
+        "-no-reboot",
+        "-drive", "file=disk.img,if=virtio,format=raw",
+    });
+    run64_blk_cmd.step.dependOn(b.getInstallStep());
+
+    const run64_blk_step = b.step("run64-blk", "Run 64-bit kernel in QEMU with virtio-blk disk");
+    run64_blk_step.dependOn(&run64_blk_cmd.step);
+
+    // ═══ Run 64-bit kernel headless with virtio-blk ═════════════════════
+    const run64_blk_headless_cmd = b.addSystemCommand(&.{
+        "qemu-system-x86_64",
+        "-kernel",
+        "zig-out/bin/poler-os64",
+        "-m", "256M",
+        "-nographic",
+        "-no-reboot",
+        "-drive", "file=disk.img,if=virtio,format=raw",
+    });
+    run64_blk_headless_cmd.step.dependOn(b.getInstallStep());
+
+    const run64_blk_headless_step = b.step("run64-blk-headless", "Run 64-bit kernel headless with virtio-blk");
+    run64_blk_headless_step.dependOn(&run64_blk_headless_cmd.step);
+
+    // ═══ Run from ISO (CDROM boot) ══════════════════════════════════════
+    const run64_iso_cmd = b.addSystemCommand(&.{
+        "qemu-system-x86_64",
+        "-cdrom", "poler-os64.iso",
+        "-m", "256M",
+        "-serial", "stdio",
+        "-vga", "std",
+        "-no-reboot",
+    });
+    run64_iso_cmd.step.dependOn(b.getInstallStep());
+
+    const run64_iso_step = b.step("run64-iso", "Run POLER-OS from ISO in QEMU");
+    run64_iso_step.dependOn(&run64_iso_cmd.step);
+
+    // ═══ Run from ISO with virtio-blk disk ══════════════════════════════
+    const run64_iso_blk_cmd = b.addSystemCommand(&.{
+        "qemu-system-x86_64",
+        "-cdrom", "poler-os64.iso",
+        "-m", "256M",
+        "-serial", "stdio",
+        "-vga", "std",
+        "-no-reboot",
+        "-drive", "file=disk.img,if=virtio,format=raw",
+    });
+    run64_iso_blk_cmd.step.dependOn(b.getInstallStep());
+
+    const run64_iso_blk_step = b.step("run64-iso-blk", "Run POLER-OS from ISO in QEMU with virtio-blk");
+    run64_iso_blk_step.dependOn(&run64_iso_blk_cmd.step);
 
     // ═══ POLER Core Tests (native x86_64 linux) ════════════════════════════
     const test_target = b.resolveTargetQuery(.{
@@ -145,4 +176,19 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&poler_core32_tests.step);
     test_step.dependOn(&poler_core64_tests.step);
     test_step.dependOn(&rsa_oaep64_tests.step);
+
+    // ═══ Build ISO step ══════════════════════════════════════════════════
+    const iso_cp_cmd = b.addSystemCommand(&.{
+        "cp", "zig-out/bin/poler-os64", "iso/boot/poler-os64",
+    });
+    iso_cp_cmd.step.dependOn(b.getInstallStep());
+
+    // Use environment variable GRUB_MKRESCUE if set, otherwise default
+    const iso_grub_cmd = b.addSystemCommand(&.{
+        "grub-mkrescue", "-o", "poler-os64.iso", "iso",
+    });
+    iso_grub_cmd.step.dependOn(&iso_cp_cmd.step);
+
+    const iso_step = b.step("iso", "Build POLER-OS bootable ISO");
+    iso_step.dependOn(&iso_grub_cmd.step);
 }

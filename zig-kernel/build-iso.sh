@@ -1,21 +1,18 @@
 #!/bin/bash
 # ============================================================================
-# POLER-OS ISO Builder — auto-detects GRUB modules (BIOS + UEFI)
+# POLER-OS GRUB ISO Builder
 # ============================================================================
+# Creates a bootable ISO using grub-mkrescue / xorriso.
 #
-# This script builds a bootable ISO using grub-mkrescue.
-# It auto-detects available GRUB platform modules:
+# Prerequisites:
+#   - grub-mkrescue (from grub-pc-bin / grub2-common)
+#   - xorriso (from libisoburn / xorriso)
+#   - mformat, mcopy (from mtools — for FAT32 disk image)
 #
-#   BIOS boot:  requires i386-pc modules (grub-pc-bin on Debian/Ubuntu)
-#   UEFI boot:  requires x86_64-efi modules (grub-efi-amd64-bin)
-#
-# Installation:
-#   BIOS-only:   sudo apt install grub-pc-bin xorriso
-#   UEFI-only:   sudo apt install grub-efi-amd64-bin xorriso mtools
-#   Dual-boot:   sudo apt install grub-pc-bin grub-efi-amd64-bin xorriso mtools
-#
-# The script passes the -d flag to grub-mkrescue ONLY for the BIOS modules
-# directory. UEFI support is auto-detected by grub-mkrescue itself.
+# Usage:
+#   ./build-iso.sh            # Build kernel + ISO
+#   ./build-iso.sh --disk     # Also create a FAT32 disk.img for virtio-blk
+#   ./build-iso.sh --run      # Build + run in QEMU with virtio-blk
 # ============================================================================
 
 set -e
@@ -23,92 +20,119 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-ISO_NAME="poler-os64.iso"
-ISO_DIR="iso"
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
-echo "[ISO] Building POLER-OS bootable ISO..."
-echo "[ISO] Working directory: $SCRIPT_DIR"
+echo -e "${GREEN}╔══════════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}║        POLER-OS ISO Builder (GRUB)               ║${NC}"
+echo -e "${GREEN}╚══════════════════════════════════════════════════╝${NC}"
 
-# --- Auto-detect GRUB BIOS modules directory ---
-GRUB_BIOS_DIR=""
-
-# Search paths for i386-pc GRUB modules (in priority order)
-BIOS_SEARCH_PATHS=(
-    "/usr/lib/grub/i386-pc"            # Standard Linux (apt install grub-pc-bin)
-    "/usr/local/lib/grub/i386-pc"       # Manual build install
-    "/usr/lib/grub2/i386-pc"            # Some distros (openSUSE, etc.)
-    "$HOME/my-project/tools/local/usr/lib/grub/i386-pc"  # Z AI sandbox
-)
-
-for dir in "${BIOS_SEARCH_PATHS[@]}"; do
-    if [ -d "$dir" ] && [ -f "$dir/boot.img" ]; then
-        GRUB_BIOS_DIR="$dir"
-        echo "[ISO] Found BIOS GRUB modules: $GRUB_BIOS_DIR"
-        break
-    fi
-done
-
-# --- Check for UEFI GRUB modules ---
-UEFI_AVAILABLE=false
-UEFI_SEARCH_PATHS=(
-    "/usr/lib/grub/x86_64-efi"         # Standard Linux (apt install grub-efi-amd64-bin)
-    "/usr/local/lib/grub/x86_64-efi"    # Manual build install
-    "/usr/lib/grub2/x86_64-efi"         # Some distros
-)
-
-for dir in "${UEFI_SEARCH_PATHS[@]}"; do
-    if [ -d "$dir" ] && [ -f "$dir/efi.sig" -o -f "$dir/multiboot2.mod" ]; then
-        UEFI_AVAILABLE=true
-        echo "[ISO] Found UEFI GRUB modules: $dir"
-        break
-    fi
-done
-
-# --- Build grub-mkrescue command ---
-MKRESCUE_ARGS=("grub-mkrescue" "-o" "$ISO_NAME")
-
-if [ -n "$GRUB_BIOS_DIR" ]; then
-    MKRESCUE_ARGS+=("-d" "$GRUB_BIOS_DIR")
-    echo "[ISO] Using BIOS modules: $GRUB_BIOS_DIR"
-else
-    echo "[ISO] WARNING: No BIOS GRUB modules found!"
-    echo "[ISO]   Install with: sudo apt install grub-pc-bin"
-    echo "[ISO]   Attempting build without explicit -d flag..."
-fi
-
-MKRESCUE_ARGS+=("$ISO_DIR")
-
-# --- Report boot mode support ---
-if $UEFI_AVAILABLE; then
-    echo "[ISO] ISO will support: BIOS + UEFI (dual-boot)"
-else
-    echo "[ISO] ISO will support: BIOS only"
-    echo "[ISO]   For UEFI support: sudo apt install grub-efi-amd64-bin mtools"
-fi
-
-# --- Build ISO ---
-echo "[ISO] Running: ${MKRESCUE_ARGS[*]}"
-if "${MKRESCUE_ARGS[@]}"; then
-    ISO_SIZE=$(stat -c%s "$ISO_NAME" 2>/dev/null || echo "?")
-    echo "[ISO] Build successful! $ISO_NAME ($ISO_SIZE bytes)"
-    echo ""
-    echo "[ISO] Boot modes:"
-    echo "  BIOS:  Supported (i386-pc)"
-    if $UEFI_AVAILABLE; then
-        echo "  UEFI:  Supported (x86_64-efi)"
-    else
-        echo "  UEFI:  Not available (install grub-efi-amd64-bin)"
-    fi
-    echo ""
-    echo "[ISO] Testing in QEMU:"
-    echo "  qemu-system-x86_64 -cdrom $ISO_NAME -m 256M -serial stdio -no-reboot"
-    echo ""
-    echo "[ISO] For VirtualBox/VMware:"
-    echo "  - BIOS mode: Should boot directly"
-    echo "  - UEFI mode: Requires UEFI modules in ISO (see above)"
-else
-    echo "[ISO] ERROR: grub-mkrescue failed!"
-    echo "[ISO] Make sure you have installed:"
-    echo "  sudo apt install grub-pc-bin xorriso"
+# Step 1: Build the kernel
+echo -e "${YELLOW}[1/4] Building 64-bit kernel...${NC}"
+if ! command -v zig &> /dev/null; then
+    echo -e "${RED}ERROR: zig not found. Install from https://ziglang.org/${NC}"
     exit 1
+fi
+zig build -Doptimize=ReleaseSmall 2>&1 || zig build 2>&1
+echo -e "${GREEN}  ✓ Kernel built${NC}"
+
+# Step 2: Copy kernel binary to ISO directory
+echo -e "${YELLOW}[2/4] Preparing ISO structure...${NC}"
+mkdir -p iso/boot/grub
+cp -f zig-out/bin/poler-os64 iso/boot/poler-os64
+echo -e "${GREEN}  ✓ Kernel copied to iso/boot/poler-os64${NC}"
+
+# Step 3: Create GRUB config
+cat > iso/boot/grub/grub.cfg << 'EOF'
+set timeout=5
+set default=0
+
+menuentry "POLER-OS v0.7.0 (64-bit)" {
+    insmod multiboot2
+    insmod part_msdos
+    insmod elf
+    echo "Loading POLER-OS v0.7.0..."
+    multiboot2 /boot/poler-os64
+    boot
+}
+
+menuentry "POLER-OS v0.7.0 (64-bit, serial console)" {
+    insmod multiboot2
+    insmod part_msdos
+    insmod elf
+    echo "Loading POLER-OS v0.7.0 (serial)..."
+    multiboot2 /boot/poler-os64 console=serial
+    boot
+}
+EOF
+echo -e "${GREEN}  ✓ GRUB config written${NC}"
+
+# Step 4: Create the ISO
+echo -e "${YELLOW}[3/4] Creating bootable ISO...${NC}"
+if command -v grub-mkrescue &> /dev/null; then
+    grub-mkrescue -o poler-os64.iso iso/ 2>&1
+    echo -e "${GREEN}  ✓ ISO created: poler-os64.iso${NC}"
+elif command -v xorriso &> /dev/null; then
+    # Manual ISO creation with xorriso if grub-mkrescue not available
+    xorriso -as mkisofs \
+        -R -J -c boot/boot.cat \
+        -b boot/grub/i386-pc/eltorito.img \
+        -no-emul-boot -boot-load-size 4 -boot-info-table \
+        --grub2-boot-info \
+        -o poler-os64.iso iso/ 2>&1
+    echo -e "${GREEN}  ✓ ISO created with xorriso: poler-os64.iso${NC}"
+else
+    echo -e "${RED}ERROR: Neither grub-mkrescue nor xorriso found!${NC}"
+    echo -e "${YELLOW}Install with: sudo apt install grub-pc-bin xorriso${NC}"
+    exit 1
+fi
+
+# Optional: Create FAT32 disk image for virtio-blk testing
+if [[ "$1" == "--disk" || "$1" == "--run" ]]; then
+    echo -e "${YELLOW}[4/4] Creating FAT32 disk image...${NC}"
+    if command -v mformat &> /dev/null; then
+        # Create a 16MB FAT32 disk image
+        dd if=/dev/zero of=disk.img bs=1M count=16 2>/dev/null
+        mformat -i disk.img -v POLEROS -F -c 1 ::
+        echo -e "${GREEN}  ✓ FAT32 disk image created: disk.img (16MB)${NC}"
+    else
+        echo -e "${YELLOW}  mformat not found, creating raw disk image...${NC}"
+        dd if=/dev/zero of=disk.img bs=1M count=16 2>/dev/null
+        echo -e "${YELLOW}  ⚠ disk.img created but not formatted (no mtools)${NC}"
+        echo -e "${YELLOW}  Format manually: mkfs.fat -F 32 disk.img${NC}"
+    fi
+else
+    echo -e "${YELLOW}[4/4] Skipping disk image (use --disk to create one)${NC}"
+fi
+
+echo ""
+echo -e "${GREEN}╔══════════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}║  Build complete!                                 ║${NC}"
+echo -e "${GREEN}╚══════════════════════════════════════════════════╝${NC}"
+echo ""
+echo "To test in QEMU:"
+echo "  qemu-system-x86_64 -cdrom poler-os64.iso -m 256M -serial stdio"
+echo ""
+echo "With virtio-blk disk:"
+echo "  qemu-system-x86_64 -cdrom poler-os64.iso -m 256M -serial stdio \\"
+echo "    -drive file=disk.img,if=virtio,format=raw"
+echo ""
+
+# Optional: Run in QEMU
+if [[ "$1" == "--run" ]]; then
+    if command -v qemu-system-x86_64 &> /dev/null; then
+        echo -e "${YELLOW}Launching QEMU...${NC}"
+        qemu-system-x86_64 \
+            -cdrom poler-os64.iso \
+            -m 256M \
+            -serial stdio \
+            -no-reboot \
+            -drive file=disk.img,if=virtio,format=raw
+    else
+        echo -e "${RED}ERROR: qemu-system-x86_64 not found!${NC}"
+        exit 1
+    fi
 fi

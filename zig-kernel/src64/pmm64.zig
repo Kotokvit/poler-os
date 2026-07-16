@@ -148,6 +148,51 @@ fn freePageInternal(addr: u64) void {
     bitmap[byte_idx] &= ~(@as(u8, 1) << bit_idx);
 }
 
+/// Allocate N contiguous page-aligned physical pages.
+/// Returns the physical address of the first page, or null if not enough
+/// contiguous free pages are available.
+pub fn allocContiguousPages(count: u64) ?u64 {
+    if (count == 0) return null;
+    if (count > MAX_PAGES) return null;
+
+    // Scan for a run of `count` consecutive free pages
+    var run_start: u64 = 0;
+    var run_len: u64 = 0;
+    var i: u64 = 0;
+    while (i < MAX_PAGES) : (i += 1) {
+        const byte_idx = i / 8;
+        const bit_idx: u3 = @intCast(i % 8);
+        if ((bitmap[byte_idx] & (@as(u8, 1) << bit_idx)) == 0) {
+            // Free page
+            if (run_len == 0) run_start = i;
+            run_len += 1;
+            if (run_len >= count) {
+                // Found a contiguous run — mark all as allocated
+                var j: u64 = run_start;
+                while (j < run_start + count) : (j += 1) {
+                    setPageInternal(j * PAGE_SIZE);
+                    allocated_pages += 1;
+                }
+                next_free_hint = run_start + count;
+                if (next_free_hint >= MAX_PAGES) next_free_hint = 0;
+                return run_start * PAGE_SIZE;
+            }
+        } else {
+            // Allocated page — reset run
+            run_len = 0;
+        }
+    }
+    return null; // No contiguous run found
+}
+
+/// Free N contiguous pages starting at the given physical address
+pub fn freeContiguousPages(addr: u64, count: u64) void {
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        freePage(addr + i * PAGE_SIZE);
+    }
+}
+
 pub fn getStats() struct { total_kb: u64, usable_pages: u64, allocated_pages: u64 } {
     return .{
         .total_kb = total_ram_bytes / 1024,
