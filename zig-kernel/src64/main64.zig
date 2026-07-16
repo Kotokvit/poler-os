@@ -519,7 +519,6 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     pci.scan();
 
     var has_blk = false;
-    _ = has_blk; // Will be used in shell commands
     virtio_blk.init() catch |err| {
         puts("[VIRTIO-BLK] Init failed: ");
         puts(@errorName(err));

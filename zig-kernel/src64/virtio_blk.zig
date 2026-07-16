@@ -413,7 +413,9 @@ pub fn init() VblkError!void {
 
     // Step 10: Configure IOAPIC for IRQ
     if (vblk_state.irq != 0 and vblk_state.irq != 0xFF) {
-        hal.IOAPIC.setRedirect(vblk_state.irq, 49, 0);
+        // IOAPIC redirection for virtio IRQ -> Vector 49
+        hal.IOAPIC.write(0x10 + vblk_state.irq * 2, 49); // low: vector 49
+        hal.IOAPIC.write(0x10 + vblk_state.irq * 2 + 1, 0); // high: APIC ID 0
         hal.Serial.puts("[VBLK] IO-APIC configured: GSI=");
         hal.Serial.putHex(vblk_state.irq);
         hal.Serial.puts(" -> Vector 49\n");
@@ -520,7 +522,7 @@ fn setupQueue(queue_idx: u16) VblkError!void {
     // Guard: if phys >= 4GB, VirtIO Legacy cannot address it — abort init
     if (vblk_state.desc_phys >= 0x100000000) {
         hal.Serial.puts("[VBLK] ERROR: desc_phys >= 4GB, VirtIO Legacy cannot address it!\n");
-        return error.DmaAddressTooHigh;
+        return error.NoDmaSlot;
     }
     const pfn: u32 = @intCast(vblk_state.desc_phys >> 12);
     write32(VIRTIO_PCI_QUEUE_PFN, pfn);

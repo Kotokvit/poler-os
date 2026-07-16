@@ -147,3 +147,6 @@ super-z-skills/
 # Security scan artifacts
 secret_scanning.json
 pentest_report.json
+
+# Local toolchain (zig, qemu, grub, xorriso)
+.local/

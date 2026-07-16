@@ -1273,10 +1273,10 @@ pub const Fat32Fs = struct {
 
         while (cluster >= 2 and cluster < 0x0FFFFFF8 and count < MAX_CLUSTER_CHAIN) {
             const next = self.getNextCluster(cluster) orelse {
-                self.setFatEntry(cluster, 0x00000000);
+                _ = self.setFatEntry(cluster, 0x00000000);
                 break;
             };
-            self.setFatEntry(cluster, 0x00000000);
+            _ = self.setFatEntry(cluster, 0x00000000);
             cluster = next;
             count += 1;
         }
