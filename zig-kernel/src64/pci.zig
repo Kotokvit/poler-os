@@ -37,7 +37,7 @@ pub fn pciWrite32(bus: u8, slot: u8, func: u8, offset: u8, val: u32) void {
 
 pub fn pciRead16(bus: u8, slot: u8, func: u8, offset: u8) u16 {
     const val = pciRead32(bus, slot, func, offset);
-    return @truncate(val >> (8 * (@as(u32, offset) & 2)));
+    return @truncate(val >> (8 * (@as(u5, @truncate(offset)) & 2)));
 }
 
 pub fn pciRead8(bus: u8, slot: u8, func: u8, offset: u8) u8 {
@@ -54,8 +54,9 @@ pub fn pciWrite16(bus: u8, slot: u8, func: u8, offset: u8, val: u16) void {
     hal.outl(PCI_CONFIG_ADDR, addr);
     // Read-modify-write for 16-bit within 32-bit register
     const old = hal.inl(PCI_CONFIG_DATA);
-    const shift = 8 * (@as(u32, offset) & 2);
-    const mask: u32 = 0xFFFF << shift;
+    const shift_raw = 8 * (@as(u5, @truncate(offset)) & 2);
+    const shift: u5 = @intCast(shift_raw);
+    const mask: u32 = @shlExact(@as(u32, 0xFFFF), shift);
     const new = (old & ~mask) | (@as(u32, val) << shift);
     hal.outl(PCI_CONFIG_ADDR, addr);
     hal.outl(PCI_CONFIG_DATA, new);
