@@ -64,6 +64,13 @@ qemu-capture/
 download/
 upload/
 
+# ============================================================================
+# ЛОКАЛЬНАЯ ИНФРАСТРУКТУРА — НЕ часть проекта poler-os
+# ============================================================================
+
+# Local toolchain (zig, grub, xorriso, etc.)
+.local/
+
 # Workspace / sandbox — НИКОГДА не пушить
 .env
 .env.local
@@ -82,35 +89,39 @@ bun.lock
 components.json
 db/
 
-# Agent tools (не часть ОС)
-.husky/
+# ============================================================================
+# PLAYGROUND / Next.js — интерфейс взаимодействия, НЕ часть проекта
+# В будущем может быть заменён на AI API
+# ============================================================================
+.next/
+src/
+public/
+poler-playground/
 package.json
 package-lock.json
-
-# Chatbot (не часть ОС)
-zai-chatbot/
-
-# Next.js playground — интерфейс взаимодействия, НЕ часть проекта
-.next/
-poler-playground/
-src/app/
-src/components/
-src/lib/
-public/
 eslint.config.mjs
 next-env.d.ts
 next.config.ts
 postcss.config.mjs
 tsconfig.json
 
-# Non-project directories — НИКОГДА не пушить
+# ============================================================================
+# МУСОР — НИКОГДА не пушить
+# ============================================================================
+
+# Agent tools (не часть ОС)
+.husky/
+
+# Chatbot (не часть ОС)
+zai-chatbot/
+
+# Non-project directories
 file-explorer/
 fpga/
 rust-core/
 verification/
 reference/
 drafts/
-# docs/ НЕ игнорируем — это документация проекта!
 
 # ISO build dirs (пересоздаются при каждой сборке)
 iso_build/
@@ -129,11 +140,6 @@ zig-kernel/iso-minimal/boot/poler-os
 # Initrd temp
 initrd_tmp/
 
-# Temporary / backup
-*.tmp
-*.bak
-
-# === ЗАЩИТА ОТ МУСОРА — НИКОГДА не пушить ===
 # Субмодули / вложенные копии репо
 poler-os-clean/
 poler-os-work/
@@ -148,5 +154,6 @@ super-z-skills/
 secret_scanning.json
 pentest_report.json
 
-# Local toolchain (zig, qemu, grub, xorriso)
-.local/
+# Temporary / backup
+*.tmp
+*.bak
