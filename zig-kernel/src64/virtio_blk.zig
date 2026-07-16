@@ -517,7 +517,12 @@ fn setupQueue(queue_idx: u16) VblkError!void {
     write16(VIRTIO_PCI_QUEUE_NUM, QUEUE_SIZE);
     // FIXED: Write page frame number of the descriptor table base
     // PFN = physical_address >> 12 (must fit in 32 bits for Legacy mode)
-    const pfn: u32 = @truncate(vblk_state.desc_phys >> 12);
+    // Guard: if phys >= 4GB, VirtIO Legacy cannot address it — abort init
+    if (vblk_state.desc_phys >= 0x100000000) {
+        hal.Serial.puts("[VBLK] ERROR: desc_phys >= 4GB, VirtIO Legacy cannot address it!\n");
+        return error.DmaAddressTooHigh;
+    }
+    const pfn: u32 = @intCast(vblk_state.desc_phys >> 12);
     write32(VIRTIO_PCI_QUEUE_PFN, pfn);
 
     hal.Serial.puts("[VBLK] Virtqueue configured (PFN=0x");

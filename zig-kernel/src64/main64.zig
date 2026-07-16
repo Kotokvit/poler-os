@@ -1,12 +1,12 @@
 // ============================================================================
-// POLER-OS v0.6.0 — 64-bit x86_64 Semantic Runtime Kernel
+// POLER-OS v0.7.0 — 64-bit x86_64 Universal OS Kernel
 // ============================================================================
 //
 // Эволюция:
 //   v0.4.0: 32-bit kernel, POLER Core, shell, PCI scan
 //   v0.5.0: 64-bit boot, HAL (GDT/IDT/PIC/APIC), ACPI, interrupts
 //   v0.5.1: VirtualBox compatibility, 64-bit Long Mode fix
-//   v0.6.0: APIC timer fix (vector 48), own GDT+TSS, PMM/VMM/Heap, scheduler
+//   v0.7.0: VirtIO-BLK + FAT32 + PCI, Ring 3, ELF loader, scheduler, crypto
 // ============================================================================
 
 const hal = @import("hal.zig");
@@ -599,7 +599,7 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     // 9. Ready!
     vga_setcolor(0x0B);
     puts("\n╔══════════════════════════════════════════════════════╗\n");
-    puts("║         POLER-OS v0.6.0 — BOOT COMPLETE             ║\n");
+    puts("║         POLER-OS v0.7.0 — BOOT COMPLETE             ║\n");
     puts("║     HAL + ACPI + POLER Core — all systems GO        ║\n");
     puts("╚══════════════════════════════════════════════════════╝\n");
     vga_setcolor(0x07);
@@ -649,7 +649,7 @@ fn sys_print(str: []const u8) void {
 }
 
 fn task1() noreturn {
-    sys_print("\n=== POLER-OS v0.6.0 Interactive Shell ===\n");
+    sys_print("\n=== POLER-OS v0.7.0 Interactive Shell ===\n");
     sys_print("Type 'help' for commands.\n\n");
     
     var buf: [128]u8 = undefined;
@@ -720,9 +720,10 @@ fn execute_command(cmd: []const u8) void {
         sys_print("  mkdir <d> - Create a directory\n");
         sys_print("  touch <f> - Create an empty file\n");
         sys_print("  write <f> <text> - Write text to a file\n");
+        sys_print("  rm <f>    - Delete a file\n");
         sys_print("  disk      - Show disk info\n");
     } else if (eq(cmd, "about")) {
-        sys_print("POLER-OS v0.6.0 (x86_64 Long Mode)\n");
+        sys_print("POLER-OS v0.7.0 (x86_64 Long Mode)\n");
         sys_print("Cognitive Semantic Runtime Environment.\n");
     } else if (eq(cmd, "clear")) {
         sys_clear_screen();
@@ -744,6 +745,8 @@ fn execute_command(cmd: []const u8) void {
         cmd_touch(cmd[6..]);
     } else if (startsWith(cmd, "write ")) {
         cmd_write(cmd[6..]);
+    } else if (startsWith(cmd, "rm ")) {
+        cmd_rm(cmd[3..]);
     } else {
         sys_print("Unknown command: ");
         sys_print(cmd);
@@ -1014,7 +1017,12 @@ fn cmd_mkdir(dirname: []const u8) void {
             sys_print("Invalid directory name\n");
             return;
         }
-        parent_cluster = fs.resolveDirCluster(parent_path);
+        parent_cluster = fs.resolveDirCluster(parent_path) orelse {
+            sys_print("Parent directory not found: ");
+            sys_print(parent_path);
+            sys_print("\n");
+            return;
+        };
     }
 
     const result = fs.createDir(parent_cluster, dir_name);
@@ -1087,7 +1095,12 @@ fn cmd_touch(filename: []const u8) void {
             sys_print("Invalid file name\n");
             return;
         }
-        parent_cluster = fs.resolveDirCluster(parent_path);
+        parent_cluster = fs.resolveDirCluster(parent_path) orelse {
+            sys_print("Parent directory not found: ");
+            sys_print(parent_path);
+            sys_print("\n");
+            return;
+        };
     }
 
     const file = fs.createFile(parent_cluster, file_name);
@@ -1149,7 +1162,10 @@ fn cmd_write(args: []const u8) void {
             if (last_slash > 0) {
                 const parent_path = path[0..last_slash];
                 file_name = path[last_slash + 1 ..];
-                parent_cluster = fs.resolveDirCluster(parent_path);
+                parent_cluster = fs.resolveDirCluster(parent_path) orelse {
+                    sys_print("Parent directory not found\n");
+                    return;
+                };
             }
 
             break :blk fs.createFile(parent_cluster, file_name) orelse {
@@ -1203,6 +1219,28 @@ fn task2() noreturn {
         while (i < 100000000) : (i += 1) {
             asm volatile ("nop");
         }
+    }
+}
+
+fn cmd_rm(filename: []const u8) void {
+    const fs = fat32.getFs() orelse {
+        sys_print("No filesystem mounted\n");
+        return;
+    };
+
+    if (filename.len == 0) {
+        sys_print("Usage: rm <file>\n");
+        return;
+    }
+
+    if (fs.deleteFile(filename)) {
+        sys_print("Deleted: ");
+        sys_print(filename);
+        sys_print("\n");
+    } else {
+        sys_print("Failed to delete: ");
+        sys_print(filename);
+        sys_print(" (not found or is a directory)\n");
     }
 }
 

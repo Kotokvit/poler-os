@@ -87,6 +87,9 @@ db/
 package.json
 package-lock.json
 
+# Chatbot (не часть ОС)
+zai-chatbot/
+
 # Non-project directories — НИКОГДА не пушить
 file-explorer/
 fpga/
@@ -94,7 +97,7 @@ rust-core/
 verification/
 reference/
 drafts/
-docs/
+# docs/ НЕ игнорируем — это документация проекта!
 
 # ISO build dirs (пересоздаются при каждой сборке)
 iso_build/

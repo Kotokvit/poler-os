@@ -106,12 +106,12 @@ pub fn scan() void {
             const prog_if: u8 = @truncate(pciRead32(bus, slot, 0, 8) >> 8);
             const header_type: u8 = @truncate(pciRead32(bus, slot, 0, 0x0C) >> 16);
 
-            // Get I/O base from BAR0
+            // Get I/O or Memory base from BAR0
             const bar0 = pciRead32(bus, slot, 0, 0x10);
             const io_base: u16 = if ((bar0 & 1) != 0)
                 @truncate(bar0 & 0xFFFC)
             else
-                0;
+                @truncate((bar0 >> 4) & 0xFFF0); // Memory-mapped BAR: bits [31:4], lower 16 for compatibility
 
             // Get IRQ
             const irq: u8 = @truncate(pciRead32(bus, slot, 0, 0x3C));

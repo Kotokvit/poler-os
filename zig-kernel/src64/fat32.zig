@@ -759,7 +759,7 @@ pub const Fat32Fs = struct {
     /// Get the directory cluster for a parent path.
     /// e.g. for "/dir/subdir", returns the cluster of "subdir" in "dir"
     /// If path is "/" or "", returns root_cluster.
-    pub fn resolveDirCluster(self: *Fat32Fs, path: []const u8) u32 {
+    pub fn resolveDirCluster(self: *Fat32Fs, path: []const u8) ?u32 {
         var p = path;
         while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1]; // Strip trailing /
         while (p.len > 0 and p[0] == '/') p = p[1..]; // Strip leading /
@@ -767,11 +767,11 @@ pub const Fat32Fs = struct {
         if (p.len == 0) return self.root_cluster;
 
         // Open the path — if it's a directory, return its cluster
-        const f = self.openFile(path) orelse return self.root_cluster;
+        const f = self.openFile(path) orelse return null; // Return null instead of silently falling back to root
         if (f.is_directory and f.first_cluster >= 2) {
             return f.first_cluster;
         }
-        return self.root_cluster;
+        return null; // Not a directory — return null
     }
 
     // ================================================================
@@ -1180,6 +1180,109 @@ pub const Fat32Fs = struct {
         }
 
         return false;
+    }
+
+    /// Delete a file by marking its directory entry as deleted (0xE5)
+    /// Returns true on success, false on failure.
+    pub fn deleteFile(self: *Fat32Fs, path: []const u8) bool {
+        // Resolve the file
+        const f = self.openFile(path) orelse return false;
+        if (f.is_directory) return false; // Cannot delete directories with this function
+
+        // Find the parent directory and file name
+        var last_slash: usize = 0;
+        for (0..path.len) |i| {
+            if (path[i] == '/') last_slash = i;
+        }
+
+        const dir_cluster = if (last_slash == 0)
+            self.root_cluster
+        else
+            self.resolveDirCluster(path[0..last_slash]) orelse return false;
+
+        const file_name = if (last_slash == 0) path else path[last_slash + 1 ..];
+        if (file_name.len == 0) return false;
+
+        // Convert to short name for matching
+        var short_name: [11]u8 = undefined;
+        self.filenameToShortName(file_name, short_name[0..8], short_name[8..11]);
+
+        // Walk the directory to find and mark the entry as deleted
+        var cluster: u32 = dir_cluster;
+        var chain_len: u32 = 0;
+
+        while (true) {
+            if (cluster < 2) break;
+            if (chain_len >= MAX_CLUSTER_CHAIN) break;
+
+            for (0..self.sectors_per_cluster) |sec_idx| {
+                if (!self.readClusterSector(cluster, @intCast(sec_idx))) break;
+
+                for (0..DIR_ENTRIES_PER_SECTOR) |entry_idx| {
+                    const entry: *const DirEntry = @ptrCast(@alignCast(self.io_buf + entry_idx * 32));
+
+                    if (entry.name[0] == 0x00) return false; // End of dir, not found
+                    if (entry.name[0] == 0xE5) continue;
+                    if (entry.attr == ATTR_LFN) continue;
+
+                    // Compare short name
+                    var match = true;
+                    for (0..11) |i| {
+                        const a = if (i < 8) entry.name[i] else entry.ext[i - 8];
+                        if (toLower(a) != toLower(short_name[i])) {
+                            match = false;
+                            break;
+                        }
+                    }
+
+                    if (match) {
+                        // Mark entry as deleted (0xE5)
+                        @memcpy(self.write_buf[0..512], self.io_buf[0..512]);
+                        const del_entry: *volatile [32]u8 = @ptrCast(self.write_buf + entry_idx * 32);
+                        del_entry[0] = 0xE5;
+
+                        if (!self.writeClusterSector(cluster, @intCast(sec_idx), self.write_buf)) {
+                            return false;
+                        }
+
+                        // Free the cluster chain
+                        if (f.first_cluster >= 2) {
+                            self.freeClusterChain(f.first_cluster);
+                        }
+
+                        // Flush FAT cache
+                        self.flushFatCache();
+                        return true;
+                    }
+                }
+            }
+
+            const next = self.getNextCluster(cluster) orelse break;
+            cluster = next;
+            chain_len += 1;
+        }
+
+        return false;
+    }
+
+    /// Free a chain of clusters starting from the given cluster.
+    /// Marks each cluster as free (0x00000000) in the FAT.
+    fn freeClusterChain(self: *Fat32Fs, start_cluster: u32) void {
+        var cluster: u32 = start_cluster;
+        var count: u32 = 0;
+
+        while (cluster >= 2 and cluster < 0x0FFFFFF8 and count < MAX_CLUSTER_CHAIN) {
+            const next = self.getNextCluster(cluster) orelse {
+                self.setFatEntry(cluster, 0x00000000);
+                break;
+            };
+            self.setFatEntry(cluster, 0x00000000);
+            cluster = next;
+            count += 1;
+        }
+
+        // Flush the FAT cache to disk
+        self.flushFatCache();
     }
 
     /// Update an existing directory entry (e.g. file size, first cluster).
