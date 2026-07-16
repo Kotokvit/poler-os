@@ -90,6 +90,19 @@ package-lock.json
 # Chatbot (не часть ОС)
 zai-chatbot/
 
+# Next.js playground — интерфейс взаимодействия, НЕ часть проекта
+.next/
+poler-playground/
+src/app/
+src/components/
+src/lib/
+public/
+eslint.config.mjs
+next-env.d.ts
+next.config.ts
+postcss.config.mjs
+tsconfig.json
+
 # Non-project directories — НИКОГДА не пушить
 file-explorer/
 fpga/
