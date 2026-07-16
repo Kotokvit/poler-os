@@ -90,6 +90,10 @@ package-lock.json
 # Chatbot (не часть ОС)
 zai-chatbot/
 
+# Next.js playground
+.next/
+poler-playground/
+
 # Non-project directories — НИКОГДА не пушить
 file-explorer/
 fpga/
