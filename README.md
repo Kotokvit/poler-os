@@ -1,8 +1,46 @@
 # POLER-OS
 
-**x86_64 монолитное антивирусное ядро на Zig 0.13.0**
+**Универсальная операционная система нового поколения. x86_64, монолитное ядро, Zig 0.13.0.**
 
-Загрузка через Multiboot2/GRUB в 64-bit long mode. Ядро спроектировано как anti-cheat/anti-malware платформа: APIC ISR хэширует ввод, CR3/PML4 страницы хэшируются, PND подписывает переходы потока управления. Читы и вредоносный код физически не могут существовать в этой архитектуре.
+POLER-OS — это не дистрибутив Linux и не надстройка над ним. Это независимая операционная система, спроектированная с нуля для решения фундаментальной проблемы: insecurity by design. Linux уязвим архитектурно — ядро открыто для модификации после загрузки, root-процесс является богом системы, а защита строится как надстройка поверх ОС. POLER-OS меняет парадигму: безопасность не добавляется — она является архитектурным свойством ядра.
+
+---
+
+## Архитектурные принципы
+
+### Ядро закрывается после загрузки
+
+После инициализации и верификации целостности ядро криптографически блокирует возможность модификации самого себя. Руткит физически не может внедриться в ядро — механизм внедрения отсутствует как таковой. В Linux `insmod` может загрузить любой модуль, `/dev/mem` даёт доступ к памяти ядра, а eBPF — одновременно инструмент мониторинга и вектор атаки. В POLER-OS ядро неизменяемо после загрузки: XorDDoS, Plague и подавляющее большинство Linux-руткитов работают через модификацию ядра, а если ядро неизменяемо — 90% атак на ядро отпадают.
+
+### Программа — гость, а не хозяин
+
+Даже процесс с максимальными привилегиями в userspace не может модифицировать ядро. Это отличает POLER-OS от Linux, где root = неограниченный доступ. Root в POLER-OS может всё в userspace, но ядро — неприкосновенно. Компрометация userspace-процесса не означает компрометацию системы.
+
+### Прямая Windows-совместимость
+
+Подход Wine/Proton — обратная совместимость: Windows-программа → прослойка-переводчик → Linux kernel. Всегда что-то теряется: не все API реализованы, DRM и античиты не работают, производительность проседает. POLER-OS реализует прямую совместимость: ядро нативно понимает форматы PE/COFF и обрабатывает Win32/Win64 системные вызовы напрямую, без промежуточного слоя-переводчика. Windows-программа говорит на своём языке, и ядро её понимает нативно. Цель — 100% запуск Windows-софта без прослоек.
+
+### Нативная поддержка Linux-софта
+
+Linux-программы работают нативно — POLER-OS реализует подмножество Linux system call interface, позволяя запускать скомпилированный под Linux софт без перекомпиляции. Долгосрочная цель — нативная поддержка KDE Plasma и других десктопных сред через реализацию достаточного подмножества Linux syscalls для работы Wayland и Qt.
+
+---
+
+## Механизмы защиты
+
+Защита в POLER-OS — не надстройка (как ClamAV поверх Linux), а архитектурное свойство:
+
+| Механизм | Реализация | Уровень |
+|---|---|---|
+| Криптографическая неизменяемость ядра | Ядро верифицирует свою целостность и блокирует модификацию после загрузки | Ядро |
+| Сигнатурный анализ | База сигнатур известных угроз, userspace-сканер с kernel-хуками | Ядро + userspace |
+| Эвристический анализ | Мониторинг подозрительных паттернов syscall'ов на уровне ядра | Ядро |
+| Поведенческий мониторинг | Детект аномалий: массовое шифрование файлов, нетипичные системные вызовы | Ядро |
+| Контроль целостности (FIM) | Хеши критических файлов хранятся в ядре, верификация при каждом доступе | Ядро |
+| Обнаружение руткитов | Неизменяемое ядро исключает kernel-level руткиты; userspace-руткиты детектятся через FIM | Ядро + userspace |
+| Верификация пакетов | Ядро проверяет цифровую подпись перед установкой; неподписанные пакеты блокируются | Ядро (привратник) |
+
+Пакетный менеджер работает в userspace — ядро не должно содержать логику скачивания и распаковки. Но ядро выступает привратником: userspace-PM ставит, ядро верифицирует подпись и разрешает или блокирует установку.
 
 ---
 
@@ -10,19 +48,22 @@
 
 | Подсистема | Статус | Описание |
 |---|---|---|
-| Boot | ✅ | Multiboot2 → 32→64 transition → identity paging (4GB, 2MB pages) |
-| HAL | ✅ | GDT, IDT, PIC remap, Local APIC timer (vector 48), IO-APIC, TSS IST1 |
-| ACPI | ✅ | RSDP/RSDT/MADT/HPET parsing |
-| Memory | ✅ | PMM (bitmap), VMM (4-level paging + OOM rollback), kernel heap (free-list + SipHash-2-4) |
-| Scheduler | ✅ | Round-robin с APIC timer preemption (8 задач, divisor 16) |
-| Ring 3 | ✅ | User mode: ELF64 loader, per-process CR3, syscall/sysretq, TSS IST |
-| Framebuffer | ✅ | Linear framebuffer (1024×768×32bpp) + bitmap font |
-| Keyboard | ✅ | PS/2 Set 2 → Set 1 translation через i8042 controller |
-| Serial | ✅ | COM1 (115200 baud, 8N1) |
-| Crypto | ✅ | PND v8 (Parametric Nonlinear Diffusion), RSA-OAEP + POLER-CTR AEAD |
-| Syscalls | ✅ | syscall/sysretq: print, read_key, clear_screen |
-| SMP | ❌ | Планируется |
-| Networking | ❌ | Планируется (virtio-net) |
+| Boot | Готово | Multiboot2 → 32→64 transition → identity paging (4GB, 2MB pages) |
+| HAL | Готово | GDT, IDT, PIC remap, Local APIC timer (vector 48), IO-APIC, TSS IST1 |
+| ACPI | Готово | RSDP/RSDT/MADT/HPET parsing |
+| Memory | Готово | PMM (bitmap), VMM (4-level paging + OOM rollback), kernel heap (free-list + SipHash-2-4) |
+| Scheduler | Готово | Round-robin с APIC timer preemption (8 задач, divisor 16) |
+| Ring 3 | Готово | User mode: ELF64 loader, per-process CR3, syscall/sysretq, TSS IST |
+| Framebuffer | Готово | Linear framebuffer (1024x768x32bpp) + bitmap font |
+| Keyboard | Готово | PS/2 Set 2 → Set 1 translation через i8042 controller (bit 6) |
+| Serial | Готово | COM1 (115200 baud, 8N1) |
+| Crypto | Готово | PND v8 (Parametric Nonlinear Diffusion), RSA-OAEP + POLER-CTR AEAD |
+| Syscalls | Готово | syscall/sysretq: print, read_key, clear_screen |
+| SMP | Планируется | Многоядерность |
+| Networking | Планируется | virtio-net |
+| VFS | Планируется | Виртуальная файловая система |
+| Win32 compat | Планируется | Нативная обработка Win32/64 syscalls |
+| Package verifier | Планируется | Криптографическая верификация пакетов на уровне ядра |
 
 ---
 
@@ -30,10 +71,20 @@
 
 ### Зависимости
 
-- Zig 0.13.0
-- QEMU (для тестирования)
-- GRUB (`grub-pc-bin`, `grub-mkrescue`)
-- `xorriso`
+- **Zig 0.13.0** — компилятор
+- **QEMU** — для тестирования
+- **GRUB** (`grub-pc-bin`, `grub-mkrescue`) — загрузчик
+- **xorriso** — создание ISO
+
+Установка зависимостей (Debian/Ubuntu):
+
+```bash
+# Минимум для BIOS-загрузки
+sudo apt install grub-pc-bin xorriso
+
+# Для UEFI + BIOS dual-boot
+sudo apt install grub-pc-bin grub-efi-amd64-bin xorriso mtools
+```
 
 ### Команды
 
@@ -41,17 +92,28 @@
 # Сборка ядра (32-bit + 64-bit)
 zig build
 
-# Сборка загрузочного ISO
-cd zig-kernel && bash build-iso.sh
+# Сборка загрузочного ISO (BIOS + UEFI если доступны модули)
+zig build iso
 
-# Запуск 64-bit ядра в QEMU (direct kernel boot)
+# Запуск 64-bit ядра в QEMU (serial console, без графического окна)
 zig build run64
 
-# Запуск 32-bit ядра в QEMU
+# Запуск 64-bit ядра в QEMU (VGA окно + serial)
+zig build run64-gfx
+
+# Запуск 32-bit ядра в QEMU (legacy)
 zig build run32
 
 # Тесты POLER Core + RSA-OAEP
 zig build test
+```
+
+### Ручная сборка ISO
+
+```bash
+cd zig-kernel
+zig build
+bash build-iso.sh
 ```
 
 ### Запуск ISO в QEMU
@@ -96,26 +158,51 @@ zig-kernel/
 ├── iso-efi/                  # GRUB ISO структура (UEFI boot)
 ├── iso-minimal/              # Минимальная ISO структура
 ├── build.zig                 # Конфигурация сборки Zig
-├── build-iso.sh              # Скрипт сборки ISO
-└── run-qemu.sh               # Скрипт запуска QEMU
+├── build-iso.sh              # Скрипт сборки ISO (auto-detect BIOS/UEFI)
+├── build-minimal-iso.sh      # Минимальная ISO сборка
+├── run-qemu.sh               # Скрипт запуска QEMU
+└── run-qemu-iso.sh           # Скрипт запуска QEMU с ISO
 ```
 
 ---
 
 ## Дорожная карта
 
-- [x] Загрузка в 64-bit long mode
-- [x] HAL (GDT/IDT/PIC/APIC)
-- [x] APIC timer на vector 48
-- [x] Собственный GDT + TSS
-- [x] PMM + VMM + kernel heap
-- [x] Round-robin scheduler
-- [x] POLER Core (PND v8, RSA-OAEP, POLER-CTR)
-- [x] Syscalls (syscall/sysretq)
-- [x] Ring 3 (user mode) + ELF64 loader + per-process CR3
-- [ ] SMP (многоядерность)
-- [ ] Networking (virtio-net)
-- [ ] Anti-cheat gaming platform
+### Этап 1 — Ядро (текущий)
+- [x] Загрузка в 64-bit long mode через Multiboot2/GRUB
+- [x] HAL: GDT, IDT, PIC, APIC, IO-APIC, TSS
+- [x] Управление памятью: PMM + VMM + kernel heap
+- [x] Preemptive multitasking: round-robin scheduler
+- [x] Ring 3: user mode, ELF64 loader, per-process CR3
+- [x] Криптография: PND v8, RSA-OAEP, POLER-CTR AEAD
+- [x] Framebuffer, PS/2 клавиатура, serial console
+- [ ] SMP — многоядерность
+
+### Этап 2 — Файловая система и драйверы
+- [ ] VFS (виртуальная файловая система)
+- [ ] Файловая система (ext2 или собственная)
+- [ ] Драйвер AHCI/SATA
+- [ ] Драйвер сети (virtio-net / e1000)
+- [ ] USB stack
+
+### Этап 3 — Безопасность
+- [ ] Криптографическая блокировка ядра после загрузки
+- [ ] Верификация целостности системных файлов (FIM)
+- [ ] Сигнатурный сканер (userspace + kernel hooks)
+- [ ] Поведенческий мониторинг на уровне ядра
+- [ ] Верификатор пакетов (kernel gatekeeper)
+
+### Этап 4 — Совместимость
+- [ ] Подмножество Linux system call interface
+- [ ] PE/COFF loader (Windows executables)
+- [ ] Подмножество Win32/64 system calls
+- [ ] POSIX compatibility layer
+
+### Этап 5 — Графическая среда
+- [ ] GPU driver (минимальный)
+- [ ] Wayland / собственный display server
+- [ ] Qt портирование / нативная поддержка
+- [ ] KDE Plasma или собственная DE
 
 ---
 
