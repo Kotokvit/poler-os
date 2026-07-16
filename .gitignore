@@ -68,6 +68,8 @@ upload/
 .env
 .env.local
 worklog.md
+.worklog/
+*.worklog
 tool-results/
 scripts/
 skills/
@@ -79,6 +81,11 @@ Caddyfile
 bun.lock
 components.json
 db/
+
+# Agent tools (не часть ОС)
+.husky/
+package.json
+package-lock.json
 
 # Non-project directories — НИКОГДА не пушить
 file-explorer/
