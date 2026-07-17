@@ -26,6 +26,7 @@
 const hal = @import("../../hal.zig");
 const subsys = @import("../subsystem.zig");
 const objmgr = @import("../common/object_manager.zig");
+const ki = @import("../../kernel_integrate.zig");
 
 // ============================================================================
 // POSIX Syscall Numbers — Linux x86_64 ABI
@@ -308,6 +309,7 @@ pub const FdEntry = struct {
     obj_handle: u64 = 0, // Object Manager handle
     flags: u32 = 0, // O_RDONLY/O_WRONLY/O_RDWR | O_CLOEXEC | etc.
     offset: u64 = 0, // Current file offset
+    object_data: u64 = 0, // VFS file descriptor index (0 = not VFS-backed)
 };
 
 pub const FdTable = struct {
@@ -644,18 +646,27 @@ pub fn handleSyscall(syscall_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u6
 // ============================================================================
 
 fn posixRead(fd: i32, buf_addr: u64, count: u64) i64 {
-    _ = buf_addr;
-    _ = count;
-
     const entry = fd_table.getFd(fd) orelse return -@as(i64, subsys.EBADF);
     if (entry.flags & 3 == O_WRONLY) return -@as(i64, subsys.EBADF); // Not open for reading
 
-    // TODO: Read from VFS via Object Manager handle
-    hal.Serial.puts("[POSIX] read(fd=");
-    hal.Serial.putDecimal(fd);
-    hal.Serial.puts(", count=");
-    hal.Serial.putDecimal(count);
-    hal.Serial.puts(")\n");
+    // Route through VFS if the handle has a VFS file descriptor
+    if (entry.object_data != 0) {
+        const vfs_fd: usize = @intCast(entry.object_data);
+        const buf: [*]u8 = @ptrFromInt(buf_addr);
+        const bytes_read = ki.vfsRead(vfs_fd, buf[0..@intCast(count)], count);
+        return @intCast(bytes_read);
+    }
+
+    // stdin (fd 0) — read from keyboard
+    if (fd == 0) {
+        const ch = hal.kbd_pop();
+        if (ch != 0) {
+            const buf: [*]u8 = @ptrFromInt(buf_addr);
+            buf[0] = @truncate(ch);
+            return 1;
+        }
+        return 0; // No data available
+    }
 
     return -@as(i64, subsys.ENOSYS);
 }
@@ -671,7 +682,14 @@ fn posixWrite(fd: i32, buf_addr: u64, count: u64) i64 {
     const entry = fd_table.getFd(fd) orelse return -@as(i64, subsys.EBADF);
     if (entry.flags & 3 == O_RDONLY) return -@as(i64, subsys.EBADF); // Not open for writing
 
-    // TODO: Write to VFS via Object Manager handle
+    // Route through VFS if the handle has a VFS file descriptor
+    if (entry.object_data != 0) {
+        const vfs_fd: usize = @intCast(entry.object_data);
+        const data: [*]const u8 = @ptrFromInt(buf_addr);
+        const bytes_written = ki.vfsWrite(vfs_fd, data[0..@intCast(count)]);
+        return @intCast(bytes_written);
+    }
+
     return -@as(i64, subsys.ENOSYS);
 }
 
@@ -682,24 +700,45 @@ fn posixOpen(path_addr: u64, flags: i32, _mode: i32) i64 {
     const path_len = strLen(path);
     const path_slice = path[0..path_len];
 
-    hal.Serial.puts("[POSIX] open(\"");
-    hal.Serial.puts(path_slice);
-    hal.Serial.puts("\", flags=0x");
-    hal.Serial.putHex(@intCast(flags));
-    hal.Serial.puts(")\n");
+    const readable = (flags & 3) != O_WRONLY;
+    const writable = (flags & 3) != O_RDONLY;
 
-    // Allocate a file descriptor
-    const fd = fd_table.allocFd() orelse return -@as(i64, subsys.EMFILE);
+    // Try to open through VFS → FAT32
+    const vfs_fd = ki.vfsOpen(path_slice, false, readable, writable);
+    if (vfs_fd != null) {
+        // Allocate a file descriptor
+        const fd = fd_table.allocFd() orelse return -@as(i64, subsys.EMFILE);
 
-    // Create an Object Manager handle for this file
-    if (objmgr_ref) |om| {
-        const access: u64 = if (flags & 3 == O_RDONLY) 0x80000000 else if (flags & 3 == O_WRONLY) 0x40000000 else 0xC0000000;
-        const handle = om.createHandle(.File, access);
-        if (handle != objmgr.INVALID_HANDLE) {
+        if (fd_table.getFd(fd)) |entry| {
+            entry.obj_handle = 0; // VFS-managed
+            entry.flags = @intCast(flags & 0xFFFFFFFF);
+            entry.object_data = @intCast(vfs_fd.?); // Store VFS index
+        }
+
+        // Also create an Object Manager handle
+        if (objmgr_ref) |om| {
+            const access: u64 = if (!writable) 0x80000000 else if (!readable) 0x40000000 else 0xC0000000;
+            const handle = om.createHandle(.File, access);
             if (fd_table.getFd(fd)) |entry| {
                 entry.obj_handle = handle;
-                entry.flags = @intCast(flags & 0xFFFFFFFF);
             }
+        }
+
+        return fd;
+    }
+
+    // Fallback: open without VFS (for device files, pipes, etc.)
+    hal.Serial.puts("[POSIX] open: VFS failed for '");
+    hal.Serial.puts(path_slice);
+    hal.Serial.puts("'\n");
+
+    const fd = fd_table.allocFd() orelse return -@as(i64, subsys.EMFILE);
+    if (objmgr_ref) |om| {
+        const access: u64 = if (!writable) 0x80000000 else if (!readable) 0x40000000 else 0xC0000000;
+        const handle = om.createHandle(.File, access);
+        if (fd_table.getFd(fd)) |entry| {
+            entry.obj_handle = handle;
+            entry.flags = @intCast(flags & 0xFFFFFFFF);
         }
     }
 
@@ -710,6 +749,12 @@ fn posixClose(fd: i32) i64 {
     if (fd < 3) return 0; // Can't close stdin/stdout/stderr (stub)
 
     const entry = fd_table.getFd(fd) orelse return -@as(i64, subsys.EBADF);
+
+    // Close VFS file if present
+    if (entry.object_data != 0) {
+        const vfs_fd: usize = @intCast(entry.object_data);
+        _ = ki.vfsClose(vfs_fd);
+    }
 
     // Close Object Manager handle
     if (objmgr_ref) |om| {
@@ -754,32 +799,29 @@ fn posixLseek(fd: i32, offset: i64, whence: i32) i64 {
 
 fn posixMmap(addr: u64, length: i64, prot: i64, flags: i64, fd: i64, offset: i64) i64 {
     _ = addr;
-    _ = prot;
-    _ = flags;
     _ = fd;
     _ = offset;
 
     if (length <= 0) return -@as(i64, subsys.EINVAL);
 
-    // TODO: Allocate virtual memory via VMM
-    // For now, return a stub address
-    hal.Serial.puts("[POSIX] mmap(length=");
-    hal.Serial.putDecimal(@intCast(length));
-    hal.Serial.puts(")\n");
+    // Route through kernel integration layer → VMM
+    const result = ki.memoryMgrMmap(1, @intCast(length), prot, flags);
+    if (result) |virt_addr| {
+        return @intCast(virt_addr);
+    }
 
-    return -@as(i64, subsys.ENOSYS);
+    return -@as(i64, subsys.ENOMEM);
 }
 
 fn posixMunmap(addr: u64, length: i64) i64 {
-    _ = addr;
-    _ = length;
-    return -@as(i64, subsys.ENOSYS);
+    if (ki.memoryMgrMunmap(1, addr, @intCast(length))) {
+        return 0;
+    }
+    return -@as(i64, subsys.EINVAL);
 }
 
 fn posixBrk(addr: u64) i64 {
-    _ = addr;
-    // TODO: Implement program break management
-    return 0;
+    return @intCast(ki.memoryMgrBrk(1, addr));
 }
 
 fn posixIoctl(fd: i32, request: i64, arg: u64) i64 {
@@ -801,7 +843,8 @@ fn posixExit(exit_code: i32) i64 {
     hal.Serial.puts("[POSIX] exit(");
     hal.Serial.putDecimal(exit_code);
     hal.Serial.puts(")\n");
-    // TODO: Kill current process via scheduler
+    // Route through process manager
+    _ = ki.processMgrTerminate(1, exit_code);
     while (true) {
         asm volatile ("pause");
     }
@@ -809,17 +852,24 @@ fn posixExit(exit_code: i32) i64 {
 
 fn posixFork() i64 {
     hal.Serial.puts("[POSIX] fork()\n");
-    // TODO: Clone current process via scheduler
+    const child_pid = ki.processMgrFork(1); // Fork current process (PID 1)
+    if (child_pid) |pid| {
+        return pid;
+    }
     return -@as(i64, subsys.ENOSYS);
 }
 
 fn posixClone(flags: i64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) i64 {
     _ = flags;
-    _ = stack;
     _ = parent_tid;
     _ = child_tid;
     _ = tls;
-    hal.Serial.puts("[POSIX] clone()\n");
+
+    // Create a new thread via process manager
+    const result = ki.processMgrCreateThread(1, stack, 0);
+    if (result) |tid| {
+        return tid;
+    }
     return -@as(i64, subsys.ENOSYS);
 }
 
