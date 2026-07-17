@@ -175,6 +175,45 @@ pub const MSR = struct {
     pub const KERNEL_GS_BASE = 0xC0000102;
 };
 
+// ============================================================================
+// FS/GS Base Access (MSR-based)
+// ============================================================================
+
+/// Read FS_BASE MSR — contains the base address of the %fs segment.
+/// Used by TLS to find the thread pointer (%fs:0 = TCB).
+pub fn readFsBase() u64 {
+    return readMsr(MSR.FS_BASE);
+}
+
+/// Write FS_BASE MSR — set the base address of the %fs segment.
+/// Called when switching threads to point %fs at the new thread's TCB.
+pub fn writeFsBase(val: u64) void {
+    writeMsr(MSR.FS_BASE, val);
+}
+
+/// Read GS_BASE MSR — contains the base address of the %gs segment.
+/// Used by the kernel for per-CPU data (GSBASE points to PerCpu struct).
+pub fn readGsBase() u64 {
+    return readMsr(MSR.GS_BASE);
+}
+
+/// Write GS_BASE MSR — set the base address of the %gs segment.
+/// Called during SMP initialization to point GSBASE at each CPU's PerCpu.
+pub fn writeGsBase(val: u64) void {
+    writeMsr(MSR.GS_BASE, val);
+}
+
+/// Write KERNEL_GS_BASE MSR — swapgs target for kernel entry/exit.
+/// The kernel uses swapgs to switch between user GS_BASE and kernel GS_BASE.
+pub fn writeKernelGsBase(val: u64) void {
+    writeMsr(MSR.KERNEL_GS_BASE, val);
+}
+
+/// Read KERNEL_GS_BASE MSR
+pub fn readKernelGsBase() u64 {
+    return readMsr(MSR.KERNEL_GS_BASE);
+}
+
 pub const EFER = struct {
     pub const SCE = 1 << 0;  // System Call Extensions
     pub const LME = 1 << 8;  // Long Mode Enable
