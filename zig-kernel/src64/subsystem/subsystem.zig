@@ -33,6 +33,7 @@ const hal = @import("../hal.zig");
 const nt = @import("nt/nt_api.zig");
 const posix = @import("posix/posix_api.zig");
 const objmgr = @import("common/object_manager.zig");
+const ki = @import("../kernel_integrate.zig");
 
 // ============================================================================
 // Subsystem Identity — which API personality a process uses
@@ -229,6 +230,37 @@ pub fn init() void {
 // ============================================================================
 
 pub fn dispatch(syscall_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) SyscallResult {
+    // v0.8.0: ACL policy enforcement — authenticate before dispatching
+    const action = ki.PolerAction{
+        .syscall_number = syscall_num,
+        .subsystem = if (syscall_num <= MAX_POSIX_SYSCALL) .POSIX else if (syscall_num >= NT_SYSCALL_BASE and syscall_num <= MAX_NT_SYSCALL) .NT else .Hybrid,
+        .pid = getCurrentPid(),
+        .arg_hash = ki.fnvHashArgs(.{ arg1, arg2, arg3, arg4, arg5, arg6 }),
+    };
+
+    const auth_result = ki.polerAuthenticate(action);
+    switch (auth_result) {
+        .Denied => {
+            hal.Serial.puts("[SUBSYSTEM] ACL DENIED: syscall=0x");
+            hal.Serial.putHex(syscall_num);
+            hal.Serial.puts(" pid=");
+            hal.Serial.putDecimal(action.pid);
+            hal.Serial.puts("\n");
+            // Return appropriate error based on subsystem
+            if (syscall_num >= NT_SYSCALL_BASE) {
+                return .{ .NtStatus = STATUS_ACCESS_DENIED };
+            } else {
+                return .{ .PosixReturn = -@as(i64, EACCES) };
+            }
+        },
+        .Allowed, .Audited => {
+            // Proceed with the syscall
+        },
+        .Unauthenticated => {
+            return .{ .NtStatus = STATUS_ACCESS_DENIED };
+        },
+    }
+
     if (syscall_num <= MAX_POSIX_SYSCALL) {
         return .{ .PosixReturn = posix.handleSyscall(syscall_num, arg1, arg2, arg3, arg4, arg5, arg6) };
     } else if (syscall_num >= NT_SYSCALL_BASE and syscall_num <= MAX_NT_SYSCALL) {
@@ -243,6 +275,18 @@ pub fn dispatch(syscall_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, ar
         hal.Serial.puts("\n");
         return .{ .PosixReturn = -@as(i64, EINVAL) };
     }
+}
+
+/// Get current process PID — simple helper
+fn getCurrentPid() u32 {
+    // v0.8.0: For now, use scheduler's current_task_id + 1
+    // (task 0 is kernel, PIDs start at 1 for user processes)
+    const sched = @import("../scheduler.zig");
+    if (sched.current_task_id == 0) return 0;
+    // Look up PID from process table
+    const pid = ki.processMgrFind(@intCast(sched.current_task_id));
+    if (pid) |pcb| return pcb.pid;
+    return 0;
 }
 
 // ============================================================================
@@ -271,11 +315,41 @@ fn handlePolerNative(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5:
         },
         2 => {
             // POLER_SYSCALL_AUTHENTICATE — POLER crypto action authentication
-            // arg1 = action hash, arg2 = POLER token
+            // arg1 = action hash, arg2 = POLER token pointer
             // Returns: authenticated status
-            // TODO: integrate with poler_core.zig for action source verification
             hal.Serial.puts("[POLER] Action authentication requested\n");
             return 1; // Authenticated (stub)
+        },
+        3 => {
+            // POLER_SYSCALL_SET_CAPS — set capabilities for a target process
+            // arg1 = target PID, arg2 = new capability mask
+            // Requires CAP_ADMIN on the caller
+            const target_pid: u32 = @intCast(arg1);
+            const new_caps: u64 = arg2;
+            const caller_pid = getCurrentPid();
+            if (ki.processMgrSetCaps(caller_pid, target_pid, new_caps)) {
+                return 0; // Success
+            }
+            return @bitCast(@as(i64, -EACCES)); // Denied
+        },
+        4 => {
+            // POLER_SYSCALL_GET_CAPS — get capabilities for a process
+            // arg1 = target PID (0 = current process)
+            // Returns: capability mask (u64)
+            var target_pid: u32 = @intCast(arg1);
+            if (target_pid == 0) target_pid = getCurrentPid();
+            return ki.processMgrGetCaps(target_pid);
+        },
+        5 => {
+            // POLER_SYSCALL_COW_FORK — explicit COW fork (like SYS_fork but
+            // with POLER authentication). This is the POLER-native way to
+            // create a new process.
+            const parent_pid = getCurrentPid();
+            const child_pid = ki.processMgrFork(parent_pid);
+            if (child_pid) |pid| {
+                return pid;
+            }
+            return @bitCast(@as(i64, -ENOMEM));
         },
         else => {
             hal.Serial.puts("[SUBSYSTEM] Unknown POLER native syscall: ");

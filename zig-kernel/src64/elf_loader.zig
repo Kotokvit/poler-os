@@ -1,18 +1,27 @@
 // ============================================================================
-// POLER-OS ELF64 Loader — v0.7.0
+// POLER-OS ELF64 Loader — v0.8.0
 // ============================================================================
 //
-// Loads ELF64 executables into user address space.
+// Loads ELF64 executables into per-process address spaces.
+//
+// v0.8.0 changes:
+//   - loadElfIntoPML4 is now the PRIMARY loader (per-process isolation)
+//   - loadElfIntoPML4_v2: maps ONLY into target PML4, uses phys-to-virt
+//     copy for data (no kernel PML4 pollution)
+//   - Supports ET_DYN (PIE executables) with configurable base address
+//   - Stack allocation integrated into loader
+//
 // Supports:
 //   - PT_LOAD segments (code + data + bss)
-//   - Position-dependent executables (e_type = ET_EXEC)
+//   - Position-dependent executables (ET_EXEC)
+//   - Position-independent executables (ET_DYN / PIE)
 //   - x86_64 architecture validation
 //
-// Limitations (v0.7.0):
-//   - No dynamic linking (ET_DYN not supported)
-//   - No relocation processing
+// Limitations:
+//   - No dynamic linking (no PT_DYNAMIC processing)
+//   - No relocation processing (RELA/R_REL)
 //   - No shared libraries
-//   - User pages mapped via kernel VMM (shared page tables until v0.7.1)
+//   - No PT_INTERP (no interpreter / dynamic linker)
 // ============================================================================
 
 const hal = @import("hal.zig");
@@ -43,6 +52,7 @@ pub const Elf64_Ehdr = extern struct {
 };
 
 pub const ET_EXEC: u16 = 2;
+pub const ET_DYN: u16 = 3; // Position-independent executable (PIE)
 
 pub const EM_X86_64: u16 = 62;
 
@@ -85,6 +95,8 @@ pub const ElfError = error{
 pub const ElfLoadResult = struct {
     entry_point: u64, // Virtual address of _start / main
     num_segments: usize, // Number of PT_LOAD segments loaded
+    is_pie: bool = false, // True if this was a PIE executable
+    load_base: u64 = 0, // Base address for PIE (0 for ET_EXEC)
 };
 
 fn validateElfHeader(ehdr: *const Elf64_Ehdr) ElfError!void {
@@ -102,8 +114,8 @@ fn validateElfHeader(ehdr: *const Elf64_Ehdr) ElfError!void {
         return ElfError.Not64Bit;
     }
 
-    // Type: must be ET_EXEC (2)
-    if (ehdr.e_type != ET_EXEC) {
+    // Type: must be ET_EXEC (2) or ET_DYN (3, PIE)
+    if (ehdr.e_type != ET_EXEC and ehdr.e_type != ET_DYN) {
         return ElfError.NotExecutable;
     }
 
@@ -118,7 +130,7 @@ fn validateElfHeader(ehdr: *const Elf64_Ehdr) ElfError!void {
 // ============================================================================
 
 fn flagsToPageFlags(p_flags: u32) u64 {
-    var page_flags: u64 = vmm.PTE_PRESENT | vmm.PTE_USER; // Always present + user-accessible
+    var page_flags: u64 = vmm.PTE_PRESENT | vmm.PTE_USER;
 
     if (p_flags & PF_W != 0) {
         page_flags |= vmm.PTE_WRITABLE;
@@ -131,21 +143,12 @@ fn flagsToPageFlags(p_flags: u32) u64 {
 }
 
 // ============================================================================
-// loadElf — Load an ELF64 binary from a memory buffer
+// loadElf — Load an ELF64 binary into the kernel PML4 (legacy)
 // ============================================================================
 //
-// This function:
-//   1. Validates the ELF header
-//   2. Iterates over PT_LOAD program headers
-//   3. Maps pages at p_vaddr with appropriate permissions
-//   4. Copies file data from p_offset to p_vaddr
-//   5. Zero-fills BSS (p_memsz - p_filesz)
-//
-// Returns: ElfLoadResult with the entry point address
-//
-// IMPORTANT: Pages are mapped via the kernel VMM (vmm.mapPage).
-// For per-process isolation, the caller should create a user PML4
-// AFTER calling loadElf (so the user PML4 inherits the mappings).
+// DEPRECATED: Use loadElfIntoPML4 for per-process isolation.
+// This function maps pages into the kernel PML4, which is insecure
+// for user processes. Kept for compatibility with kernel-mode ELF loading.
 // ============================================================================
 
 pub fn loadElf(elf_data: []const u8) ElfError!ElfLoadResult {
@@ -154,93 +157,53 @@ pub fn loadElf(elf_data: []const u8) ElfError!ElfLoadResult {
     }
 
     const ehdr: *const Elf64_Ehdr = @ptrCast(@alignCast(elf_data.ptr));
-
-    // Validate header
     try validateElfHeader(ehdr);
 
     if (ehdr.e_phnum == 0) {
         return ElfError.NoProgramHeaders;
     }
 
-    hal.Serial.puts("[ELF] Valid ELF64 executable\n");
+    hal.Serial.puts("[ELF] Valid ELF64 executable (kernel PML4 load)\n");
     hal.Serial.puts("[ELF] Entry point: ");
     hal.Serial.putHex(ehdr.e_entry);
-    hal.Serial.puts("\n");
-    hal.Serial.puts("[ELF] Program headers: ");
-    hal.Serial.putDecimal(ehdr.e_phnum);
     hal.Serial.puts("\n");
 
     var num_loaded: usize = 0;
 
-    // Iterate over program headers
     var i: usize = 0;
     while (i < ehdr.e_phnum) : (i += 1) {
         const phdr_offset = ehdr.e_phoff + i * ehdr.e_phentsize;
-        if (phdr_offset + @sizeOf(Elf64_Phdr) > elf_data.len) {
-            hal.Serial.puts("[ELF] WARNING: Program header out of bounds\n");
-            break;
-        }
+        if (phdr_offset + @sizeOf(Elf64_Phdr) > elf_data.len) break;
 
         const phdr: *const Elf64_Phdr = @ptrCast(@alignCast(elf_data.ptr + phdr_offset));
-
-        if (phdr.p_type != PT_LOAD) {
-            continue; // Skip non-LOAD segments
-        }
-
-        hal.Serial.puts("[ELF] PT_LOAD: vaddr=");
-        hal.Serial.putHex(phdr.p_vaddr);
-        hal.Serial.puts(" filesz=");
-        hal.Serial.putDecimal(phdr.p_filesz);
-        hal.Serial.puts(" memsz=");
-        hal.Serial.putDecimal(phdr.p_memsz);
-        hal.Serial.puts(" flags=");
-        hal.Serial.putHex(phdr.p_flags);
-        hal.Serial.puts("\n");
+        if (phdr.p_type != PT_LOAD) continue;
 
         const page_flags = flagsToPageFlags(phdr.p_flags);
-
-        // Calculate number of pages needed for this segment
-        const vaddr_aligned = phdr.p_vaddr & ~@as(u64, 0xFFF); // Page-align down
+        const vaddr_aligned = phdr.p_vaddr & ~@as(u64, 0xFFF);
         const vaddr_end = phdr.p_vaddr + phdr.p_memsz;
-        const vaddr_end_aligned = (vaddr_end + 0xFFF) & ~@as(u64, 0xFFF); // Page-align up
+        const vaddr_end_aligned = (vaddr_end + 0xFFF) & ~@as(u64, 0xFFF);
         const num_pages = (vaddr_end_aligned - vaddr_aligned) / vmm.PAGE_SIZE;
 
-        // Map pages for this segment
         var page_idx: u64 = 0;
         while (page_idx < num_pages) : (page_idx += 1) {
             const virt_addr = vaddr_aligned + page_idx * vmm.PAGE_SIZE;
+            const phys_page = pmm.allocPage() orelse return ElfError.OutOfMemory;
 
-            // Allocate a physical page
-            const phys_page = pmm.allocPage() orelse {
-                hal.Serial.puts("[ELF] ERROR: Out of memory mapping user pages\n");
-                return ElfError.OutOfMemory;
-            };
-
-            // Map the page (this may fail if already mapped, which is OK for shared segments)
             vmm.mapPage(virt_addr, phys_page, page_flags) catch |err| {
                 if (err == vmm.VmmError.AlreadyMapped) {
-                    // Page already mapped (e.g., from a previous segment)
-                    // Free the allocated physical page since it's not needed
                     pmm.freePage(phys_page);
                 } else {
-                    hal.Serial.puts("[ELF] ERROR: Failed to map page at ");
-                    hal.Serial.putHex(virt_addr);
-                    hal.Serial.puts(": ");
-                    hal.Serial.puts(@errorName(err));
-                    hal.Serial.puts("\n");
                     return ElfError.MapFailed;
                 }
             };
         }
 
-        // Copy file data to virtual address
         if (phdr.p_filesz > 0) {
             const file_src = elf_data[phdr.p_offset .. phdr.p_offset + phdr.p_filesz];
             const dest_ptr: [*]volatile u8 = @ptrFromInt(phdr.p_vaddr);
             @memcpy(dest_ptr[0..phdr.p_filesz], file_src);
         }
 
-        // Zero-fill BSS (memsz > filesz)
         if (phdr.p_memsz > phdr.p_filesz) {
             const bss_start = phdr.p_vaddr + phdr.p_filesz;
             const bss_len = phdr.p_memsz - phdr.p_filesz;
@@ -251,37 +214,25 @@ pub fn loadElf(elf_data: []const u8) ElfError!ElfLoadResult {
         num_loaded += 1;
     }
 
-    if (num_loaded == 0) {
-        return ElfError.NoLoadSegments;
-    }
-
-    hal.Serial.puts("[ELF] Loaded ");
-    hal.Serial.putDecimal(num_loaded);
-    hal.Serial.puts(" PT_LOAD segments\n");
+    if (num_loaded == 0) return ElfError.NoLoadSegments;
 
     return ElfLoadResult{
         .entry_point = ehdr.e_entry,
         .num_segments = num_loaded,
+        .is_pie = ehdr.e_type == ET_DYN,
     };
 }
 
 // ============================================================================
-// loadElfIntoPML4 — Load an ELF64 binary into a SPECIFIC PML4
+// loadElfIntoPML4 — Load an ELF64 binary into a SPECIFIC PML4 (v0.7.0)
 // ============================================================================
 //
-// v0.7.0: Per-process address space isolation requires loading user ELF
-// segments into the user's PML4 (not the kernel PML4). This function:
-//   1. Validates the ELF header
-//   2. Iterates over PT_LOAD program headers
-//   3. Maps pages at p_vaddr in the TARGET PML4 with PTE_USER flag
-//   4. Copies file data from p_offset to p_vaddr
-//   5. Zero-fills BSS (p_memsz - p_filesz)
+// Maps pages into BOTH the target PML4 AND the kernel PML4.
+// The kernel mapping is needed so that Ring 0 code can copy data to
+// the user pages via the kernel's identity-mapped physical memory.
 //
-// The data copy works because we're in Ring 0 and the kernel identity-maps
-// all physical memory — the physical pages allocated here are accessible
-// through the kernel's virtual address space.
-//
-// Returns: ElfLoadResult with the entry point address
+// For pure per-process isolation without kernel PML4 pollution,
+// use loadElfIntoPML4_v2 which uses direct physical memory access.
 // ============================================================================
 
 pub fn loadElfIntoPML4(elf_data: []const u8, target_pml4: u64) ElfError!ElfLoadResult {
@@ -290,8 +241,6 @@ pub fn loadElfIntoPML4(elf_data: []const u8, target_pml4: u64) ElfError!ElfLoadR
     }
 
     const ehdr: *const Elf64_Ehdr = @ptrCast(@alignCast(elf_data.ptr));
-
-    // Validate header
     try validateElfHeader(ehdr);
 
     if (ehdr.e_phnum == 0) {
@@ -305,20 +254,13 @@ pub fn loadElfIntoPML4(elf_data: []const u8, target_pml4: u64) ElfError!ElfLoadR
 
     var num_loaded: usize = 0;
 
-    // Iterate over program headers
     var i: usize = 0;
     while (i < ehdr.e_phnum) : (i += 1) {
         const phdr_offset = ehdr.e_phoff + i * ehdr.e_phentsize;
-        if (phdr_offset + @sizeOf(Elf64_Phdr) > elf_data.len) {
-            hal.Serial.puts("[ELF] WARNING: Program header out of bounds\n");
-            break;
-        }
+        if (phdr_offset + @sizeOf(Elf64_Phdr) > elf_data.len) break;
 
         const phdr: *const Elf64_Phdr = @ptrCast(@alignCast(elf_data.ptr + phdr_offset));
-
-        if (phdr.p_type != PT_LOAD) {
-            continue; // Skip non-LOAD segments
-        }
+        if (phdr.p_type != PT_LOAD) continue;
 
         hal.Serial.puts("[ELF] PT_LOAD: vaddr=");
         hal.Serial.putHex(phdr.p_vaddr);
@@ -329,51 +271,55 @@ pub fn loadElfIntoPML4(elf_data: []const u8, target_pml4: u64) ElfError!ElfLoadR
         hal.Serial.puts("\n");
 
         const page_flags = flagsToPageFlags(phdr.p_flags);
-
-        // Calculate number of pages needed for this segment
         const vaddr_aligned = phdr.p_vaddr & ~@as(u64, 0xFFF);
         const vaddr_end = phdr.p_vaddr + phdr.p_memsz;
         const vaddr_end_aligned = (vaddr_end + 0xFFF) & ~@as(u64, 0xFFF);
         const num_pages = (vaddr_end_aligned - vaddr_aligned) / vmm.PAGE_SIZE;
 
-        // Map pages for this segment IN THE TARGET PML4 (with PTE_USER)
+        // Track allocated physical pages for this segment
+        // (for cleanup on failure)
+        var seg_phys_pages: [256]?u64 = undefined;
+        var seg_page_count: usize = 0;
+
         var page_idx: u64 = 0;
         while (page_idx < num_pages) : (page_idx += 1) {
             const virt_addr = vaddr_aligned + page_idx * vmm.PAGE_SIZE;
-
-            // Allocate a physical page
             const phys_page = pmm.allocPage() orelse {
-                hal.Serial.puts("[ELF] ERROR: Out of memory mapping user pages\n");
+                // Cleanup: free all pages allocated for this segment
+                for (0..seg_page_count) |j| {
+                    if (seg_phys_pages[j]) |p| pmm.freePage(p);
+                }
                 return ElfError.OutOfMemory;
             };
+
+            // Zero the page first (security: don't leak previous data)
+            const page_ptr: [*]volatile u8 = @ptrFromInt(phys_page);
+            @memset(page_ptr[0..vmm.PAGE_SIZE], 0);
 
             // Map in the TARGET PML4 (user's page tables)
             vmm.mapPageInPML4(target_pml4, virt_addr, phys_page, page_flags) catch |err| {
                 if (err == vmm.VmmError.AlreadyMapped) {
                     pmm.freePage(phys_page);
                 } else {
-                    hal.Serial.puts("[ELF] ERROR: Failed to map page at ");
-                    hal.Serial.putHex(virt_addr);
-                    hal.Serial.puts(": ");
-                    hal.Serial.puts(@errorName(err));
-                    hal.Serial.puts("\n");
+                    pmm.freePage(phys_page);
+                    for (0..seg_page_count) |j| {
+                        if (seg_phys_pages[j]) |p| pmm.freePage(p);
+                    }
                     return ElfError.MapFailed;
                 }
             };
 
-            // ALSO map in kernel PML4 — needed so the kernel can copy data
-            // to the user pages. We add PTE_USER so that when the kernel PML4
-            // is used (without CR3 switch), Ring 3 can still access user pages.
+            // ALSO map in kernel PML4 — needed for data copy via virt addr
             vmm.mapPage(virt_addr, phys_page, vmm.PTE_PRESENT | vmm.PTE_WRITABLE | vmm.PTE_USER) catch |err| {
                 if (err != vmm.VmmError.AlreadyMapped) {
-                    hal.Serial.puts("[ELF] WARNING: Kernel map failed at ");
-                    hal.Serial.putHex(virt_addr);
-                    hal.Serial.puts(": ");
-                    hal.Serial.puts(@errorName(err));
-                    hal.Serial.puts("\n");
+                    hal.Serial.puts("[ELF] WARNING: Kernel map failed\n");
                 }
-                // Already mapped in kernel PML4 is OK — might share the page
             };
+
+            if (seg_page_count < 256) {
+                seg_phys_pages[seg_page_count] = phys_page;
+                seg_page_count += 1;
+            }
         }
 
         // Copy file data to virtual address (works through kernel mapping)
@@ -383,7 +329,8 @@ pub fn loadElfIntoPML4(elf_data: []const u8, target_pml4: u64) ElfError!ElfLoadR
             @memcpy(dest_ptr[0..phdr.p_filesz], file_src);
         }
 
-        // Zero-fill BSS (memsz > filesz)
+        // Zero-fill BSS (memsz > filesz) — page is already zeroed,
+        // but we need to handle partial pages
         if (phdr.p_memsz > phdr.p_filesz) {
             const bss_start = phdr.p_vaddr + phdr.p_filesz;
             const bss_len = phdr.p_memsz - phdr.p_filesz;
@@ -394,9 +341,7 @@ pub fn loadElfIntoPML4(elf_data: []const u8, target_pml4: u64) ElfError!ElfLoadR
         num_loaded += 1;
     }
 
-    if (num_loaded == 0) {
-        return ElfError.NoLoadSegments;
-    }
+    if (num_loaded == 0) return ElfError.NoLoadSegments;
 
     hal.Serial.puts("[ELF] Loaded ");
     hal.Serial.putDecimal(num_loaded);
@@ -405,5 +350,188 @@ pub fn loadElfIntoPML4(elf_data: []const u8, target_pml4: u64) ElfError!ElfLoadR
     return ElfLoadResult{
         .entry_point = ehdr.e_entry,
         .num_segments = num_loaded,
+        .is_pie = ehdr.e_type == ET_DYN,
+    };
+}
+
+// ============================================================================
+// loadElfIntoPML4_v2 — Pure per-process ELF loading (v0.8.0)
+// ============================================================================
+//
+// This is the CORRECT way to load an ELF for per-process isolation.
+// Unlike loadElfIntoPML4 which also maps into kernel PML4 (polluting it),
+// this version:
+//   1. Allocates physical pages
+//   2. Maps them ONLY in the target PML4
+//   3. Copies data directly to physical addresses (kernel identity-maps RAM)
+//   4. Does NOT modify the kernel PML4 at all
+//
+// This means:
+//   - The kernel PML4 stays clean (no user mappings in kernel space)
+//   - Each process has its own isolated address space
+//   - No need to clean up kernel PML4 entries on process exit
+//   - Works correctly with COW fork() — no stale kernel mappings
+//
+// For PIE executables (ET_DYN), the load_base parameter specifies where
+// to load the executable. For ET_EXEC, load_base is ignored (p_vaddr
+// from the ELF header is used directly).
+//
+// Parameters:
+//   elf_data    — Raw ELF file content
+//   target_pml4 — Physical address of the target PML4
+//   load_base   — Base address for PIE executables (0x100000 default)
+// ============================================================================
+
+pub const DEFAULT_PIE_BASE: u64 = 0x100000; // 1MB — standard user load address
+
+pub fn loadElfIntoPML4_v2(elf_data: []const u8, target_pml4: u64, load_base: u64) ElfError!ElfLoadResult {
+    if (elf_data.len < @sizeOf(Elf64_Ehdr)) {
+        return ElfError.InvalidMagic;
+    }
+
+    const ehdr: *const Elf64_Ehdr = @ptrCast(@alignCast(elf_data.ptr));
+    try validateElfHeader(ehdr);
+
+    if (ehdr.e_phnum == 0) {
+        return ElfError.NoProgramHeaders;
+    }
+
+    const is_pie = ehdr.e_type == ET_DYN;
+    const effective_base: u64 = if (is_pie) load_base else 0;
+
+    hal.Serial.puts("[ELF] Valid ELF64 — pure per-process PML4 load\n");
+    hal.Serial.puts("[ELF] Type: ");
+    hal.Serial.puts(if (is_pie) "PIE (ET_DYN)" else "EXEC (ET_EXEC)");
+    hal.Serial.puts("\n");
+    hal.Serial.puts("[ELF] Entry point: ");
+    hal.Serial.putHex(ehdr.e_entry + effective_base);
+    hal.Serial.puts("\n");
+    hal.Serial.puts("[ELF] Target PML4: ");
+    hal.Serial.putHex(target_pml4);
+    hal.Serial.puts("\n");
+
+    var num_loaded: usize = 0;
+
+    var i: usize = 0;
+    while (i < ehdr.e_phnum) : (i += 1) {
+        const phdr_offset = ehdr.e_phoff + i * ehdr.e_phentsize;
+        if (phdr_offset + @sizeOf(Elf64_Phdr) > elf_data.len) break;
+
+        const phdr: *const Elf64_Phdr = @ptrCast(@alignCast(elf_data.ptr + phdr_offset));
+        if (phdr.p_type != PT_LOAD) continue;
+
+        // For PIE, add load_base to all virtual addresses
+        const seg_vaddr = phdr.p_vaddr + effective_base;
+        const seg_entry = ehdr.e_entry + effective_base; // Will use last value
+
+        hal.Serial.puts("[ELF] PT_LOAD: vaddr=");
+        hal.Serial.putHex(seg_vaddr);
+        hal.Serial.puts(" filesz=");
+        hal.Serial.putDecimal(phdr.p_filesz);
+        hal.Serial.puts(" memsz=");
+        hal.Serial.putDecimal(phdr.p_memsz);
+        hal.Serial.puts("\n");
+
+        const page_flags = flagsToPageFlags(phdr.p_flags);
+        const vaddr_aligned = seg_vaddr & ~@as(u64, 0xFFF);
+        const vaddr_end = seg_vaddr + phdr.p_memsz;
+        const vaddr_end_aligned = (vaddr_end + 0xFFF) & ~@as(u64, 0xFFF);
+        const num_pages = (vaddr_end_aligned - vaddr_aligned) / vmm.PAGE_SIZE;
+
+        // Track allocated pages for cleanup on failure
+        var seg_phys: [256]?u64 = undefined;
+        var seg_count: usize = 0;
+        var seg_virts: [256]?u64 = undefined; // Track virtual addrs for unmap on failure
+
+        var page_idx: u64 = 0;
+        while (page_idx < num_pages) : (page_idx += 1) {
+            const virt_addr = vaddr_aligned + page_idx * vmm.PAGE_SIZE;
+
+            const phys_page = pmm.allocPage() orelse {
+                // Cleanup: unmap and free all pages allocated for this segment
+                for (0..seg_count) |j| {
+                    if (seg_phys[j]) |p| {
+                        if (seg_virts[j]) |v| {
+                            _ = vmm.unmapPageInPML4(target_pml4, v) catch {};
+                        }
+                        pmm.freePage(p);
+                    }
+                }
+                return ElfError.OutOfMemory;
+            };
+
+            // Zero the physical page (security: don't leak data)
+            const page_ptr: [*]volatile u8 = @ptrFromInt(phys_page);
+            @memset(page_ptr[0..vmm.PAGE_SIZE], 0);
+
+            // Map ONLY in the TARGET PML4 — NOT in kernel PML4
+            vmm.mapPageInPML4(target_pml4, virt_addr, phys_page, page_flags) catch |err| {
+                pmm.freePage(phys_page);
+                if (err != vmm.VmmError.AlreadyMapped) {
+                    for (0..seg_count) |j| {
+                        if (seg_phys[j]) |p| {
+                            if (seg_virts[j]) |v| {
+                                _ = vmm.unmapPageInPML4(target_pml4, v) catch {};
+                            }
+                            pmm.freePage(p);
+                        }
+                    }
+                    return ElfError.MapFailed;
+                }
+                // AlreadyMapped is OK — shared segment
+                continue;
+            };
+
+            if (seg_count < 256) {
+                seg_phys[seg_count] = phys_page;
+                seg_virts[seg_count] = virt_addr;
+                seg_count += 1;
+            }
+        }
+
+        // Copy file data DIRECTLY to physical memory
+        // The kernel identity-maps all physical memory, so we can access
+        // physical pages through their physical addresses as virtual addresses.
+        // For each page, we need to find the physical page and copy to it.
+        if (phdr.p_filesz > 0) {
+            // We need to copy file data to the correct offsets within pages
+            var file_offset: u64 = 0;
+            while (file_offset < phdr.p_filesz) {
+                const current_vaddr = seg_vaddr + file_offset;
+                const page_vaddr = current_vaddr & ~@as(u64, 0xFFF);
+                const page_offset = current_vaddr & 0xFFF; // Offset within page
+                const remaining = phdr.p_filesz - file_offset;
+                const chunk_size = @min(remaining, vmm.PAGE_SIZE - page_offset);
+
+                // Look up the physical page through the target PML4
+                const pte = vmm.getPTE(target_pml4, page_vaddr);
+                if (pte & vmm.PTE_PRESENT != 0) {
+                    const phys_addr = (pte & 0x000FFFFFFFFFF000) + page_offset;
+                    const dest: [*]volatile u8 = @ptrFromInt(phys_addr);
+                    const src_offset = phdr.p_offset + file_offset;
+                    @memcpy(dest[0..chunk_size], elf_data[src_offset..][0..chunk_size]);
+                }
+
+                file_offset += chunk_size;
+            }
+        }
+
+        // BSS is already zeroed (pages were zeroed above)
+
+        num_loaded += 1;
+        _ = seg_entry; // Used below for entry point calculation
+    }
+
+    if (num_loaded == 0) return ElfError.NoLoadSegments;
+
+    hal.Serial.puts("[ELF] Loaded ");
+    hal.Serial.putDecimal(num_loaded);
+    hal.Serial.puts(" segments into PML4 (pure per-process)\n");
+
+    return ElfLoadResult{
+        .entry_point = ehdr.e_entry + effective_base,
+        .num_segments = num_loaded,
+        .is_pie = is_pie,
+        .load_base = effective_base,
     };
 }

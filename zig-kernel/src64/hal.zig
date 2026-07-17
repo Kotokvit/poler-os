@@ -7,6 +7,11 @@
 // Breaks circular dependency: hal.zig ↔ scheduler.zig
 pub var timerTickCallback: ?*const fn (u64) callconv(.C) u64 = null;
 
+// COW page fault callback — registered by VMM at init
+// Breaks circular dependency: hal.zig ↔ vmm64.zig
+// Parameters: (fault_virt, fault_cr3, error_code) → true if COW handled
+pub var cowPageFaultCallback: ?*const fn (u64, u64, u64) callconv(.C) bool = null;
+
 // Simple spinlock for protecting shared resources (e.g. serial output)
 pub var serial_lock: u32 = 0;
 
@@ -115,6 +120,24 @@ pub fn writeCr3(val: u64) void {
         : [val] "r" (val),
         : "memory"
     );
+}
+
+/// Read CR2 — contains the page fault linear address
+pub fn readCr2() u64 {
+    return asm volatile ("mov %%cr2, %[val]"
+        : [val] "=r" (-> u64),
+    );
+}
+
+/// Read TSC (Time Stamp Counter) — for audit timestamps
+pub fn readTsc() u64 {
+    var low: u32 = undefined;
+    var high: u32 = undefined;
+    asm volatile ("rdtsc"
+        : [low] "={eax}" (low),
+          [high] "={edx}" (high),
+    );
+    return (@as(u64, high) << 32) | @as(u64, low);
 }
 
 pub fn readMsr(msr: u32) u64 {
@@ -421,6 +444,42 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
 fn handleException(frame: *InterruptFrame) void {
     // v0.7.0: Differentiate user-mode vs kernel-mode exceptions
     const from_user = (frame.cs & 0x3) != 0;
+
+    // v0.8.0: Page fault (vector 14) may be COW — try to resolve before killing
+    if (frame.vector == 14) {
+        // Page fault — CR2 contains the faulting virtual address
+        const fault_virt = readCr2();
+        const fault_cr3 = readCr3() & 0x000FFFFFFFFFF000;
+        const error_code = frame.error_code;
+
+        // Try COW handler first
+        if (cowPageFaultCallback) |cow_handler| {
+            if (cow_handler(fault_virt, fault_cr3, error_code)) {
+                // COW resolved — the page fault was a legitimate COW fault
+                // and has been resolved. Return to retry the instruction.
+                return;
+            }
+        }
+
+        // Not a COW fault — log and handle as a real page fault
+        Serial.puts("\n!!! PAGE FAULT (#PF) !!!\n");
+        Serial.puts("Fault address: ");
+        Serial.putHex(fault_virt);
+        Serial.puts("\nError Code: ");
+        Serial.putHex(error_code);
+        const present = error_code & 0x01 != 0;
+        const write = error_code & 0x02 != 0;
+        const user = error_code & 0x04 != 0;
+        const rsvd = error_code & 0x08 != 0;
+        const exec = error_code & 0x10 != 0;
+        Serial.puts(" [");
+        if (present) Serial.puts("P") else Serial.puts("NP");
+        if (write) Serial.puts(" W") else Serial.puts(" R");
+        if (user) Serial.puts(" U") else Serial.puts(" S");
+        if (rsvd) Serial.puts(" RSVD");
+        if (exec) Serial.puts(" X");
+        Serial.puts("]\n");
+    }
 
     Serial.puts("\n!!! CPU EXCEPTION !!!\n");
     Serial.puts("Vector: ");
