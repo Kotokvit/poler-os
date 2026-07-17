@@ -191,7 +191,8 @@ fileCards.forEach(card => {
 
     const textExts = [".md",".txt",".json",".js",".ts",".tsx",".py",".zig",".html",".css",".sh",".cfg",".ld",".s",".csv"];
     if (ext === ".pdf") {
-      previewBody.innerHTML = '<iframe src="/api/file?path="+encodeURIComponent(path)+" style="width:100%;height:calc(100vh - 200px);min-height:400px;border:none;border-radius:8px;background:#fff" title="'+name+'"></iframe><a href="/api/file?path="+encodeURIComponent(path)+" download="'+name+'" class="dl-btn">⬇ Скачать PDF</a>';
+      const furl = '/api/file?path='+encodeURIComponent(path);
+      previewBody.innerHTML = '<iframe src="'+furl+'" style="width:100%;height:calc(100vh - 200px);min-height:400px;border:none;border-radius:8px;background:#fff" title="'+name+'"></iframe><a href="'+furl+'" download="'+name+'" class="dl-btn">⬇ Скачать PDF</a>';
     } else if (textExts.includes(ext)) {
       try {
         const res = await fetch('/api/text?path=' + encodeURIComponent(path));
