@@ -40,14 +40,45 @@ Remove `@import("std")` from poler_core.zig:
 - RTL8139/e1000 NIC driver
 - TCP/IP stack (lwIP port or minimal custom)
 
-## Next: v0.9.0 — Intent Layer
+## Completed: v0.8.0 — Dual-Personality Kernel
+
+- [x] COW for fork() — clonePML4_COW() with PTE_COW bit
+- [x] unmapPageInPML4() for munmap — proper page table cleanup
+- [x] ELF loading into per-process PML4 — ET_EXEC + ET_DYN/PIE support
+- [x] Real ACL policy for POLER Auth — RSA-OAEP, 10 CSP
+- [x] Dual NT+POSIX syscall dispatch — NtXxx/ZwXxx + POSIX simultaneously
+- [x] ApiSetMap v6 — 891 virtual API sets, 6 overrides
+- [x] VFS ↔ FAT32 integration, ProcessMgr, mmap ↔ VMM
+
+## Completed: v0.9.0 — COW Refcounting + SMP TLB + Dynamic Linker
+
+- [x] Reference counting for COW pages — refPage/unrefPage/freePage with atomics
+- [x] SMP TLB shootdown via IPI — cross-core TLB invalidation with wait-for-completion
+- [x] ELF64 dynamic linker — .so parsing, RELA/JMPREL relocations, SVR4/GNU hash lookup
+- [x] DT_NEEDED enumeration, PLT/GOT setup, init/fini functions
+
+## Completed: v1.0.0 — Production Dynamic Linker
+
+- [x] PLT lock for thread-safe lazy binding — per-library spinlock, double-check on GOT
+- [x] TLS (Thread-Local Storage) — PT_TLS parsing, TCB allocation, DTV, __tls_get_addr
+- [x] Weak symbols — STB_WEAK resolves to 0 if absent (not error)
+- [x] Symbol versioning — DT_VERSYM/DT_VERNEED/DT_VERDEF with version matching
+- [x] DT_NEEDED auto-loading from /lib/ via VFS (FAT32 stub, ready for integration)
+- [x] BIND_NOW / DF_1_NOW support (eager vs lazy binding)
+- [x] FS/GS Base MSR access in HAL — readFsBase/writeFsBase for TLS
+- [x] STV_HIDDEN visibility — hidden symbols not exported across libraries
+- [x] New relocation types: R_X86_64_TPOFF64, R_X86_64_DTPMOD64, R_X86_64_DTPOFF64
+
+## Next: v1.1.0 — Intent Layer + VFS Integration
 
 - Intent struct + dispatcher
 - FS/NET/PROC adapters
 - POLER Firewall integration (intent verification via ⊗_ε)
 - Object table (capability-based access)
+- Full VFS → dynlinker integration (wire FAT32 open/read/close to loadFromVfs)
+- Thread creation with TCB allocation and FS_BASE switching
 
-## Next: v1.0.0 — Shell + Self-Hosting
+## Next: v2.0.0 — Shell + Self-Hosting
 
 - Interactive shell with pipe/redirection
 - Text editor
