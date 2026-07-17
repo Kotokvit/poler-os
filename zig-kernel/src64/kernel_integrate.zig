@@ -35,6 +35,7 @@ const subsys = @import("subsystem/subsystem.zig");
 const objmgr = @import("subsystem/common/object_manager.zig");
 const nt_api = @import("subsystem/nt/nt_api.zig");
 const posix_api = @import("subsystem/posix/posix_api.zig");
+const dynlink = @import("dynlinker.zig");
 
 // ============================================================================
 // 1. VFS ↔ FAT32 Integration
@@ -1151,6 +1152,9 @@ pub fn kernelIntegrateInit() void {
     }
     acl_audit_index = 0;
 
+    // v0.9.0: Initialize dynamic linker
+    dynlink.init();
+
     hal.Serial.puts("[INTEGRATE] All kernel integration layers initialized\n");
-    hal.Serial.puts("[INTEGRATE] VFS, ProcessMgr+COW, mmap+unmapPageInPML4, POLER+ACL\n");
+    hal.Serial.puts("[INTEGRATE] VFS, ProcessMgr+COW+refcount, mmap+unmapPageInPML4, POLER+ACL, dynlink\n");
 }

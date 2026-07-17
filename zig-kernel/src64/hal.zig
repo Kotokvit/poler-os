@@ -338,6 +338,21 @@ pub const IDT = struct {
             }
         }
 
+        // v0.9.0: Manually register TLB shootdown IPI handler (vector 240 = 0xF0)
+        // This vector is not in the standard ISR stub table (which only has vectors 0-48)
+        // but was added as isr_stub_240 in isr64.S
+        const vmm = @import("vmm64.zig");
+        // We need the address of isr_stub_240, which is at index 49 in the extended table
+        // The ISR stub table now has 50 entries (0-48 + 240)
+        if (num_entries > 49) {
+            const ptr_arr: [*]const u64 = @ptrFromInt(table_start);
+            const shootdown_handler: u64 = ptr_arr[49];
+            if (shootdown_handler > 0x100000) {
+                setGate(240, .interrupt, shootdown_handler, 0x08, 0, 0);
+                Serial.puts("[IDT] TLB shootdown IPI handler registered at vector 0xF0\n");
+            }
+        }
+
         // Load IDT using raw 10-byte descriptor (2 bytes limit + 8 bytes base)
         var idt_ptr: [10]u8 = undefined;
         const limit: u16 = @intCast(@sizeOf(u128) * NUM_ENTRIES - 1);
@@ -435,6 +450,12 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
         },
         33 => handleKeyboard(frame),
         36 => handleSerial(frame),
+        240 => {
+            // v0.9.0: TLB Shootdown IPI — received from another CPU
+            // Call the VMM's shootdown handler
+            const vmm = @import("vmm64.zig");
+            vmm.handleTlbShootdownIpi();
+        },
         else => {}, // Unknown interrupt — ignore for now
     }
     
@@ -699,6 +720,15 @@ pub const APIC = struct {
     pub const LVT_MASKED: u32 = 1 << 16;
     pub const DIV_BY_16: u32 = 0x03;
 
+    // ICR (Interrupt Command Register) delivery modes
+    pub const ICR_INIT: u32 = 0x00000500; // Delivery mode: INIT (101)
+    pub const ICR_STARTUP: u32 = 0x00000600; // Delivery mode: SIPI (110)
+    pub const ICR_ASSERT: u32 = 1 << 14; // Assert (edge triggered)
+    pub const ICR_DEASSERT: u32 = 0; // Deassert
+    pub const ICR_LEVEL: u32 = 1 << 15; // Level triggered
+    pub const ICR_BCAST_EXCLUDE_SELF: u32 = 1 << 19 | 1 << 18; // Shorthand: all except self (01)
+    pub const ICR_BCAST_ALL_INCL_SELF: u32 = 1 << 19; // Shorthand: all including self (10)
+
     var base_addr: u64 = 0;
 
     pub fn init() void {
@@ -755,6 +785,55 @@ pub const APIC = struct {
 
     pub fn getId() u32 {
         return readReg(REG_ID) >> 24;
+    }
+
+    /// Send an IPI (Inter-Processor Interrupt) to a specific APIC ID
+    /// This is the low-level function that writes to the ICR registers.
+    /// The ICR is a 64-bit register split into two 32-bit MMIO registers:
+    ///   REG_ICR_HIGH (0x310): bits 63:32 — destination APIC ID in bits 63:56
+    ///   REG_ICR_LOW  (0x300): bits 31:0  — vector, delivery mode, etc.
+    fn sendIpi(apic_id: u32, icr_low: u32) void {
+        // Wait until the previous IPI has been delivered (ICR bit 12 = Delivery Status)
+        // If we don't wait, we can overwrite a pending IPI and lose it.
+        var timeout: u32 = 0;
+        while ((readReg(REG_ICR_LOW) & (1 << 12)) != 0) : (timeout += 1) {
+            if (timeout > 1000000) {
+                Serial.puts("[APIC] IPI delivery timeout!\n");
+                break;
+            }
+            asm volatile ("pause");
+        }
+
+        // Write destination APIC ID to ICR high register
+        writeReg(REG_ICR_HIGH, apic_id << 24);
+
+        // Write command to ICR low register — this triggers the IPI
+        writeReg(REG_ICR_LOW, icr_low);
+    }
+
+    /// Send INIT IPI to a specific CPU (used for AP startup)
+    pub fn sendInitIpi(apic_id: u32) void {
+        sendIpi(apic_id, ICR_INIT | ICR_ASSERT | ICR_LEVEL);
+    }
+
+    /// Send STARTUP IPI (SIPI) to a specific CPU (used for AP startup)
+    /// The vector parameter is the page number where the AP starts (0x08 = page 8 = 0x8000)
+    pub fn sendStartupIpi(apic_id: u32, vector_page: u32) void {
+        sendIpi(apic_id, ICR_STARTUP | (vector_page & 0xFF));
+    }
+
+    /// Send a broadcast IPI to all CPUs EXCEPT self.
+    /// Used for TLB shootdown — all other CPUs receive the interrupt
+    /// and check if they need to invalidate their TLB entries.
+    ///
+    /// The vector parameter is the interrupt vector number to deliver.
+    /// For TLB shootdown, this is TLB_SHOOTDOWN_VECTOR (0xF0).
+    pub fn sendBroadcastIpiExcludeSelf(vector: u32) void {
+        // No need to specify destination — the shorthand field handles it
+        // ICR bits 19:18 = 01 → "All excluding self"
+        // No destination field needed in ICR_HIGH for shorthand mode
+        writeReg(REG_ICR_HIGH, 0);
+        writeReg(REG_ICR_LOW, ICR_BCAST_EXCLUDE_SELF | (vector & 0xFF));
     }
 };
 
