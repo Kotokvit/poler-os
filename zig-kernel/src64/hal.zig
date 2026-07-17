@@ -1012,77 +1012,20 @@ pub fn initSyscalls(handler_addr: u64) void {
     Serial.puts("[HAL] Syscall mechanism initialized\n");
 }
 
-pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, syscall_num: u64) callconv(.C) u64 {
-    _ = arg3;
-    _ = arg4;
+// NOTE: zig_syscall_handler is now defined in syscall_integration.zig
+// which routes syscalls through the dual-personality subsystem dispatcher.
+//
+// Legacy syscalls (1-5) are still supported for backward compatibility.
+// New syscalls use the subsystem dispatch:
+//   0x0000-0x0FFF: POSIX (Linux-compatible)
+//   0x1000-0x1FFF: NT (Windows NtXxx)
+//   0x2000-0x2FFF: POLER-OS native
+//
+// See: src64/subsystem/subsystem.zig for the full architecture.
 
-    // Re-enable interrupts — syscall clears IF via SFMASK, but we need
-    // timer interrupts to fire for preemptive scheduling. IF will be
-    // restored from R11 on sysretq anyway.
-    sti();
-
-    switch (syscall_num) {
-        1 => {
-            // Syscall 1: Print string
-            // arg1 = pointer to string, arg2 = length
-            const ptr: [*]const u8 = @ptrFromInt(arg1);
-            const len: usize = @intCast(arg2);
-            const slice = ptr[0..len];
-            if (print_fn) |f| {
-                f(slice);
-            } else {
-                Serial.puts(slice);
-            }
-            return 0;
-        },
-        2 => {
-            // Syscall 2: Read key (non-blocking)
-            return kbd_pop();
-        },
-        3 => {
-            // Syscall 3: Clear screen
-            if (clear_screen_fn) |f| {
-                f();
-            }
-            return 0;
-        },
-        4 => {
-            // Syscall 4: Exit — terminate the calling user process
-            // arg1 = exit code (unused for now)
-            // This sets the current task to Killed state.
-            // The scheduler will skip Killed tasks on next tick.
-            Serial.puts("[SYSCALL] exit(");
-            Serial.putDecimal(arg1);
-            Serial.puts(") — killing user process\n");
-
-            // Import scheduler to kill the current task.
-            // We can't import scheduler directly (circular dep), so we use
-            // a function pointer callback, similar to timerTickCallback.
-            if (exitCallback) |cb| {
-                cb();
-            }
-            // The task should never reach here — the scheduler will
-            // have marked it as Killed and won't return to it.
-            // But just in case, spin forever.
-            while (true) {
-                asm volatile ("pause");
-            }
-        },
-        5 => {
-            // Syscall 5: Yield — voluntarily give up CPU time
-            // The scheduler will pick the next Ready task on the next tick.
-            // For now, this is a no-op since the APIC timer preempts anyway.
-            // In the future, this could trigger an immediate reschedule.
-            return 0;
-        },
-        else => {
-            Serial.puts("[SYSCALL] Unknown syscall: ");
-            Serial.putDecimal(syscall_num);
-            Serial.puts("\n");
-            return @as(u64, @bitCast(@as(i64, -1)));
-        }
-    }
-}
+// The assembly code in isr64.S calls zig_syscall_handler, which is now
+// exported from syscall_integration.zig. We keep the variables here
+// that the integration module references.
 
 // Exit callback — registered by scheduler at init to break circular dependency
 pub var exitCallback: ?*const fn () callconv(.C) void = null;

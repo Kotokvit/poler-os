@@ -1,5 +1,5 @@
 // ============================================================================
-// POLER-OS v0.7.0 — 64-bit x86_64 Universal OS Kernel
+// POLER-OS v0.8.0 — 64-bit x86_64 Dual-Personality OS Kernel
 // ============================================================================
 //
 // Эволюция:
@@ -7,6 +7,10 @@
 //   v0.5.0: 64-bit boot, HAL (GDT/IDT/PIC/APIC), ACPI, interrupts
 //   v0.5.1: VirtualBox compatibility, 64-bit Long Mode fix
 //   v0.7.0: VirtIO-BLK + FAT32 + PCI, Ring 3, ELF loader, scheduler, crypto
+//   v0.8.0: Dual-personality kernel — NT API + POSIX simultaneously
+//           Both APIs are first-class, neither is a translation layer.
+//           Object Manager provides unified namespace.
+//           Syscall dispatcher routes to NT/POSIX/POLER handlers.
 // ============================================================================
 
 const hal = @import("hal.zig");
@@ -23,6 +27,8 @@ const framebuffer = @import("framebuffer.zig");
 const pci = @import("pci.zig");
 const virtio_blk = @import("virtio_blk.zig");
 const fat32 = @import("fat32.zig");
+const subsys = @import("subsystem/subsystem.zig");
+const syscall_int = @import("syscall_integration.zig");
 
 
 
@@ -598,17 +604,20 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     // 9. Ready!
     vga_setcolor(0x0B);
     puts("\n╔══════════════════════════════════════════════════════╗\n");
-    puts("║         POLER-OS v0.7.0 — BOOT COMPLETE             ║\n");
-    puts("║     HAL + ACPI + POLER Core — all systems GO        ║\n");
+    puts("║     POLER-OS v0.8.0 — DUAL-PERSONALITY KERNEL       ║\n");
+    puts("║   NT API + POSIX — Neither is a crutch. Both native. ║\n");
     puts("╚══════════════════════════════════════════════════════╝\n");
     vga_setcolor(0x07);
 
     puts("\nNext steps: Memory Manager (PMM/VMM) → Process Service → Intent Layer\n");
     puts("Timer: APIC periodic, tick count will increment in idle loop\n");
 
-    // 8.55. Initialize Syscalls
-    hal.print_fn = &puts;
-    hal.clear_screen_fn = &clear_screen;
+    // 8.5a. Initialize Dual-Personality Subsystem Dispatcher
+    subsys.init();
+
+    // 8.5b. Initialize Syscalls — now routes through subsystem dispatcher
+    syscall_int.print_fn = &puts;
+    syscall_int.clear_screen_fn = &clear_screen;
     hal.initSyscalls(@intFromPtr(&syscall_entry));
 
     // 8.6. Initialize Scheduler & Preemptive Multitasking
