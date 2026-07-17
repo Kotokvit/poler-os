@@ -68,6 +68,8 @@ pub const Elf64_Phdr = extern struct {
 };
 
 pub const PT_LOAD: u32 = 1;
+pub const PT_DYNAMIC: u32 = 2; // Dynamic linking information
+pub const PT_INTERP: u32 = 3; // Path to dynamic linker (interpreter)
 
 pub const PF_X: u32 = 1;
 pub const PF_W: u32 = 2;
@@ -355,7 +357,7 @@ pub fn loadElfIntoPML4(elf_data: []const u8, target_pml4: u64) ElfError!ElfLoadR
 }
 
 // ============================================================================
-// loadElfIntoPML4_v2 — Pure per-process ELF loading (v0.8.0)
+// loadElfIntoPML4_v2 — Pure per-process ELF loading (v0.9.0)
 // ============================================================================
 //
 // This is the CORRECT way to load an ELF for per-process isolation.
@@ -365,12 +367,14 @@ pub fn loadElfIntoPML4(elf_data: []const u8, target_pml4: u64) ElfError!ElfLoadR
 //   2. Maps them ONLY in the target PML4
 //   3. Copies data directly to physical addresses (kernel identity-maps RAM)
 //   4. Does NOT modify the kernel PML4 at all
+//   5. v0.9.0: If PT_DYNAMIC is found, invokes the dynamic linker
 //
 // This means:
 //   - The kernel PML4 stays clean (no user mappings in kernel space)
 //   - Each process has its own isolated address space
 //   - No need to clean up kernel PML4 entries on process exit
 //   - Works correctly with COW fork() — no stale kernel mappings
+//   - Shared libraries are loaded and linked automatically
 //
 // For PIE executables (ET_DYN), the load_base parameter specifies where
 // to load the executable. For ET_EXEC, load_base is ignored (p_vaddr
@@ -527,6 +531,37 @@ pub fn loadElfIntoPML4_v2(elf_data: []const u8, target_pml4: u64, load_base: u64
     hal.Serial.puts("[ELF] Loaded ");
     hal.Serial.putDecimal(num_loaded);
     hal.Serial.puts(" segments into PML4 (pure per-process)\n");
+
+    // v0.9.0: Check for PT_DYNAMIC and invoke dynamic linker if present
+    var has_dynamic = false;
+    i = 0;
+    while (i < ehdr.e_phnum) : (i += 1) {
+        const phdr_offset2 = ehdr.e_phoff + i * ehdr.e_phentsize;
+        if (phdr_offset2 + @sizeOf(Elf64_Phdr) > elf_data.len) break;
+        const phdr2: *const Elf64_Phdr = @ptrCast(@alignCast(elf_data.ptr + phdr_offset2));
+        if (phdr2.p_type == PT_DYNAMIC) {
+            has_dynamic = true;
+            break;
+        }
+    }
+
+    if (has_dynamic) {
+        hal.Serial.puts("[ELF] PT_DYNAMIC found — invoking dynamic linker\n");
+        const dynlink = @import("dynlinker.zig");
+        dynlink.linkDynamicExecutable(elf_data, effective_base, target_pml4) catch |err| {
+            hal.Serial.puts("[ELF] WARNING: dynamic linking failed: ");
+            switch (err) {
+                dynlink.DynLinkError.NoDynamicSegment => hal.Serial.puts("NoDynamicSegment"),
+                dynlink.DynLinkError.SymbolNotFound => hal.Serial.puts("SymbolNotFound"),
+                dynlink.DynLinkError.LibraryNotFound => hal.Serial.puts("LibraryNotFound"),
+                dynlink.DynLinkError.RelocationFailed => hal.Serial.puts("RelocationFailed"),
+                dynlink.DynLinkError.OutOfMemory => hal.Serial.puts("OutOfMemory"),
+                dynlink.DynLinkError.MapFailed => hal.Serial.puts("MapFailed"),
+                dynlink.DynLinkError.InvalidDynamicEntry => hal.Serial.puts("InvalidDynamicEntry"),
+            }
+            hal.Serial.puts(" — continuing without shared libraries\n");
+        };
+    }
 
     return ElfLoadResult{
         .entry_point = ehdr.e_entry + effective_base,

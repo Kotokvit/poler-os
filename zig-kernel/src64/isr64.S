@@ -293,6 +293,25 @@ isr_stub_48:
     jmp isr_common
 
 // ============================================================================
+//  TLB Shootdown IPI Stub  (vector 0xF0 = 240)
+// ============================================================================
+// v0.9.0: SMP TLB shootdown handler — called on APs via broadcast IPI.
+// This is a FAST IPI handler — it does NOT use the full isr_common path
+// because TLB shootdown must be extremely low-latency. We don't need to
+// save/restore all GP registers since we only call handleTlbShootdownIpi()
+// which is a simple function that does INVLPG and an atomic decrement.
+//
+// However, for simplicity in v0.9.0, we use the same isr_common path.
+// Future optimization: use a dedicated lightweight IPI handler that only
+// saves/restores the minimal registers needed.
+// ============================================================================
+
+isr_stub_240:
+    pushq $0
+    pushq $240
+    jmp isr_common
+
+// ============================================================================
 //  Common ISR Entry
 // ============================================================================
 
@@ -404,6 +423,7 @@ isr_stub_table:
     .quad isr_stub_46
     .quad isr_stub_47
     .quad isr_stub_48
+    .quad isr_stub_240
 
 // ============================================================================
 //  Fast System Call Entry Point (syscall/sysretq)

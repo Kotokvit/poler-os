@@ -2,21 +2,36 @@
 // POLER-OS Virtual Memory Manager — x86_64
 // ============================================================================
 //
-// v0.8.0: COW (Copy-on-Write) for fork(), unmapPageInPML4 for munmap
+// v0.9.0: Reference counting for COW pages, SMP TLB shootdown via IPI
 //
-// COW Architecture:
+// COW Architecture (v0.9.0 with refcounting):
 //   fork() → clonePML4_COW() → mark all user pages as read-only + PTE_COW
+//            + pmm.refPage() on each shared physical page
 //   write fault → handleCowPageFault() → allocate new page, copy data,
 //                 restore writable, clear PTE_COW
-//   read fault  → just return (page is readable)
+//                 + pmm.unrefPage() on the OLD physical page
+//   munmap → unmapPageInPML4() → pmm.unrefPage() on the physical page
+//            if unrefPage returns true → pmm.freePage() (actually frees)
+//            if unrefPage returns false → page still shared, just remove PTE
 //
 // The PTE_COW bit uses x86_64 PTE bit 9 (available to software).
 // When PTE_COW is set, the page is shared between parent and child;
 // a write triggers a #PF which we handle by creating a private copy.
+//
+// SMP TLB Shootdown (v0.9.0):
+//   When page tables are modified on one CPU, other CPUs may have stale
+//   TLB entries. The shootdown protocol:
+//     1. Record the virtual address and target PML4 in a shared struct
+//     2. Send IPI (Inter-Processor Interrupt) to all other online CPUs
+//     3. Each AP receives the IPI, checks if it's using the target PML4,
+//        and if so, invalidates the TLB entry with INVLPG
+//     4. AP signals completion via an atomic counter
+//     5. BSP waits for all APs to acknowledge before continuing
 // ============================================================================
 
 const pmm = @import("pmm64.zig");
 const hal = @import("hal.zig");
+const smp = @import("smp.zig");
 
 pub const PTE_PRESENT: u64 = 0x01;
 pub const PTE_WRITABLE: u64 = 0x02;
@@ -46,6 +61,49 @@ pub const VmmError = error{
 
 var pml4_phys: u64 = 0;
 
+// ============================================================================
+// v0.9.0: SMP TLB Shootdown State
+// ============================================================================
+//
+// When a CPU modifies page tables, it must ensure that all other CPUs
+// that might be using the same PML4 invalidate their TLB entries.
+// This is done via IPI (Inter-Processor Interrupt).
+//
+// The shootdown state is a shared structure that the initiating CPU
+// fills in before sending IPIs. Each AP reads this structure in the
+// IPI handler to know what to invalidate.
+//
+// The pending_count atomic counter tracks how many APs still need to
+// process the shootdown. The initiator waits until this reaches 0
+// before continuing (synchronous shootdown).
+// ============================================================================
+
+pub const TlbShootdownType = enum(u8) {
+    None = 0,
+    SinglePage = 1, // INVLPG a single virtual address
+    FullTlb = 2, // CR3 reload (full TLB flush) — used for widespread changes
+    Range = 3, // INVLPG a range of pages
+};
+
+pub const TlbShootdownRequest = struct {
+    shootdown_type: TlbShootdownType = .None,
+    virt_addr: u64 = 0, // Virtual address to invalidate
+    virt_end: u64 = 0, // End of range (for Range type)
+    target_cr3: u64 = 0, // Only invalidate if this CPU's CR3 matches
+    pending_count: u32 = 0, // Number of APs that haven't acknowledged yet
+    sequence: u32 = 0, // Monotonically increasing sequence number
+};
+
+/// Global TLB shootdown request — written by initiator, read by APs
+var tlb_shootdown: TlbShootdownRequest = .{};
+
+/// Lock for serializing TLB shootdown requests
+var tlb_shootdown_lock: u32 = 0;
+
+/// IPI vector number for TLB shootdown
+/// Using vector 0xF0 (240) — must match the IDT setup
+pub const TLB_SHOOTDOWN_VECTOR: u32 = 0xF0;
+
 pub fn init() void {
     pml4_phys = hal.readCr3() & 0x000FFFFFFFFFF000;
     hal.Serial.puts("[VMM] Virtual Memory Manager initialized, PML4 at ");
@@ -57,6 +115,11 @@ pub fn init() void {
     // without a direct circular dependency (hal ↔ vmm)
     hal.cowPageFaultCallback = handleCowPageFault;
     hal.Serial.puts("[VMM] COW page fault handler registered with HAL\n");
+
+    // Initialize TLB shootdown state
+    tlb_shootdown = .{};
+    tlb_shootdown_lock = 0;
+    hal.Serial.puts("[VMM] SMP TLB shootdown initialized\n");
 }
 
 /// Get the kernel's PML4 physical address (needed for COW cloning)
@@ -216,39 +279,40 @@ pub fn createUserPML4() !u64 {
 }
 
 // ============================================================================
-// COW (Copy-on-Write) — v0.8.0
+// COW (Copy-on-Write) — v0.9.0 with reference counting
 // ============================================================================
 //
 // When fork() is called, instead of copying all user pages (expensive),
 // we create a new PML4 that shares the same physical pages as the parent.
 // All user pages are marked read-only with PTE_COW flag.
 //
+// v0.9.0 change: Each shared physical page gets its refcount incremented
+// in the PMM. This ensures that when one process calls munmap() or exits,
+// the physical page is only freed when NO process references it anymore.
+//
 // When either process writes to a COW page, a page fault (#PF) occurs.
 // The page fault handler:
 //   1. Checks if PTE_COW is set on the faulting page
-//   2. Allocates a new physical page
-//   3. Copies the content from the shared page to the new page
-//   4. Maps the new page as writable (without PTE_COW)
-//   5. Returns — the faulting instruction retries and succeeds
-//
-// This gives fork() O(1) time complexity (only copies page tables,
-// not actual memory), and only copies pages that are actually modified.
+//   2. Decrements refcount on the OLD physical page (unrefPage)
+//   3. Allocates a NEW physical page (refcount starts at 1)
+//   4. Copies the content from the shared page to the new page
+//   5. Maps the new page as writable (without PTE_COW)
+//   6. If old page's refcount dropped to 1, make the remaining mapping
+//      writable again (no longer shared)
+//   7. Returns — the faulting instruction retries and succeeds
 // ============================================================================
 
 /// Clone a PML4 with COW semantics for fork().
 ///
-/// This creates a new PML4 for the child process where:
-///   - Kernel entries are shared (same as createUserPML4)
-///   - User entries point to the SAME physical pages as the parent,
-///     but are marked read-only with PTE_COW flag
-///   - Page table structures (PDPT/PD/PT) are deep-copied (not shared)
-///     because the PTE flags differ between parent and child
+/// v0.9.0: Now increments reference counts on all shared physical pages.
+/// This prevents munmap() from freeing a page that another process still
+/// references. The old bug: fork() shares pages without tracking refs,
+/// munmap() frees the physical page, and the other process crashes on
+/// access to the now-freed page.
 ///
-/// After this call, the parent's user pages are ALSO marked read-only+COW.
-/// This is necessary because both parent and child must trigger COW faults
-/// on write. The parent's original writable state is preserved in PTE_COW.
-///
-/// Returns: physical address of the new (child) PML4
+/// After this call, both the parent's and child's user pages are marked
+/// read-only + PTE_COW. The physical page refcounts are incremented
+/// for every PTE that points to the shared page.
 pub fn clonePML4_COW(parent_pml4_phys: u64) !u64 {
     const child_pml4_phys = pmm.allocPage() orelse return VmmError.OutOfMemory;
     const child_pml4: [*]volatile u64 = @ptrFromInt(child_pml4_phys);
@@ -292,10 +356,13 @@ pub fn clonePML4_COW(parent_pml4_phys: u64) !u64 {
             if (pdpt_entry & PTE_PRESENT == 0) continue;
             if (pdpt_entry & PTE_HUGE != 0) {
                 // 1GB page — just copy as-is with COW (rare in user space)
+                const phys_addr = pdpt_entry & 0x000FFFFFFFFFF000;
                 child_pdpt[pdpt_idx] = (pdpt_entry & ~PTE_WRITABLE) | PTE_COW | PTE_SHARED;
                 // Also mark parent as COW
                 const p_pdpt: [*]volatile u64 = @ptrFromInt(parent_pdpt_phys);
                 p_pdpt[pdpt_idx] = (pdpt_entry & ~PTE_WRITABLE) | PTE_COW | PTE_SHARED;
+                // v0.9.0: Increment refcount on the 1GB page
+                pmm.refPage(phys_addr);
                 continue;
             }
 
@@ -314,9 +381,12 @@ pub fn clonePML4_COW(parent_pml4_phys: u64) !u64 {
                 if (pd_entry & PTE_PRESENT == 0) continue;
                 if (pd_entry & PTE_HUGE != 0) {
                     // 2MB page — copy with COW
+                    const phys_addr = pd_entry & 0x000FFFFFFFFFF000;
                     child_pd[pd_idx] = (pd_entry & ~PTE_WRITABLE) | PTE_COW | PTE_SHARED;
                     const p_pd: [*]volatile u64 = @ptrFromInt(parent_pd_phys);
                     p_pd[pd_idx] = (pd_entry & ~PTE_WRITABLE) | PTE_COW | PTE_SHARED;
+                    // v0.9.0: Increment refcount on the 2MB page
+                    pmm.refPage(phys_addr);
                     continue;
                 }
 
@@ -335,6 +405,9 @@ pub fn clonePML4_COW(parent_pml4_phys: u64) !u64 {
                     if (pte & PTE_PRESENT == 0) continue;
                     if ((pte & PTE_USER) == 0) continue; // Skip kernel pages in user tables
 
+                    // Extract physical page address
+                    const phys_addr = pte & 0x000FFFFFFFFFF000;
+
                     // Mark the child's PTE as read-only + COW
                     // Child points to the SAME physical page
                     const cow_entry = (pte & ~PTE_WRITABLE) | PTE_COW | PTE_SHARED;
@@ -346,6 +419,10 @@ pub fn clonePML4_COW(parent_pml4_phys: u64) !u64 {
                         parent_pt[pt_idx] = (pte & ~PTE_WRITABLE) | PTE_COW | PTE_SHARED;
                     }
 
+                    // v0.9.0: Increment refcount on the shared physical page
+                    // The page is now referenced by both parent and child PTEs
+                    pmm.refPage(phys_addr);
+
                     cow_pages += 1;
                 }
             }
@@ -354,29 +431,22 @@ pub fn clonePML4_COW(parent_pml4_phys: u64) !u64 {
 
     hal.Serial.puts("[VMM] COW clone: ");
     hal.Serial.putDecimal(cow_pages);
-    hal.Serial.puts(" user pages marked COW, child PML4 at ");
+    hal.Serial.puts(" user pages marked COW (refcounted), child PML4 at ");
     hal.Serial.putHex(child_pml4_phys);
     hal.Serial.puts("\n");
 
     return child_pml4_phys;
 }
 
-/// Handle a COW page fault.
+/// Handle a COW page fault — v0.9.0 with reference counting
 ///
-/// Called from the #PF handler when a write fault occurs on a COW page.
-/// This function:
-///   1. Verifies the faulting page has PTE_COW set
-///   2. Allocates a new physical page
-///   3. Copies the old page content to the new page
-///   4. Replaces the PTE: new physical page, writable, COW cleared
-///   5. Invalidates the TLB entry
+/// v0.9.0: When resolving a COW fault, we decrement the refcount on the
+/// OLD physical page. If the refcount drops to 1, the remaining process
+/// that still maps this page can have its PTE restored to writable (no
+/// longer needs COW protection). If the refcount is still > 1, the old
+/// page stays read-only + COW for the other processes.
 ///
-/// Parameters:
-///   fault_virt  — virtual address that caused the fault
-///   fault_cr3   — CR3 value at the time of the fault (current process PML4)
-///   error_code  — #PF error code (bit 1 = write, bit 2 = user, bit 3 = RSVD)
-///
-/// Returns: true if COW was handled, false if not a COW fault
+/// The new private page gets refcount = 1 (from pmm.allocPage).
 pub fn handleCowPageFault(fault_virt: u64, fault_cr3: u64, error_code: u64) bool {
     // A COW fault must be a write fault (bit 1 of error code)
     if (error_code & 0x02 == 0) return false;
@@ -410,6 +480,39 @@ pub fn handleCowPageFault(fault_virt: u64, fault_cr3: u64, error_code: u64) bool
     // This IS a COW page fault — handle it
     const old_phys = pte & 0x000FFFFFFFFFF000;
 
+    // v0.9.0: Check the refcount on the old physical page
+    const old_refcount = pmm.getRefCount(old_phys);
+
+    if (old_refcount <= 1) {
+        // Only this process references the page — no need to copy!
+        // Just restore write permission and clear COW flags.
+        // This is an optimization: if the other process already unmapped
+        // or COW-resolved its copy, we can just make this page writable.
+        var new_pte = pte;
+        new_pte |= PTE_WRITABLE; // Restore write permission
+        new_pte &= ~(PTE_COW | PTE_SHARED); // Clear COW markers
+        new_pte &= ~PTE_DIRTY; // Will be set by CPU on next write
+        pt[pt_idx] = new_pte;
+
+        // Invalidate TLB for this virtual address
+        invlpgOrShootdown(virt_aligned, fault_cr3);
+
+        hal.Serial.puts("[VMM] COW resolved (no-copy): vaddr=");
+        hal.Serial.putHex(virt_aligned);
+        hal.Serial.puts(" phys=");
+        hal.Serial.putHex(old_phys);
+        hal.Serial.puts(" refcount=1 → writable\n");
+
+        return true;
+    }
+
+    // Multiple processes still reference the old page — must copy
+
+    // v0.9.0: Decrement refcount on the old physical page
+    // We're about to replace our PTE with a new private page,
+    // so the old page loses one reference.
+    _ = pmm.unrefPage(old_phys);
+
     // Allocate a new physical page for the private copy
     const new_phys = pmm.allocPage() orelse {
         hal.Serial.puts("[VMM] COW FAULT: Out of memory! Cannot allocate private page\n");
@@ -435,43 +538,49 @@ pub fn handleCowPageFault(fault_virt: u64, fault_cr3: u64, error_code: u64) bool
 
     pt[pt_idx] = new_pte;
 
-    // Invalidate TLB for this virtual address
-    asm volatile ("invlpg (%[virt])"
-        :
-        : [virt] "r" (virt_aligned),
-        : "memory"
-    );
+    // v0.9.0: If the old page's refcount dropped to 1, find the remaining
+    // process that maps it and restore its write permission.
+    // This avoids unnecessary COW faults for the last remaining process.
+    // For simplicity, we don't do this cross-process fixup here — it will
+    // happen naturally when that process writes to the page (its COW fault
+    // handler will see refcount==1 and use the no-copy fast path above).
 
-    hal.Serial.puts("[VMM] COW resolved: vaddr=");
+    // Invalidate TLB for this virtual address
+    invlpgOrShootdown(virt_aligned, fault_cr3);
+
+    hal.Serial.puts("[VMM] COW resolved (copy): vaddr=");
     hal.Serial.putHex(virt_aligned);
     hal.Serial.puts(" old_phys=");
     hal.Serial.putHex(old_phys);
     hal.Serial.puts(" new_phys=");
     hal.Serial.putHex(new_phys);
+    hal.Serial.puts(" old_refcount=");
+    hal.Serial.putDecimal(pmm.getRefCount(old_phys));
     hal.Serial.puts("\n");
 
     return true;
 }
 
 // ============================================================================
-// unmapPageInPML4 — v0.8.0
+// unmapPageInPML4 — v0.9.0 with reference counting + SMP TLB shootdown
 // ============================================================================
 //
 // Unmap a page from a SPECIFIC PML4 (not the kernel PML4).
 // Used by munmap() to unmap pages from the process's page tables.
 //
-// This walks the 4-level page table hierarchy in the target PML4,
-// clears the PTE, frees the physical page, and cleans up empty
-// page table structures.
+// v0.9.0 changes:
+//   - Uses pmm.unrefPage() instead of pmm.freePage() directly
+//   - Only frees the physical page when refcount reaches 0
+//   - Sends SMP TLB shootdown IPIs to other CPUs if needed
 //
-// TLB invalidation: Since we may be modifying a PML4 that is not
-// currently active (CR3 != target_pml4_phys), we need to either:
-//   1. INVLPG if the target PML4 is the current CR3
-//   2. No INVLPG needed if it's a different PML4 (not active yet)
-// For SMP, we would need IPI-based TLB shootdown (future work).
+// For COW pages (PTE_COW set), the page may be shared. We decrement
+// the refcount and only free when no other process references it.
+// For non-COW pages (refcount == 1), unrefPage returns true and
+// the page is freed normally — identical to the old behavior.
 // ============================================================================
 
-/// Unmap a page from a specific PML4 and free the physical page.
+/// Unmap a page from a specific PML4 and free the physical page
+/// if its reference count reaches zero.
 /// Returns the physical address of the unmapped page, or 0 if not mapped.
 pub fn unmapPageInPML4(target_pml4_phys: u64, virt: u64) VmmError!u64 {
     if (virt % PAGE_SIZE != 0) {
@@ -503,19 +612,41 @@ pub fn unmapPageInPML4(target_pml4_phys: u64, virt: u64) VmmError!u64 {
     // Extract physical page address before clearing
     const phys_page = pte & 0x000FFFFFFFFFF000;
 
+    // v0.9.0: Check if this is a COW page
+    const is_cow = (pte & PTE_COW) != 0;
+
     // Clear the PTE
     pt[pt_idx] = 0;
 
-    // Free the physical page (unless it's COW — the page may be shared)
-    // For COW pages, we only unmap from this PML4 but don't free the
-    // physical page because other processes might still reference it.
-    // TODO: Implement reference counting for COW pages.
-    // For now, we free unconditionally since we don't have ref counting yet.
+    // v0.9.0: Use reference counting to decide whether to free
+    // unrefPage returns true if the page should be freed (refcount → 0)
     if (phys_page != 0) {
-        pmm.freePage(phys_page);
+        if (pmm.unrefPage(phys_page)) {
+            // Refcount dropped to 0 — free the physical page
+            pmm.freePage(phys_page);
+
+            if (is_cow) {
+                hal.Serial.puts("[VMM] unmapPage: COW page freed (last ref) 0x");
+                hal.Serial.putHex(phys_page);
+                hal.Serial.puts("\n");
+            }
+        } else {
+            // Page still referenced by other processes — don't free
+            if (is_cow) {
+                hal.Serial.puts("[VMM] unmapPage: COW page kept (refcount=");
+                hal.Serial.putDecimal(pmm.getRefCount(phys_page));
+                hal.Serial.puts(") 0x");
+                hal.Serial.putHex(phys_page);
+                hal.Serial.puts("\n");
+            }
+        }
     }
 
-    // Invalidate TLB if this PML4 is currently active
+    // v0.9.0: SMP TLB shootdown
+    // If this PML4 might be active on another CPU, send shootdown IPIs
+    tlbShootdownSingle(virt, target_pml4_phys);
+
+    // Also invalidate TLB locally if this PML4 is the current CR3
     const current_cr3 = hal.readCr3() & 0x000FFFFFFFFFF000;
     if (current_cr3 == target_pml4_phys) {
         asm volatile ("invlpg (%[virt])"
@@ -556,6 +687,10 @@ pub fn unmapRangeInPML4(target_pml4_phys: u64, start_virt: u64, length: u64) u64
         const result = unmapPageInPML4(target_pml4_phys, addr) catch 0;
         if (result != 0) count += 1;
     }
+
+    // v0.9.0: Send a full TLB shootdown for the range
+    // This is more efficient than per-page shootdowns
+    tlbShootdownRange(start, end, target_pml4_phys);
 
     hal.Serial.puts("[VMM] unmapRangeInPML4: unmapped ");
     hal.Serial.putDecimal(count);
@@ -701,7 +836,10 @@ pub fn protectPageInPML4(target_pml4_phys: u64, virt: u64, new_flags: u64) bool 
     const phys = pte & 0x000FFFFFFFFFF000;
     pt[pt_idx] = phys | new_flags | PTE_PRESENT;
 
-    // Invalidate TLB if this PML4 is active
+    // v0.9.0: Send SMP TLB shootdown after protection change
+    tlbShootdownSingle(virt, target_pml4_phys);
+
+    // Also invalidate TLB if this PML4 is active locally
     const current_cr3 = hal.readCr3() & 0x000FFFFFFFFFF000;
     if (current_cr3 == target_pml4_phys) {
         asm volatile ("invlpg (%[virt])"
@@ -712,4 +850,190 @@ pub fn protectPageInPML4(target_pml4_phys: u64, virt: u64, new_flags: u64) bool 
     }
 
     return true;
+}
+
+// ============================================================================
+// v0.9.0: SMP TLB Shootdown Implementation
+// ============================================================================
+//
+// TLB shootdown ensures that all CPUs invalidate stale TLB entries when
+// page tables are modified. Without this, a page could be unmapped on
+// one CPU but still accessible from another CPU's TLB cache.
+//
+// Protocol:
+//   1. Acquire tlb_shootdown_lock (spinlock)
+//   2. Fill in the shootdown request (type, vaddr, target CR3)
+//   3. Set pending_count = number of online APs
+//   4. Increment sequence number (for ordering)
+//   5. Send IPI to all other online CPUs (broadcast except self)
+//   6. Wait until pending_count reaches 0 (all APs acknowledged)
+//   7. Release lock
+//
+// On the AP side (IPI handler):
+//   1. Read the shootdown request
+//   2. Check if this CPU's CR3 matches target_cr3
+//   3. If match: execute INVLPG (single) or CR3 reload (full)
+//   4. Atomic decrement of pending_count
+// ============================================================================
+
+/// Invalidate a single TLB entry locally, or send shootdown if SMP
+fn invlpgOrShootdown(virt: u64, target_cr3: u64) void {
+    // Local invalidation always needed
+    asm volatile ("invlpg (%[virt])"
+        :
+        : [virt] "r" (virt),
+        : "memory"
+    );
+
+    // If SMP is active, also send shootdown to other CPUs
+    if (smp.online_cpus > 1) {
+        tlbShootdownSingle(virt, target_cr3);
+    }
+}
+
+/// Send a single-page TLB shootdown to all other CPUs
+fn tlbShootdownSingle(virt: u64, target_cr3: u64) void {
+    if (smp.online_cpus <= 1) return; // No other CPUs to shoot down
+
+    hal.spinLock(&tlb_shootdown_lock);
+    defer hal.spinUnlock(&tlb_shootdown_lock);
+
+    tlb_shootdown.shootdown_type = .SinglePage;
+    tlb_shootdown.virt_addr = virt;
+    tlb_shootdown.target_cr3 = target_cr3;
+    tlb_shootdown.sequence += 1;
+
+    // Number of APs that need to acknowledge
+    const ap_count = smp.online_cpus - 1; // Exclude BSP (self)
+    @atomicStore(u32, &tlb_shootdown.pending_count, ap_count, .release);
+
+    // Memory barrier — ensure APs see the request data before we send IPI
+    asm volatile ("sfence" ::: "memory");
+
+    // Send IPI to all other CPUs
+    // Use the "shorthand: all excluding self" mode in the APIC
+    hal.APIC.sendBroadcastIpiExcludeSelf(TLB_SHOOTDOWN_VECTOR);
+
+    // Wait for all APs to acknowledge
+    var timeout: u32 = 0;
+    while (@atomicLoad(u32, &tlb_shootdown.pending_count, .acquire) > 0) : (timeout += 1) {
+        if (timeout > 10_000_000) {
+            hal.Serial.puts("[VMM] TLB shootdown timeout! pending=");
+            hal.Serial.putDecimal(@atomicLoad(u32, &tlb_shootdown.pending_count, .monotonic));
+            hal.Serial.puts("\n");
+            break;
+        }
+        asm volatile ("pause");
+    }
+}
+
+/// Send a range TLB shootdown to all other CPUs
+fn tlbShootdownRange(virt_start: u64, virt_end: u64, target_cr3: u64) void {
+    if (smp.online_cpus <= 1) return;
+
+    hal.spinLock(&tlb_shootdown_lock);
+    defer hal.spinUnlock(&tlb_shootdown_lock);
+
+    tlb_shootdown.shootdown_type = .Range;
+    tlb_shootdown.virt_addr = virt_start;
+    tlb_shootdown.virt_end = virt_end;
+    tlb_shootdown.target_cr3 = target_cr3;
+    tlb_shootdown.sequence += 1;
+
+    const ap_count = smp.online_cpus - 1;
+    @atomicStore(u32, &tlb_shootdown.pending_count, ap_count, .release);
+
+    asm volatile ("sfence" ::: "memory");
+
+    hal.APIC.sendBroadcastIpiExcludeSelf(TLB_SHOOTDOWN_VECTOR);
+
+    var timeout: u32 = 0;
+    while (@atomicLoad(u32, &tlb_shootdown.pending_count, .acquire) > 0) : (timeout += 1) {
+        if (timeout > 10_000_000) {
+            hal.Serial.puts("[VMM] TLB shootdown range timeout!\n");
+            break;
+        }
+        asm volatile ("pause");
+    }
+}
+
+/// Send a full TLB flush shootdown to all other CPUs
+/// Used when CR3 changes or when many pages are modified at once
+pub fn tlbShootdownFull(target_cr3: u64) void {
+    if (smp.online_cpus <= 1) return;
+
+    hal.spinLock(&tlb_shootdown_lock);
+    defer hal.spinUnlock(&tlb_shootdown_lock);
+
+    tlb_shootdown.shootdown_type = .FullTlb;
+    tlb_shootdown.target_cr3 = target_cr3;
+    tlb_shootdown.sequence += 1;
+
+    const ap_count = smp.online_cpus - 1;
+    @atomicStore(u32, &tlb_shootdown.pending_count, ap_count, .release);
+
+    asm volatile ("sfence" ::: "memory");
+
+    hal.APIC.sendBroadcastIpiExcludeSelf(TLB_SHOOTDOWN_VECTOR);
+
+    var timeout: u32 = 0;
+    while (@atomicLoad(u32, &tlb_shootdown.pending_count, .acquire) > 0) : (timeout += 1) {
+        if (timeout > 10_000_000) {
+            hal.Serial.puts("[VMM] TLB shootdown full timeout!\n");
+            break;
+        }
+        asm volatile ("pause");
+    }
+}
+
+/// TLB shootdown IPI handler — called on each AP when it receives the
+/// TLB_SHOOTDOWN_VECTOR interrupt.
+///
+/// This function is called from the IDT ISR context on the AP.
+/// It reads the global shootdown request, performs the requested
+/// invalidation, and acknowledges completion.
+pub fn handleTlbShootdownIpi() callconv(.C) void {
+    const req = &tlb_shootdown;
+
+    // Read the current CR3 to check if this CPU uses the target PML4
+    const my_cr3 = hal.readCr3() & 0x000FFFFFFFFFF000;
+
+    switch (req.shootdown_type) {
+        .SinglePage => {
+            if (my_cr3 == req.target_cr3) {
+                // This CPU is using the affected PML4 — invalidate the entry
+                asm volatile ("invlpg (%[virt])"
+                    :
+                    : [virt] "r" (req.virt_addr),
+                    : "memory"
+                );
+            }
+        },
+        .Range => {
+            if (my_cr3 == req.target_cr3) {
+                // Invalidate each page in the range
+                var addr = req.virt_addr;
+                while (addr < req.virt_end) : (addr += PAGE_SIZE) {
+                    asm volatile ("invlpg (%[virt])"
+                        :
+                        : [virt] "r" (addr),
+                        : "memory"
+                    );
+                }
+            }
+        },
+        .FullTlb => {
+            if (my_cr3 == req.target_cr3) {
+                // Full TLB flush — reload CR3
+                const cr3 = hal.readCr3();
+                hal.writeCr3(cr3);
+            }
+        },
+        .None => {
+            // Spurious IPI — ignore
+        },
+    }
+
+    // Acknowledge completion
+    @atomicRmw(u32, &req.pending_count, .Sub, 1, .release);
 }
