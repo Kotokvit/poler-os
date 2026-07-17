@@ -1,0 +1,4 @@
+{
+  "api_sets": {},
+  "notes": "ApiSetMap maps api-ms-win-* DLL names to real implementation DLLs"
+}
