@@ -29,6 +29,7 @@ const virtio_blk = @import("virtio_blk.zig");
 const fat32 = @import("fat32.zig");
 const subsys = @import("subsystem/subsystem.zig");
 const syscall_int = @import("syscall_integration.zig");
+const ki = @import("kernel_integrate.zig");
 
 
 
@@ -614,6 +615,9 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
 
     // 8.5a. Initialize Dual-Personality Subsystem Dispatcher
     subsys.init();
+
+    // 8.5a-2. Initialize Kernel Integration Layer (VFS↔FAT32, ProcessMgr, mmap, POLER Auth)
+    ki.kernelIntegrateInit();
 
     // 8.5b. Initialize Syscalls — now routes through subsystem dispatcher
     syscall_int.print_fn = &puts;
