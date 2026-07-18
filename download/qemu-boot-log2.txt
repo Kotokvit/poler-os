@@ -1,0 +1,34 @@
+c[?7l[2J[0mSeaBIOS (version rel-1.16.0-0-gd239552ce722-prebuilt.qemu.org)
+
+
+iPXE (http://ipxe.org) 00:03.0 CA00 PCI2.10 PnP PMM+0FF91210+0FEF1210 CA00
+Press Ctrl-B to configure iPXE (PCI 00:03.0)...                                                                               
+
+
+Booting from Hard Disk...
+Boot failed: not a bootable disk
+
+Booting from Floppy...
+Boot failed: could not read the boot disk
+
+Booting from DVD/CD...
+[0;30;47mWelcome to GRUB!
+
+[01;01H[0m[2J[02;25HGNU GRUB  version 2.12-9+deb13u2[04;02H┌────────────────────────────────────────────────────────────────────────────┐[05;02H│[05;79H│[06;02H│[06;79H│[07;02H│[07;79H│[08;02H│[08;79H│[09;02H│[09;79H│[10;02H│[10;79H│[11;02H│[11;79H│[12;02H│[12;79H│[13;02H│[13;79H│[14;02H│[14;79H│[15;02H│[15;79H│[16;02H│[16;79H│[17;02H│[17;79H│[18;02H└────────────────────────────────────────────────────────────────────────────┘[20;02H     Use the ↑ and ↓ keys to select which entry is highlighted.          
+      Press enter to boot the selected OS, `e' to edit the commands       
+      before booting or `c' for a command-line.                           [05;80H [05;03H[0;30;47m*POLER-OS v0.7.0 (64-bit)                                                   [06;03H[0m POLER-OS v0.7.0 (64-bit, serial console)                                   [07;03H POLER-OS v0.7.0 (64-bit, QEMU VT-d)                                      [07;76H[07;77H  [08;03H                                                                            [09;03H                                                                            [10;03H                                                                            [11;03H                                                                            [12;03H                                                                            [13;03H                                                                 [13;67H[13;68H           [14;03H                                                                            [15;03H                                                                            [16;03H                                                                            [17;03H                                                                            [17;80H 
+
+
+
+
+
+   The highlighted entry will be executed automatically in 5s.                                                                                                
+                                                                               [01;01H[2J[2J[02;25HGNU GRUB  version 2.12-9+deb13u2
+
+   Minimal BASH-like line editing is supported. For the first word, TAB   
+   lists possible command completions. Anywhere else TAB lists possible   
+   device or file completions. To enable less(1)-like paging, "set        
+   pager=1". ESC at any time exits.                                     [07;72H[07;73H  
+
+
+grub> e_agenqemu-system-x86_64: terminating on signal 15 from pid 24466 (timeout)
