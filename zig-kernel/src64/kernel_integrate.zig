@@ -36,6 +36,7 @@ const objmgr = @import("subsystem/common/object_manager.zig");
 const nt_api = @import("subsystem/nt/nt_api.zig");
 const posix_api = @import("subsystem/posix/posix_api.zig");
 const dynlink = @import("dynlinker.zig");
+const cap = @import("capability.zig");
 
 // ============================================================================
 // 1. VFS ↔ FAT32 Integration
@@ -268,6 +269,13 @@ pub const ProcessControlBlock = struct {
 
     // v0.8.0: ACL policy version — for cache invalidation
     acl_version: u32 = 0,
+
+    // v0.9.0: Capability TTL and resource quotas
+    cap_expire_tick: u64 = 0,      // Scheduler tick when capabilities expire (0 = never)
+    memory_quota: u64 = 0,         // Maximum memory allocatable in bytes (0 = unlimited)
+    memory_used: u64 = 0,          // Currently allocated memory in bytes
+    cpu_quota_ticks: u64 = 0,      // Max CPU ticks per time window (0 = unlimited)
+    cpu_used_ticks: u64 = 0,       // CPU ticks consumed in current window
 
     pub fn init(pid: u32, ppid: u32, subsystem_id: subsys.SubsystemId) ProcessControlBlock {
         var pcb = ProcessControlBlock{
@@ -776,12 +784,17 @@ pub fn memoryMgrNtProtect(pid: u32, addr: u64, size: u64, new_protect: u64) bool
 //   Bit 16 (0x10000): CAP_NT_API      — can use NT syscall range
 //   Bit 17 (0x20000): CAP_POSIX_API   — can use POSIX syscall range
 //   Bit 18 (0x40000): CAP_POLER_AUTH  — can use POLER native syscalls
-//   Bit 19-63: Reserved
+//   Bit 19 (0x80000): CAP_AI_RUNTIME   — can launch/run AI capsule
+//   Bit 20 (0x100000): CAP_AI_MANAGE   — can manage AI lifecycle
+//   Bit 21 (0x200000): CAP_POLICY_SET   — can modify policy rules
+//   Bit 22 (0x400000): CAP_AUDIT_READ   — can read audit log
+//   Bit 23-63: Reserved
 //
 // Default capabilities for a new user process:
 //   CAP_FILE_READ | CAP_FILE_WRITE | CAP_FILE_EXECUTE |
 //   CAP_PROCESS_CREATE | CAP_MEMORY_MMAP | CAP_SIGNAL |
-//   CAP_NT_API | CAP_POSIX_API | CAP_POLER_AUTH
+//   CAP_NT_API | CAP_POSIX_API | CAP_POLER_AUTH |
+//   CAP_AI_RUNTIME | CAP_AUDIT_READ
 //
 // Kernel process gets ALL capabilities.
 // ============================================================================
@@ -803,17 +816,22 @@ pub const CAP_ADMIN: u64 = 1 << 12;
 pub const CAP_NT_API: u64 = 1 << 16;
 pub const CAP_POSIX_API: u64 = 1 << 17;
 pub const CAP_POLER_AUTH: u64 = 1 << 18;
+pub const CAP_AI_RUNTIME: u64   = 1 << 19; // Can launch/run AI capsule
+pub const CAP_AI_MANAGE: u64    = 1 << 20; // Can manage AI lifecycle (start/stop/update)
+pub const CAP_POLICY_SET: u64   = 1 << 21; // Can modify policy rules
+pub const CAP_AUDIT_READ: u64   = 1 << 22; // Can read audit log
 
 /// Default capabilities for a new user process
 pub const DEFAULT_CAPABILITIES: u64 = CAP_FILE_READ | CAP_FILE_WRITE | CAP_FILE_EXECUTE |
     CAP_PROCESS_CREATE | CAP_MEMORY_MMAP | CAP_SIGNAL |
-    CAP_NT_API | CAP_POSIX_API | CAP_POLER_AUTH;
+    CAP_NT_API | CAP_POSIX_API | CAP_POLER_AUTH |
+    CAP_AI_RUNTIME | CAP_AUDIT_READ;
 
 /// Kernel process gets ALL capabilities
 pub const KERNEL_CAPABILITIES: u64 = 0xFFFFFFFFFFFFFFFF;
 
 /// Map POSIX syscall numbers to required capabilities
-fn posixSyscallToCapabilities(syscall_num: u64) u64 {
+pub fn posixSyscallToCapabilities(syscall_num: u64) u64 {
     return switch (syscall_num) {
         0, 17, 19, 78, 79 => CAP_FILE_READ | CAP_POSIX_API, // read, pread64, readv, getdents, getcwd
         1, 18, 20, 85, 86, 87, 88, 82, 83, 84 => CAP_FILE_WRITE | CAP_POSIX_API, // write, pwrite64, writev, creat, link, unlink, symlink, rename, mkdir, rmdir
@@ -840,7 +858,7 @@ fn posixSyscallToCapabilities(syscall_num: u64) u64 {
 }
 
 /// Map NT syscall numbers to required capabilities
-fn ntSyscallToCapabilities(nt_num: u64) u64 {
+pub fn ntSyscallToCapabilities(nt_num: u64) u64 {
     return switch (nt_num) {
         // NtCreateFile, NtOpenFile, NtReadFile
         0x02, 0x30, 0x03 => CAP_FILE_READ | CAP_FILE_WRITE | CAP_NT_API,
@@ -867,7 +885,7 @@ fn ntSyscallToCapabilities(nt_num: u64) u64 {
 }
 
 /// Map POLER native syscall numbers to required capabilities
-fn polerSyscallToCapabilities(poler_num: u64) u64 {
+pub fn polerSyscallToCapabilities(poler_num: u64) u64 {
     return switch (poler_num) {
         0 => CAP_POLER_AUTH, // POLER_SYSCALL_PRINT
         1 => CAP_POLER_AUTH, // POLER_SYSCALL_GET_SUBSYSTEM
@@ -990,6 +1008,17 @@ pub fn polerAuthenticate(action: PolerAction) AuthResult {
         return .Denied;
     }
 
+    // Step 1.5: Check capability TTL expiration
+    if (process.cap_expire_tick != 0 and scheduler.scheduler_ticks > process.cap_expire_tick) {
+        hal.Serial.puts("[POLER-ACL] EXPIRED: PID=");
+        hal.Serial.putDecimal(action.pid);
+        hal.Serial.puts(" caps expired at tick ");
+        hal.Serial.putDecimal(process.cap_expire_tick);
+        hal.Serial.puts("\n");
+        auditLog(action, required_caps, process.acl_capabilities, .Denied);
+        return .Denied;
+    }
+
     // Step 2: Check ACL — does the process have ALL required capabilities?
     const process_caps = process.acl_capabilities;
     const missing_caps = required_caps & ~process_caps;
@@ -1102,6 +1131,31 @@ pub fn processMgrGetCaps(pid: u32) u64 {
     return pcb.acl_capabilities;
 }
 
+/// Set capabilities with TTL — for AI capsule temporary privileges
+pub fn processMgrSetCapsWithTtl(caller_pid: u32, target_pid: u32, new_caps: u64, ttl_ticks: u64) bool {
+    if (!processMgrSetCaps(caller_pid, target_pid, new_caps)) return false;
+    const target = processMgrFind(target_pid) orelse return false;
+    if (ttl_ticks > 0) {
+        target.cap_expire_tick = scheduler.scheduler_ticks + ttl_ticks;
+    }
+    return true;
+}
+
+/// Check and enforce capability expiration
+pub fn processMgrCheckCapExpiry(pid: u32) bool {
+    const pcb = processMgrFind(pid) orelse return false;
+    if (pcb.cap_expire_tick != 0 and scheduler.scheduler_ticks > pcb.cap_expire_tick) {
+        // Capabilities expired — reduce to minimal set
+        pcb.acl_capabilities = CAP_FILE_READ | CAP_POSIX_API; // Minimal survival caps
+        pcb.cap_expire_tick = 0;
+        hal.Serial.puts("[PROC] PID=");
+        hal.Serial.putDecimal(pid);
+        hal.Serial.puts(" capabilities EXPIRED — reduced to minimal\n");
+        return true; // Expired
+    }
+    return false; // Still valid
+}
+
 /// Add an entry to the ACL audit log
 fn auditLog(action: PolerAction, required_caps: u64, process_caps: u64, result: AuthResult) void {
     const entry = AclAuditEntry{
@@ -1162,6 +1216,9 @@ pub fn kernelIntegrateInit() void {
         };
     }
     acl_audit_index = 0;
+
+    // v0.9.0: Initialize capability module
+    cap.init();
 
     // v0.9.0: Initialize dynamic linker
     dynlink.init();

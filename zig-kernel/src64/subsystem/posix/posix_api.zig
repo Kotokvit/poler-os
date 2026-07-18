@@ -717,7 +717,7 @@ fn posixOpen(path_addr: u64, flags: i32, _mode: i32) i64 {
 
         // Also create an Object Manager handle
         if (objmgr_ref) |om| {
-            const access: u64 = if (!writable) 0x80000000 else if (!readable) 0x40000000 else 0xC0000000;
+            const access: u32 = if (!writable) 0x80000000 else if (!readable) 0x40000000 else 0xC0000000;
             const handle = om.createHandle(.File, access);
             if (fd_table.getFd(fd)) |entry| {
                 entry.obj_handle = handle;
@@ -734,7 +734,7 @@ fn posixOpen(path_addr: u64, flags: i32, _mode: i32) i64 {
 
     const fd = fd_table.allocFd() orelse return -@as(i64, subsys.EMFILE);
     if (objmgr_ref) |om| {
-        const access: u64 = if (!writable) 0x80000000 else if (!readable) 0x40000000 else 0xC0000000;
+        const access: u32 = if (!writable) 0x80000000 else if (!readable) 0x40000000 else 0xC0000000;
         const handle = om.createHandle(.File, access);
         if (fd_table.getFd(fd)) |entry| {
             entry.obj_handle = handle;
