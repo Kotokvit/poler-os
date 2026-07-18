@@ -710,6 +710,73 @@ pub const ObjectManager = struct {
 };
 
 // ============================================================================
+// Per-Process Handle Tables — v1.1.0
+// ============================================================================
+//
+// In v1.0.0 the Object Manager used a single global handle table. This meant
+// any process with a valid handle index could access any object — the classic
+// Ambient Authority problem. An attacker who guesses a handle value can
+// operate on objects they should never see.
+//
+// v1.1.0 introduces per-process handle tables. Each ProcessControlBlock
+// references its own ObjectManager instance. A handle is valid ONLY within
+// the process that created it. Handle values from different processes are
+// isolated even if they happen to share the same integer value.
+//
+// Architecture:
+//   ┌─────────────────────────────────────────────────────┐
+//   │ Process A (PID 1)                                   │
+//   │   ObjectManager { handle 4 → File A (READ only) }  │
+//   └─────────────────────────────────────────────────────┘
+//   ┌─────────────────────────────────────────────────────┐
+//   │ Process B (PID 2)                                   │
+//   │   ObjectManager { handle 4 → File B (READ|WRITE) } │
+//   └─────────────────────────────────────────────────────┘
+//
+//   Handle 4 in Process A → File A with READ only
+//   Handle 4 in Process B → File B with READ|WRITE
+//   No cross-process handle leakage is possible.
+//
+// The global ObjectManager is retained for kernel-internal objects that
+// are not associated with any process (e.g., IPC channels created by the
+// kernel during boot). Process-scoped operations always use the per-process
+// table obtained via getProcessOM(pid).
+// ============================================================================
+
+const MAX_PROCESS_OMS: usize = 64; // Matches MAX_PROCESSES in kernel_integrate
+
+var process_oms: [MAX_PROCESS_OMS]ObjectManager = undefined;
+var process_oms_initialized: [MAX_PROCESS_OMS]bool = [_]bool{false} ** MAX_PROCESS_OMS;
+
+/// Initialize the per-process Object Manager for a given PID
+pub fn initProcessOM(pid: u32) void {
+    if (pid >= MAX_PROCESS_OMS) return;
+    process_oms[pid].init();
+    process_oms_initialized[pid] = true;
+}
+
+/// Get the ObjectManager for a specific process
+pub fn getProcessOM(pid: u32) ?*ObjectManager {
+    if (pid >= MAX_PROCESS_OMS) return null;
+    if (!process_oms_initialized[pid]) {
+        process_oms[pid].init();
+        process_oms_initialized[pid] = true;
+    }
+    return &process_oms[pid];
+}
+
+/// Destroy all handles for a process (called on process termination)
+pub fn destroyProcessOM(pid: u32) void {
+    if (pid >= MAX_PROCESS_OMS) return;
+    if (!process_oms_initialized[pid]) return;
+    // Zero out the handle table — resources are freed by processMgrTerminate
+    for (&process_oms[pid].handles) |*entry| {
+        entry.* = HandleEntry{};
+    }
+    process_oms_initialized[pid] = false;
+}
+
+// ============================================================================
 // Global Object Manager Singleton + Standalone Wrapper Functions
 // ============================================================================
 // These wrappers allow modules (like ipc.zig) to call createHandle/closeHandle
@@ -743,4 +810,100 @@ pub fn closeHandle(handle: u64) bool {
 /// Standalone lookupHandle — uses global ObjectManager
 pub fn lookupHandle(handle: u64) ?*HandleEntry {
     return getGlobal().lookupHandle(handle);
+}
+
+// ============================================================================
+// Intent ↔ Object Manager Integration — v1.1.0
+// ============================================================================
+//
+// The Intent Dispatcher (poler/intent.zig) calls these functions during
+// Phase 4 (Object Handle Verification) of intent dispatch.
+//
+// Flow:
+//   Intent.dispatch()
+//     → Phase 1: PND nonce verification
+//     → Phase 2: Rate limiting
+//     → Phase 3: Process-level capability check
+//     → Phase 4: intentVerifyHandle() ← THIS FUNCTION
+//         ├─ Lookup handle in the CALLER's per-process table
+//         ├─ Check access_mask covers the requested action
+//         └─ Return .Allowed / .NoHandle / .Insufficient
+//
+// This eliminates the TODO placeholders in intent.zig Phase 3 and Phase 4.
+// ============================================================================
+
+/// Verify that a handle exists in the caller's per-process table and that
+/// its access_mask covers the requested access for the given IntentAction.
+/// Called from Intent Dispatcher Phase 4.
+///
+/// Returns:
+///   .Allowed       — handle exists and access_mask covers the action
+///   .NoHandle      — handle doesn't exist in caller's table or is revoked
+///   .Insufficient  — handle exists but access_mask doesn't cover the action
+///   .Denied        — caller PID is invalid
+pub fn intentVerifyHandle(caller_pid: u32, handle: u32, required_access: u32) IntentCheckResult {
+    // Get the per-process ObjectManager for the caller
+    const om = getProcessOM(caller_pid) orelse {
+        // No per-process table — fall back to global (kernel processes)
+        const gom = getGlobal();
+        const idx: usize = handle;
+        if (idx >= MAX_HANDLES) return .NoHandle;
+        if (!gom.handles[idx].in_use) return .NoHandle;
+        if (gom.handles[idx].cap_revoked) return .NoHandle;
+        if ((gom.handles[idx].access_mask & required_access) != required_access) {
+            return .Insufficient;
+        }
+        return .Allowed;
+    };
+
+    const idx: usize = handle;
+    if (idx >= MAX_HANDLES) return .NoHandle;
+    if (!om.handles[idx].in_use) return .NoHandle;
+    if (om.handles[idx].cap_revoked) return .NoHandle;
+    if ((om.handles[idx].access_mask & required_access) != required_access) {
+        return .Insufficient;
+    }
+    return .Allowed;
+}
+
+/// Result of Intent ↔ Object Manager verification
+pub const IntentCheckResult = enum(u8) {
+    Allowed = 0,
+    Denied = 1,
+    NoHandle = 2,
+    Insufficient = 3,
+};
+
+/// Get the access_mask of a handle in a process's per-process table.
+/// Returns null if the handle doesn't exist or is revoked.
+pub fn getHandleAccessMask(pid: u32, handle: u32) ?u32 {
+    const om = getProcessOM(pid) orelse {
+        // Fall back to global
+        const gom = getGlobal();
+        const idx: usize = handle;
+        if (idx >= MAX_HANDLES) return null;
+        if (!gom.handles[idx].in_use) return null;
+        if (gom.handles[idx].cap_revoked) return null;
+        return gom.handles[idx].access_mask;
+    };
+    const idx: usize = handle;
+    if (idx >= MAX_HANDLES) return null;
+    if (!om.handles[idx].in_use) return null;
+    if (om.handles[idx].cap_revoked) return null;
+    return om.handles[idx].access_mask;
+}
+
+/// Create a handle in a specific process's per-process table.
+/// Returns the handle value on success, null on failure.
+pub fn createProcessHandle(pid: u32, obj_type: ObjectType, access_mask: ?u32) ?u64 {
+    const om = getProcessOM(pid) orelse return null;
+    const handle = om.createHandle(obj_type, access_mask);
+    if (handle == INVALID_HANDLE) return null;
+    return handle;
+}
+
+/// Close a handle in a specific process's per-process table.
+pub fn closeProcessHandle(pid: u32, handle: u64) bool {
+    const om = getProcessOM(pid) orelse return false;
+    return om.closeHandle(handle);
 }

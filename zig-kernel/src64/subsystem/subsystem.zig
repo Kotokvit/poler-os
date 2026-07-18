@@ -76,6 +76,7 @@ pub const STATUS_OBJECT_NAME_NOT_FOUND: NTSTATUS = 0xC0000034;
 pub const STATUS_OBJECT_PATH_NOT_FOUND: NTSTATUS = 0xC000003A;
 pub const STATUS_NOT_IMPLEMENTED: NTSTATUS = 0xC0000002;
 pub const STATUS_NO_MEMORY: NTSTATUS = 0xC0000017;
+pub const STATUS_INSUFFICIENT_RESOURCES: NTSTATUS = 0xC000009A;
 pub const STATUS_BUFFER_TOO_SMALL: NTSTATUS = 0xC0000023;
 pub const STATUS_PENDING: NTSTATUS = 0x00000103;
 pub const STATUS_TIMEOUT: NTSTATUS = 0x00000102;
@@ -208,6 +209,11 @@ pub fn init() void {
     // Initialize NT subsystem
     nt.init(&global_objmgr);
     hal.Serial.puts("[SUBSYSTEM] NT API subsystem initialized\n");
+
+    // v1.1.0: Register callbacks for NT thread creation
+    nt.registerSchedulerCallbacks(schedulerGetCurrentTaskId);
+    nt.registerKernelCallbacks(createThreadInProcessWrapper);
+    hal.Serial.puts("[SUBSYSTEM] NT thread creation callbacks registered\n");
 
     // Initialize POSIX subsystem
     posix.init(&global_objmgr);
@@ -417,4 +423,22 @@ pub fn errnoToNtstatus(err: errno_t) NTSTATUS {
         ENOSPC => STATUS_NO_MEMORY, // Disk full
         else => STATUS_NOT_IMPLEMENTED,
     };
+}
+
+// ============================================================================
+// Callback Wrappers for NT API — v1.1.0
+// ============================================================================
+// These wrapper functions have C calling convention and are registered as
+// callbacks in nt_api.zig. They break the circular import chain:
+// nt_api.zig ↔ scheduler.zig / kernel_integrate.zig
+
+const scheduler = @import("../scheduler.zig");
+
+fn schedulerGetCurrentTaskId() callconv(.C) usize {
+    return scheduler.current_task_id;
+}
+
+fn createThreadInProcessWrapper(pid: u32, start_routine: u64, arg: u64) callconv(.C) u32 {
+    const result = ki.processMgrCreateThread(pid, start_routine, arg);
+    return result orelse 0;
 }

@@ -37,6 +37,7 @@ const nt_api = @import("subsystem/nt/nt_api.zig");
 const posix_api = @import("subsystem/posix/posix_api.zig");
 const dynlink = @import("dynlinker.zig");
 const cap = @import("capability.zig");
+const heap = @import("heap64.zig");
 
 // ============================================================================
 // 1. VFS ↔ FAT32 Integration
@@ -388,6 +389,9 @@ pub fn processMgrCreateProcess(parent_pid: u32, subsystem_id: subsys.SubsystemId
     pcb.state = .Running;
     process_count += 1;
 
+    // v1.1.0: Initialize per-process Object Manager handle table
+    objmgr.initProcessOM(pid);
+
     hal.Serial.puts("[PROC] Created process PID=");
     hal.Serial.putDecimal(pid);
     hal.Serial.puts(" CR3=");
@@ -495,6 +499,9 @@ pub fn processMgrFork(parent_pid: u32) ?u32 {
     child.state = .Running;
     process_count += 1;
 
+    // v1.1.0: Initialize per-process Object Manager handle table for child
+    objmgr.initProcessOM(child_pid);
+
     hal.Serial.puts("[PROC] COW fork: PID=");
     hal.Serial.putDecimal(parent_pid);
     hal.Serial.puts(" → child PID=");
@@ -581,6 +588,9 @@ pub fn processMgrTerminate(pid: u32, exit_code: i32) bool {
         freeProcessPages(pcb.cr3);
         pcb.cr3 = 0;
     }
+
+    // v1.1.0: Destroy per-process handle table
+    objmgr.destroyProcessOM(pid);
 
     process_count -= 1;
 
@@ -1452,6 +1462,13 @@ pub fn kernelIntegrateInit() void {
     // page tables, FDs, and other per-process resources.
     scheduler.processTerminateCallback = processTerminateWrapper;
 
+    // v1.1.0: Wire VFS load callback into dynlinker.
+    // This eliminates the direct fat32.zig import in dynlinker.zig,
+    // routing all .so file reads through the VFS security layer.
+    // Before this, the dynlinker bypassed Intent verification and
+    // per-handle access checks when loading shared libraries.
+    dynlink.vfsLoadCallback = vfsLoadWrapper;
+
     hal.Serial.puts("[INTEGRATE] All kernel integration layers initialized\n");
     hal.Serial.puts("[INTEGRATE] VFS, ProcessMgr+COW+refcount, mmap+unmapPageInPML4, POLER+ACL, dynlink\n");
 }
@@ -1478,4 +1495,83 @@ fn processTerminateWrapper(task_id: usize) callconv(.C) void {
     }
     if (pid == 0) return;
     _ = processMgrTerminate(pid, 0);
+}
+
+/// VFS load wrapper with C calling convention for dynlinker callback.
+/// Routes .so file reads through the VFS layer instead of the dynlinker
+/// directly calling fat32.zig. This ensures Intent Layer verification
+/// and per-handle access checks apply to shared library loading.
+///
+/// Parameters:
+///   path     — Absolute path (e.g., "/lib/libc.so")
+///   out_data — Pointer to VfsFileData to fill with file contents
+///
+/// Returns: true if the file was successfully read, false otherwise
+fn vfsLoadWrapper(path_ptr: [*]const u8, path_len: usize, out_data: *dynlink.VfsFileData) callconv(.C) bool {
+    const path = path_ptr[0..path_len];
+    out_data.* = dynlink.VfsFileData{};
+
+    const fs = fat32.getFs() orelse {
+        hal.Serial.puts("[DYNLINK-VFS] no FAT32 filesystem available\n");
+        return false;
+    };
+
+    var file = fs.openFile(path) orelse {
+        hal.Serial.puts("[DYNLINK-VFS] file not found: '");
+        hal.Serial.puts(path);
+        hal.Serial.puts("'\n");
+        return false;
+    };
+
+    if (file.is_directory or file.file_size == 0) {
+        hal.Serial.puts("[DYNLINK-VFS] invalid file: '");
+        hal.Serial.puts(path);
+        hal.Serial.puts("'\n");
+        return false;
+    }
+
+    if (file.file_size > 0x4000000) { // 64MB max
+        hal.Serial.puts("[DYNLINK-VFS] file too large\n");
+        return false;
+    }
+
+    const buf_ptr = heap.kmalloc(file.file_size) orelse {
+        hal.Serial.puts("[DYNLINK-VFS] kmalloc failed\n");
+        return false;
+    };
+
+    const buf = buf_ptr[0..file.file_size];
+    var total_read: u32 = 0;
+    const chunk_size: u32 = 4096;
+
+    while (total_read < file.file_size) {
+        const remaining = file.file_size - total_read;
+        const to_read = if (remaining < chunk_size) remaining else chunk_size;
+        const bytes_read = fs.readFile(&file, buf[total_read..][0..to_read], to_read);
+        if (bytes_read == 0) break;
+        total_read += bytes_read;
+    }
+
+    // Validate ELF magic
+    if (total_read < 4 or buf[0] != 0x7F or buf[1] != 'E' or buf[2] != 'L' or buf[3] != 'F') {
+        hal.Serial.puts("[DYNLINK-VFS] not a valid ELF: '");
+        hal.Serial.puts(path);
+        hal.Serial.puts("'\n");
+        heap.kfree(buf_ptr);
+        return false;
+    }
+
+    out_data.* = dynlink.VfsFileData{
+        .ptr = buf_ptr,
+        .size = total_read,
+        .slice = buf[0..total_read],
+    };
+
+    hal.Serial.puts("[DYNLINK-VFS] loaded '");
+    hal.Serial.puts(path);
+    hal.Serial.puts("' (");
+    hal.Serial.putDecimal(total_read);
+    hal.Serial.puts(" bytes)\n");
+
+    return true;
 }

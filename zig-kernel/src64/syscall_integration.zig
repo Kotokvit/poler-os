@@ -28,6 +28,10 @@ const scheduler = @import("scheduler.zig");
 // Import kernel_integrate for process management (capability checks)
 const kernel_integrate = @import("kernel_integrate.zig");
 
+// v1.1.0: Import Intent Dispatcher — all I/O operations must pass through
+// the Intent Layer before reaching the subsystem dispatcher.
+const intent = @import("poler/intent.zig");
+
 // ============================================================================
 // User-space pointer validation — prevents kernel address dereference
 // ============================================================================
@@ -152,6 +156,51 @@ pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, sy
     }
 
     // ========================================================================
+    // Intent Layer — v1.1.0 Semantic Security Gateway
+    // ========================================================================
+    // Before dispatching to any subsystem, create an Intent and verify it
+    // through the 4-phase pipeline:
+    //   Phase 1: PND nonce verification (tamper detection)
+    //   Phase 2: Rate limiting (DoS prevention)
+    //   Phase 3: Process-level capability check
+    //   Phase 4: Per-handle access_mask verification
+    //
+    // This ensures NO I/O operation bypasses the Intent Layer.
+    // The Intent Dispatcher is the single point of truth for authorization.
+    //
+    // Note: Legacy syscalls (1-6) are exempt from Intent verification because
+    // they are simple operations (print, read key, exit, yield) that don't
+    // touch the I/O path. They are covered by the process-level ACL check
+    // in polerAuthenticate() instead.
+    const caller_pid: u32 = @intCast(scheduler.current_task_id);
+    const intent_action = syscallToIntentAction(syscall_num);
+    if (intent_action != null) {
+        const action = intent_action.?;
+        const cat = intentActionToCategory(action);
+        const target_handle: u32 = if (action != .FS_OPEN and action != .PROC_CREATE and action != .MEM_MMAP) @truncate(arg1) else 0;
+        const intent_obj = intent.Intent.create(
+            cat,
+            action,
+            caller_pid,
+            target_handle,
+            .{ arg1, arg2, arg3, arg4, 0, 0 },
+        );
+        const verdict = intent.dispatch(&intent_obj);
+        if (verdict != .Allowed) {
+            // Intent denied — return appropriate error code
+            // NT: STATUS_ACCESS_DENIED (0xC0000022)
+            // POSIX: -EPERM (−1)
+            // We return a generic error; the subsystem will translate.
+            hal.Serial.puts("[SYSCALL] Intent DENIED for syscall=0x");
+            hal.Serial.putHex(syscall_num);
+            hal.Serial.puts(" verdict=");
+            hal.Serial.putDecimal(@intFromEnum(verdict));
+            hal.Serial.puts("\n");
+            return 0xC0000022; // STATUS_ACCESS_DENIED
+        }
+    }
+
+    // ========================================================================
     // Subsystem dispatch — NT / POSIX / POLER native
     // ========================================================================
     const result = subsys.dispatch(syscall_num, arg1, arg2, arg3, arg4, 0, 0);
@@ -160,5 +209,96 @@ pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, sy
         .NtStatus => |status| status, // NTSTATUS is already u32, fits in u64
         .PosixReturn => |ret| @bitCast(ret), // i64 → u64 for return
         .PollerNative => |ret| ret,
+    };
+}
+
+// ============================================================================
+// Syscall → IntentAction Mapping — v1.1.0
+// ============================================================================
+//
+// Maps syscall numbers to their corresponding IntentAction for the Intent
+// Layer. Not every syscall maps to an Intent — only I/O-related ones.
+// Syscalls like getpid(), clock_gettime() etc. are pure queries that don't
+// need Intent verification (they're covered by the process-level ACL check).
+//
+// Returns null for syscalls that don't need Intent verification.
+
+fn syscallToIntentAction(syscall_num: u64) ?intent.IntentAction {
+    // POSIX syscalls (0x0000-0x0FFF)
+    if (syscall_num <= 0x0FFF) {
+        return switch (syscall_num) {
+            0 => .FS_READ,                // read
+            1 => .FS_WRITE,               // write
+            2 => .FS_OPEN,                // open
+            3 => .FS_CLOSE,               // close
+            9 => .MEM_MMAP,               // mmap
+            10 => .MEM_MPROTECT,          // mprotect
+            11 => .MEM_MUNMAP,            // munmap
+            56, 57, 58 => .PROC_CREATE,   // clone, fork, vfork
+            59 => .PROC_EXEC,             // execve
+            60 => .PROC_EXIT,             // exit
+            62 => .PROC_SIGNAL,           // kill
+            78 => .FS_READ,               // getdents
+            79 => .FS_READ,               // getcwd (reads dir info)
+            80 => .FS_CHMOD,              // chdir
+            82 => .FS_MKDIR,              // mkdir
+            83 => .FS_RMDIR,              // rmdir
+            84 => .FS_UNLINK,             // unlink
+            85 => .FS_WRITE,              // creat
+            86 => .FS_WRITE,              // link
+            87 => .FS_UNLINK,             // symlink target
+            88 => .FS_WRITE,              // rename
+            90 => .FS_CHMOD,              // chmod
+            41...55 => .NET_CONNECT,      // socket syscalls
+            else => null,                 // No Intent verification needed
+        };
+    }
+    // NT syscalls (0x1000-0x1FFF)
+    if (syscall_num >= 0x1000 and syscall_num <= 0x1FFF) {
+        const nt_num = syscall_num - 0x1000;
+        return switch (nt_num) {
+            0x02 => .FS_OPEN,             // NtCreateFile
+            0x03 => .FS_READ,             // NtReadFile
+            0x04 => .FS_WRITE,            // NtWriteFile
+            0x07 => .HW_IOCTL,            // NtDeviceIoControlFile
+            0x0C => .FS_CLOSE,            // NtClose
+            0x0D => .FS_READ,             // NtOpenKey (registry = FS_READ in Intent model)
+            0x18 => .MEM_MMAP,            // NtAllocateVirtualMemory
+            0x1E => .MEM_MUNMAP,          // NtFreeVirtualMemory
+            0x1F => .PROC_CREATE,         // NtCreateProcess
+            0x29 => .FS_WRITE,            // NtCreateKey (registry = FS_WRITE)
+            0x30 => .FS_OPEN,             // NtOpenFile
+            0x37 => .FS_WRITE,            // NtSetValueKey
+            0x2C => .PROC_KILL,           // NtTerminateProcess
+            0x46 => .PROC_CREATE,         // NtCreateProcessEx
+            0x50 => .MEM_MPROTECT,        // NtProtectVirtualMemory
+            else => null,
+        };
+    }
+    // POLER native syscalls (0x2000-0x2FFF)
+    if (syscall_num >= 0x2000 and syscall_num <= 0x2FFF) {
+        const poler_num = syscall_num - 0x2000;
+        return switch (poler_num) {
+            0 => null,                     // POLER_SYSCALL_PRINT (no I/O)
+            1 => null,                     // POLER_SYSCALL_GET_SUBSYSTEM (query)
+            2 => null,                     // POLER_SYSCALL_AUTHENTICATE (auth)
+            3 => .SYS_CAP_DELEGATE,        // POLER_SYSCALL_SET_CAPS
+            4 => .SYS_CAP_REVOKE,          // POLER_SYSCALL_REVOKE_CAPS
+            else => null,
+        };
+    }
+    return null;
+}
+
+/// Map an IntentAction back to its IntentCategory
+fn intentActionToCategory(action: intent.IntentAction) intent.IntentCategory {
+    return switch (action) {
+        .FS_OPEN, .FS_READ, .FS_WRITE, .FS_CLOSE, .FS_MKDIR, .FS_RMDIR, .FS_UNLINK, .FS_STAT, .FS_CHMOD, .FS_MOUNT => .FS,
+        .NET_CONNECT, .NET_BIND, .NET_LISTEN, .NET_ACCEPT, .NET_SEND, .NET_RECV, .NET_CLOSE => .NET,
+        .PROC_CREATE, .PROC_KILL, .PROC_WAIT, .PROC_SIGNAL, .PROC_FORK, .PROC_EXEC, .PROC_EXIT, .PROC_GETPID => .PROC,
+        .MEM_MMAP, .MEM_MUNMAP, .MEM_MPROTECT, .MEM_SHARE => .MEM,
+        .HW_READ, .HW_WRITE, .HW_IOCTL, .HW_DMA_MAP => .HW,
+        .IPC_SEND, .IPC_RECV, .IPC_CHANNEL_CREATE, .IPC_CHANNEL_DESTROY => .IPC,
+        .SYS_CAP_DELEGATE, .SYS_CAP_REVOKE, .SYS_POLICY_SET, .SYS_AUDIT_READ, .SYS_SHUTDOWN => .SYS,
     };
 }

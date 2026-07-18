@@ -41,6 +41,8 @@
 const hal = @import("../hal.zig");
 const poler = @import("../poler_core.zig");
 const cap = @import("../capability.zig");
+const objmgr = @import("../subsystem/common/object_manager.zig");
+const ki = @import("../kernel_integrate.zig");
 
 // ============================================================================
 // Intent Categories — semantic classification of operations
@@ -302,36 +304,52 @@ pub fn dispatch(intent: *const Intent) IntentVerdict {
 
     // ── Phase 3: Capability Check (process-level) ────────────────────────
     // Verify that the caller's process has the coarse-grained capability
-    // for this category of operation.
+    // for this category of operation. This uses the per-process capability
+    // mask from the ProcessControlBlock (via kernel_integrate).
     const required_caps = categoryToCapability(intent.category);
-    if (required_caps != 0) {
-        // Get the caller's capability set from the scheduler/PCB
-        // For now, kernel tasks (caller_id=0) always pass
-        if (intent.caller_id != 0) {
-            // TODO: Look up caller's caps from ProcessManager
-            // const caller_caps = proc_getCaps(intent.caller_id);
-            // if (cap.checkCapabilities(caller_caps, required_caps) != .Allowed) {
-            //     denied_intents += 1;
-            //     logIntent(intent, .Insufficient);
-            //     return .Insufficient;
-            // }
+    if (required_caps != 0 and intent.caller_id != 0) {
+        const caller_caps = ki.processMgrGetCaps(intent.caller_id);
+        if (cap.checkCapabilities(caller_caps, required_caps) != .Allowed) {
+            denied_intents += 1;
+            logIntent(intent, .Insufficient);
+            hal.Serial.puts("[INTENT] DENIED: process-level capability insufficient\n");
+            return .Insufficient;
         }
     }
 
     // ── Phase 4: Object Handle Verification ──────────────────────────────
-    // If a handle is specified, verify it exists and its access_mask
-    // covers the requested action.
+    // If a handle is specified, verify it exists in the CALLER's per-process
+    // handle table and its access_mask covers the requested action.
+    // This is the key v1.1.0 improvement: per-handle, per-object access
+    // control eliminates the Ambient Authority problem.
     if (intent.handle != 0) {
         const required_access = actionToAccessMask(intent.action);
         if (required_access != 0) {
-            // TODO: Look up handle in Object Table
-            // const entry = objectTable.lookup(intent.handle);
-            // if (entry == null) { return .NoHandle; }
-            // if (!cap.checkObjectAccess(entry.access_mask, required_access)) {
-            //     denied_intents += 1;
-            //     logIntent(intent, .Insufficient);
-            //     return .Insufficient;
-            // }
+            const result = objmgr.intentVerifyHandle(
+                intent.caller_id,
+                intent.handle,
+                required_access,
+            );
+            switch (result) {
+                .Allowed => {}, // Proceed
+                .NoHandle => {
+                    denied_intents += 1;
+                    logIntent(intent, .NoHandle);
+                    hal.Serial.puts("[INTENT] DENIED: handle not found or revoked\n");
+                    return .NoHandle;
+                },
+                .Insufficient => {
+                    denied_intents += 1;
+                    logIntent(intent, .Insufficient);
+                    hal.Serial.puts("[INTENT] DENIED: handle access_mask insufficient\n");
+                    return .Insufficient;
+                },
+                .Denied => {
+                    denied_intents += 1;
+                    logIntent(intent, .Denied);
+                    return .Denied;
+                },
+            }
         }
     }
 

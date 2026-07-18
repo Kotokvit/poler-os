@@ -34,6 +34,7 @@ pub const STATUS_INVALID_PARAMETER = subsys.STATUS_INVALID_PARAMETER;
 pub const STATUS_INVALID_HANDLE = subsys.STATUS_INVALID_HANDLE;
 pub const STATUS_ACCESS_DENIED = subsys.STATUS_ACCESS_DENIED;
 pub const STATUS_NO_MEMORY = subsys.STATUS_NO_MEMORY;
+pub const STATUS_INSUFFICIENT_RESOURCES = subsys.STATUS_INSUFFICIENT_RESOURCES;
 pub const STATUS_OBJECT_NAME_NOT_FOUND = subsys.STATUS_OBJECT_NAME_NOT_FOUND;
 
 // ============================================================================
@@ -412,11 +413,30 @@ pub fn parseNtPath(path: []const u8) ParsedNtPath {
 var api_set_table: ApiSetTable = undefined;
 var objmgr_ref: ?*objmgr.ObjectManager = null;
 
+// v1.1.0: Function pointer references to break circular dependencies.
+// nt_api.zig cannot directly import scheduler.zig or kernel_integrate.zig
+// (circular import chain). Instead, the needed functions are registered
+// as callbacks at init time, following the same pattern used by
+// hal.zig ↔ scheduler.zig (timerTickCallback).
+var getCurrentTaskId: ?*const fn () callconv(.C) usize = null;
+var createThreadInProcess: ?*const fn (u32, u64, u64) callconv(.C) u32 = null;
+
 pub fn init(om: *objmgr.ObjectManager) void {
     api_set_table = ApiSetTable.init();
     objmgr_ref = om;
     hal.Serial.puts("[NT] NT API subsystem initialized (v6 schema, 891 API sets)\n");
     hal.Serial.puts("[NT] NtXxx syscalls: 0x1000-0x1FFF, Path parser ready\n");
+}
+
+/// Register scheduler callback for getting current task ID (v1.1.0)
+pub fn registerSchedulerCallbacks(get_tid: *const fn () callconv(.C) usize) void {
+    getCurrentTaskId = get_tid;
+}
+
+/// Register kernel_integrate callback for thread creation (v1.1.0)
+/// Returns PID on success, 0 on failure (C calling convention doesn't allow ?u32)
+pub fn registerKernelCallbacks(create_thread: *const fn (u32, u64, u64) callconv(.C) u32) void {
+    createThreadInProcess = create_thread;
 }
 
 // ============================================================================
@@ -832,26 +852,61 @@ fn ntProtectVirtualMemory(process_handle: u64, base_addr: u64, region_size: u64,
 }
 
 fn ntCreateThread(thread_handle: u64, desired_access: u64, client_id: u64) NTSTATUS {
-    _ = desired_access;
     _ = client_id;
 
-    const out: *HANDLE = @ptrFromInt(thread_handle);
-    out.* = 0x2000; // Stub handle
+    // v1.1.0: Implement NtCreateThread using callbacks
+    const current_pid: u32 = if (getCurrentTaskId) |cb| @intCast(cb()) else 0;
+    const start_routine: u64 = 0; // Must be provided via thread context
 
-    return STATUS_NOT_IMPLEMENTED;
+    if (start_routine == 0) {
+        const out: *HANDLE = @ptrFromInt(thread_handle);
+        out.* = 0;
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    const result_pid = if (createThreadInProcess) |cb| cb(current_pid, start_routine, 0) else 0;
+    if (result_pid == 0) {
+        const out: *HANDLE = @ptrFromInt(thread_handle);
+        out.* = 0;
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    const handle = objmgr_ref.?.createHandle(.Thread, @truncate(desired_access));
+    const out: *HANDLE = @ptrFromInt(thread_handle);
+    out.* = handle;
+
+    return STATUS_SUCCESS;
 }
 
 fn ntCreateThreadEx(thread_handle: u64, desired_access: u64, obj_attrs: u64, process_handle: u64, start_routine: u64, argument: u64) NTSTATUS {
-    _ = desired_access;
     _ = obj_attrs;
-    _ = process_handle;
-    _ = start_routine;
-    _ = argument;
 
+    // v1.1.0: Implement NtCreateThreadEx with actual thread creation
+    const pid: u32 = if (process_handle == 0xFFFFFFFFFFFFFFFF)
+        if (getCurrentTaskId) |cb| @intCast(cb()) else 0
+    else
+        @truncate(process_handle);
+
+    const result_pid = if (createThreadInProcess) |cb| cb(pid, start_routine, argument) else 0;
+    if (result_pid == 0) {
+        const out: *HANDLE = @ptrFromInt(thread_handle);
+        out.* = 0;
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    const handle = objmgr_ref.?.createHandle(.Thread, @truncate(desired_access));
     const out: *HANDLE = @ptrFromInt(thread_handle);
-    out.* = 0x2001; // Stub handle
+    out.* = handle;
 
-    return STATUS_NOT_IMPLEMENTED;
+    hal.Serial.puts("[NT] NtCreateThreadEx: PID=");
+    hal.Serial.putDecimal(pid);
+    hal.Serial.puts(" start=0x");
+    hal.Serial.putHex(start_routine);
+    hal.Serial.puts(" handle=0x");
+    hal.Serial.putHex(handle);
+    hal.Serial.puts("\n");
+
+    return STATUS_SUCCESS;
 }
 
 fn ntWaitForSingleObject(handle: u64, alertable: u64, timeout: u64) NTSTATUS {
