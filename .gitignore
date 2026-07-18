@@ -2,7 +2,9 @@ skills/
 node_modules/
 poler-os-drive/
 poler-os-source/
+qemu-alt/
 *.deb
 *.tar.xz
 *.tar.gz
 !zig-kernel/iso/**/*.tar.gz
+tool-results/
