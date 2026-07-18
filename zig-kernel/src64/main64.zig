@@ -31,6 +31,10 @@ const fat32 = @import("fat32.zig");
 const subsys = @import("subsystem/subsystem.zig");
 const syscall_int = @import("syscall_integration.zig");
 const ki = @import("kernel_integrate.zig");
+const cap = @import("capability.zig");
+const policy = @import("policy_engine.zig");
+const ipc = @import("ipc.zig");
+const ai_capsule = @import("ai_capsule.zig");
 
 
 
@@ -613,9 +617,9 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     };
     if (virtio_blk.isInitialized()) {
         has_blk = true;
-        const cap = virtio_blk.getCapacityBytes();
+        const blk_cap = virtio_blk.getCapacityBytes();
         puts("[VIRTIO-BLK] Device found! Capacity: ");
-        putDecimal(cap);
+        putDecimal(blk_cap);
         puts(" bytes\n");
 
         // Initialize FAT32 filesystem
@@ -702,6 +706,21 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     puts("[BOOT] Initializing kernel integration...\n");
     ki.kernelIntegrateInit();
     puts("[BOOT] Kernel integration OK\n");
+
+    // 8.5a-3. Initialize Policy Engine
+    puts("[BOOT] Initializing policy engine...\n");
+    policy.init();
+    puts("[BOOT] Policy engine OK\n");
+
+    // 8.5a-4. Initialize IPC Channels
+    puts("[BOOT] Initializing IPC channels...\n");
+    ipc.init();
+    puts("[BOOT] IPC channels OK\n");
+
+    // 8.5a-5. Initialize AI Capsule Manager
+    puts("[BOOT] Initializing AI capsule manager...\n");
+    ai_capsule.init();
+    puts("[BOOT] AI capsule manager OK\n");
 
     // 8.5b. Initialize Syscalls — now routes through subsystem dispatcher
     puts("[BOOT] Initializing syscalls...\n");

@@ -20,7 +20,7 @@
 
 const hal = @import("hal.zig");
 
-pub const MAX_TASKS = 8;
+pub const MAX_TASKS = 64;
 
 // v1.2.0: TCB allocation callback — registered by kernel_integrate at init.
 // Breaks circular dependency: scheduler.zig ↔ dynlinker.zig via function pointer.
@@ -296,7 +296,7 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
     scheduler_ticks += 1;
 
     // DEBUG: periodic log to confirm schedule is running
-    if (scheduler_ticks % 100 == 1) {
+    if (scheduler_ticks % 1000 == 1) {
         hal.Serial.puts("[SCHED] tick ");
         hal.Serial.putDecimal(scheduler_ticks);
         hal.Serial.puts(" current=");
@@ -337,8 +337,8 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
     current_task_id = next_id;
     tasks[current_task_id].state = .Running;
 
-    // DEBUG: Log when switching to a user task
-    if (tasks[current_task_id].privilege == .User) {
+    // Log user task switches (reduced frequency)
+    if (tasks[current_task_id].privilege == .User and scheduler_ticks % 5000 == 0) {
         hal.Serial.puts("[SCHED] Switching to user task ");
         hal.Serial.putHex(current_task_id);
         hal.Serial.puts(" RIP=");

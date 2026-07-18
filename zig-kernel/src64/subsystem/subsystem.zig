@@ -34,6 +34,7 @@ const nt = @import("nt/nt_api.zig");
 const posix = @import("posix/posix_api.zig");
 const objmgr = @import("common/object_manager.zig");
 const ki = @import("../kernel_integrate.zig");
+const cap = @import("../capability.zig");
 
 // ============================================================================
 // Subsystem Identity — which API personality a process uses
@@ -44,6 +45,7 @@ pub const SubsystemId = enum(u8) {
     NT = 1, // Windows NT API personality
     POSIX = 2, // Linux/POSIX API personality
     Hybrid = 3, // Can call both (e.g., WSL-like interop)
+    AI = 4, // AI runtime capsule (restricted capability set)
 };
 
 // ============================================================================
@@ -57,6 +59,8 @@ pub const POLER_SYSCALL_BASE: u64 = 0x2000; // 0x2000..0x2FFF: POLER-OS native
 pub const MAX_POSIX_SYSCALL: u64 = 0x0FFF;
 pub const MAX_NT_SYSCALL: u64 = 0x1FFF;
 pub const MAX_POLER_SYSCALL: u64 = 0x2FFF;
+pub const AI_SYSCALL_BASE: u64 = 0x3000; // 0x3000..0x3FFF: AI capsule syscalls
+pub const MAX_AI_SYSCALL: u64 = 0x3FFF;
 
 // ============================================================================
 // NTSTATUS codes — mirrors Windows NT status values
@@ -211,6 +215,26 @@ pub fn init() void {
 
     initialized = true;
     hal.Serial.puts("[SUBSYSTEM] Dual-personality kernel ready (NT + POSIX)\n");
+}
+
+// ============================================================================
+// Capability mapping — determine required capabilities for a syscall
+// ============================================================================
+
+/// Determine required capabilities for a syscall number.
+/// Routes to the appropriate subsystem's capability mapping.
+pub fn requiredCapsForSyscall(syscall_num: u64) u64 {
+    if (syscall_num <= MAX_POSIX_SYSCALL) {
+        return ki.posixSyscallToCapabilities(syscall_num);
+    } else if (syscall_num >= NT_SYSCALL_BASE and syscall_num <= MAX_NT_SYSCALL) {
+        return ki.ntSyscallToCapabilities(syscall_num - NT_SYSCALL_BASE);
+    } else if (syscall_num >= POLER_SYSCALL_BASE and syscall_num <= MAX_POLER_SYSCALL) {
+        return ki.polerSyscallToCapabilities(syscall_num - POLER_SYSCALL_BASE);
+    } else if (syscall_num >= AI_SYSCALL_BASE and syscall_num <= MAX_AI_SYSCALL) {
+        // AI syscalls require CAP_AI_RUNTIME | CAP_POLER_AUTH
+        return ki.CAP_AI_RUNTIME | ki.CAP_POLER_AUTH;
+    }
+    return 0; // Unknown — no capabilities required (will be denied by policy)
 }
 
 // ============================================================================

@@ -24,6 +24,19 @@
 const hal = @import("../../hal.zig");
 
 // ============================================================================
+// NT-compatible ACCESS_MASK bits
+// ============================================================================
+
+pub const ACCESS_READ: u32 = 0x00000001;
+pub const ACCESS_WRITE: u32 = 0x00000002;
+pub const ACCESS_EXECUTE: u32 = 0x00000004;
+pub const ACCESS_DELETE: u32 = 0x00010000;
+pub const ACCESS_READ_ATTRIBUTES: u32 = 0x00000080;
+pub const ACCESS_WRITE_ATTRIBUTES: u32 = 0x00000100;
+pub const ACCESS_FULL: u32 = 0xFFFFFFFF;
+pub const ACCESS_NONE: u32 = 0x00000000;
+
+// ============================================================================
 // Object Types
 // ============================================================================
 
@@ -81,6 +94,8 @@ pub const HandleEntry = struct {
     obj_type: ObjectType = .Free,
     access_mask: u32 = 0,
     ref_count: u32 = 0,
+    cap_generation: u32 = 0, // Generation counter for revocation detection
+    cap_revoked: bool = false, // Soft-revoke flag
     // Object-specific data follows
     // For files: VFS node pointer, offset, etc.
     // For events: signaled state, auto-reset flag
@@ -128,7 +143,9 @@ pub const ObjectManager = struct {
     }
 
     /// Create a new handle for the given object type
-    pub fn createHandle(self: *Self, obj_type: ObjectType, access: u64) u64 {
+    /// initial_access_mask: optional ACCESS_MASK bits; defaults to ACCESS_FULL if null
+    pub fn createHandle(self: *Self, obj_type: ObjectType, initial_access_mask: ?u32) u64 {
+        const mask = initial_access_mask orelse ACCESS_FULL;
         self.spinLock();
 
         // Find a free handle slot
@@ -142,8 +159,10 @@ pub const ObjectManager = struct {
                 self.handles[idx] = HandleEntry{
                     .in_use = true,
                     .obj_type = obj_type,
-                    .access_mask = @intCast(access & 0xFFFFFFFF),
+                    .access_mask = mask,
                     .ref_count = 1,
+                    .cap_generation = 0,
+                    .cap_revoked = false,
                 };
 
                 const handle: u64 = @intCast(idx);
@@ -156,6 +175,34 @@ pub const ObjectManager = struct {
 
         self.spinUnlock();
         return INVALID_HANDLE;
+    }
+
+    /// Check whether a handle grants the required access rights
+    /// Returns true if: handle is in_use, NOT revoked, and access_mask covers required_access
+    pub fn checkHandleAccess(self: *Self, handle_index: usize, required_access: u32) bool {
+        if (handle_index >= MAX_HANDLES) return false;
+        const entry = &self.handles[handle_index];
+        if (!entry.in_use) return false;
+        if (entry.cap_revoked) return false;
+        return (entry.access_mask & required_access) == required_access;
+    }
+
+    /// Soft-revoke a handle: marks it revoked and bumps the generation counter
+    pub fn revokeHandle(self: *Self, handle_index: usize) void {
+        self.spinLock();
+        defer self.spinUnlock();
+
+        if (handle_index >= MAX_HANDLES) return;
+        if (!self.handles[handle_index].in_use) return;
+
+        self.handles[handle_index].cap_revoked = true;
+        self.handles[handle_index].cap_generation += 1;
+    }
+
+    /// Check whether a handle has been revoked
+    pub fn isHandleRevoked(self: *Self, handle_index: usize) bool {
+        if (handle_index >= MAX_HANDLES) return false;
+        return self.handles[handle_index].cap_revoked;
     }
 
     /// Look up a handle and return a pointer to the entry
@@ -271,3 +318,39 @@ pub const ObjectManager = struct {
         @atomicStore(u32, &self.lock, 0, .release);
     }
 };
+
+// ============================================================================
+// Global Object Manager Singleton + Standalone Wrapper Functions
+// ============================================================================
+// These wrappers allow modules (like ipc.zig) to call createHandle/closeHandle
+// without needing a direct reference to the ObjectManager instance.
+
+var global_om: ObjectManager = undefined;
+var global_om_initialized: bool = false;
+
+/// Get the global ObjectManager instance (initializes on first call)
+pub fn getGlobal() *ObjectManager {
+    if (!global_om_initialized) {
+        global_om.init();
+        global_om_initialized = true;
+    }
+    return &global_om;
+}
+
+/// Standalone createHandle — uses global ObjectManager
+pub fn createHandle(obj_type: ObjectType, access_mask: ?u32) ?u64 {
+    const om = getGlobal();
+    const handle = om.createHandle(obj_type, access_mask);
+    if (handle == INVALID_HANDLE) return null;
+    return handle;
+}
+
+/// Standalone closeHandle — uses global ObjectManager
+pub fn closeHandle(handle: u64) bool {
+    return getGlobal().closeHandle(handle);
+}
+
+/// Standalone lookupHandle — uses global ObjectManager
+pub fn lookupHandle(handle: u64) ?*HandleEntry {
+    return getGlobal().lookupHandle(handle);
+}

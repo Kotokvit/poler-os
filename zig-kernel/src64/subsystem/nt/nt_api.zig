@@ -657,7 +657,7 @@ fn ntCreateFile(
     hal.Serial.puts("\n");
 
     // Create a handle in the Object Manager
-    const handle = objmgr_ref.?.createHandle(.File, desired_access);
+    const handle = objmgr_ref.?.createHandle(.File, @truncate(desired_access));
     if (handle == INVALID_HANDLE_VALUE) return STATUS_NO_MEMORY;
 
     // Write handle to user memory
@@ -841,7 +841,7 @@ fn ntCreateEvent(event_handle: u64, desired_access: u64, obj_attrs: u64, initial
 
     if (objmgr_ref == null) return STATUS_NO_MEMORY;
 
-    const handle = objmgr_ref.?.createHandle(.Event, desired_access);
+    const handle = objmgr_ref.?.createHandle(.Event, @truncate(desired_access));
     if (handle == INVALID_HANDLE_VALUE) return STATUS_NO_MEMORY;
 
     const out: *HANDLE = @ptrFromInt(event_handle);
