@@ -959,7 +959,7 @@ fn sys_clear_screen() void {
 fn execute_command(cmd: []const u8) void {
     if (eq(cmd, "help")) {
         hal.Serial.puts("╔══════════════════════════════════════════════╗\n");
-        hal.Serial.puts("║       POLER-OS v0.9.1 Shell Commands        ║\n");
+        hal.Serial.puts("║       POLER-OS v0.9.2 Shell Commands        ║\n");
         hal.Serial.puts("╠══════════════════════════════════════════════╣\n");
         hal.Serial.puts("║ Navigation:                                 ║\n");
         hal.Serial.puts("║   ls             List files in current dir   ║\n");
@@ -982,6 +982,7 @@ fn execute_command(cmd: []const u8) void {
         hal.Serial.puts("║   clear          Clear screen               ║\n");
         hal.Serial.puts("║   disk           Show disk info             ║\n");
         hal.Serial.puts("║   format         Format disk as FAT32       ║\n");
+        hal.Serial.puts("║   sync           Flush disk writes          ║\n");
         hal.Serial.puts("║   fbinfo         Show framebuffer info      ║\n");
         hal.Serial.puts("║   poler          Run POLER core self-tests   ║\n");
         hal.Serial.puts("╠══════════════════════════════════════════════╣\n");
@@ -995,9 +996,9 @@ fn execute_command(cmd: []const u8) void {
         hal.Serial.puts("╚══════════════════════════════════════════════╝\n");
     } else if (eq(cmd, "commands")) {
         // Short-form command listing
-        hal.Serial.puts("help about clear poler ls cat mkdir touch write rm cp mv cd pwd disk intents handles format storage_test nested_test fbinfo commands\n");
+        hal.Serial.puts("help about clear poler ls cat mkdir touch write rm cp mv cd pwd disk intents handles format sync storage_test nested_test fbinfo commands\n");
     } else if (eq(cmd, "about")) {
-        hal.Serial.puts("POLER-OS v0.9.1 (x86_64 Long Mode)\n");
+        hal.Serial.puts("POLER-OS v0.9.2 (x86_64 Long Mode)\n");
         hal.Serial.puts("Semantic Security Kernel — Intent + Firewall + Capabilities.\n");
         hal.Serial.puts("Dual-personality: NT API + POSIX. Serial + PS/2 keyboard input.\n");
     } else if (eq(cmd, "clear")) {
@@ -1035,6 +1036,8 @@ fn execute_command(cmd: []const u8) void {
         cmd_cd(cmd[3..]);
     } else if (eq(cmd, "format")) {
         cmd_format();
+    } else if (eq(cmd, "sync")) {
+        cmd_sync();
     } else if (eq(cmd, "storage_test")) {
         cmd_storage_test();
     } else if (eq(cmd, "nested_test")) {
@@ -1562,6 +1565,16 @@ fn cmd_format() void {
     } else {
         hal.Serial.puts("Format failed!\n");
     }
+}
+
+fn cmd_sync() void {
+    const fs = fat32.getFs() orelse {
+        hal.Serial.puts("No filesystem mounted\n");
+        return;
+    };
+    hal.Serial.puts("Syncing disk...");
+    fs.sync();
+    hal.Serial.puts(" Done.\n");
 }
 
 fn cmd_storage_test() void {

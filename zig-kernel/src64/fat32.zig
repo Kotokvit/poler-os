@@ -682,12 +682,22 @@ pub const Fat32Fs = struct {
             if (current_dir < 2 or current_dir >= self.total_data_clusters + 2) {
                 hal.Serial.puts("[FAT32] openFile: invalid cluster ");
                 hal.Serial.putHex(current_dir);
-                hal.Serial.puts(" in path traversal\n");
+                hal.Serial.puts(" in path traversal at component '");
+                hal.Serial.puts(component);
+                hal.Serial.puts("'\n");
                 return null;
             }
 
             // Look up this component in the current directory
-            const entry = self.findEntryInDir(current_dir, component) orelse return null;
+            const entry = self.findEntryInDir(current_dir, component) orelse {
+                // Debug: component not found in current directory
+                if (!is_last) {
+                    hal.Serial.puts("[FAT32] openFile: intermediate directory '");
+                    hal.Serial.puts(component);
+                    hal.Serial.puts("' not found\n");
+                }
+                return null;
+            };
 
             if (is_last) {
                 // This is the final component — return as File
@@ -710,7 +720,12 @@ pub const Fat32Fs = struct {
                 };
             } else {
                 // Intermediate component — must be a directory
-                if (!entry.is_directory) return null;
+                if (!entry.is_directory) {
+                    hal.Serial.puts("[FAT32] openFile: '");
+                    hal.Serial.puts(component);
+                    hal.Serial.puts("' is not a directory (expected intermediate dir)\n");
+                    return null;
+                }
                 if (entry.first_cluster >= 2 and entry.first_cluster < self.total_data_clusters + 2) {
                     current_dir = entry.first_cluster;
                 } else {
@@ -719,7 +734,7 @@ pub const Fat32Fs = struct {
                     hal.Serial.puts("' has invalid cluster ");
                     hal.Serial.putHex(entry.first_cluster);
                     hal.Serial.puts("\n");
-                    current_dir = self.root_cluster;
+                    return null;
                 }
             }
         }
@@ -1013,6 +1028,20 @@ pub const Fat32Fs = struct {
         }
 
         return null;
+    }
+
+    /// Flush all cached metadata to disk and issue a device flush.
+    /// Call this to ensure data persistence across reboots.
+    pub fn sync(self: *Fat32Fs) void {
+        // Flush dirty FAT cache first
+        self.flushFatCache();
+        // Reset FAT cache to force re-read on next access
+        self.fat_cache_sector = 0xFFFFFFFF;
+        self.fat_cache_dirty = false;
+        // Issue device-level flush (VIRTIO_BLK_T_FLUSH)
+        virtio_blk.flushDevice() catch {
+            hal.Serial.puts("[FAT32] sync: device flush failed (may not be supported)\n");
+        };
     }
 
     /// Read bytes from an open file into a caller-provided buffer.

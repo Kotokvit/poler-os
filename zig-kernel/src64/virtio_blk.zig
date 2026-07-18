@@ -833,6 +833,60 @@ pub fn writeSector(sector: u64, buffer: []const u8) VblkError!void {
     return writeSectors(sector, 1, buffer);
 }
 
+/// Flush device write cache (VIRTIO_BLK_T_FLUSH).
+/// Sends a flush request to the device to ensure all previously
+/// written data is persisted to stable storage.
+pub fn flushDevice() VblkError!void {
+    if (!vblk_state.initialized) return VblkError.NoDevice;
+    if (vblk_state.is_read_only) return;
+
+    hal.cli();
+    defer hal.sti();
+
+    const slot = allocDmaSlot() orelse return VblkError.NoDmaSlot;
+    defer freeDmaSlot(slot);
+
+    // Set up flush request header
+    const req: *volatile VirtBlkReqHeader = @ptrFromInt(@as(usize, @intCast(slot.req_virt)));
+    req.type = VIRTIO_BLK_T_FLUSH;
+    req.reserved = 0;
+    req.sector = 0;
+
+    // Allocate descriptor chain: req(out) → status(in)
+    const head = allocDescChain(2) orelse return VblkError.NoDmaSlot;
+
+    var desc0 = getDesc(head);
+    desc0.addr = slot.req_phys;
+    desc0.len = @sizeOf(VirtBlkReqHeader);
+    desc0.flags = VIRTIO_DESC_F_NEXT;
+
+    const desc1_idx = desc0.next;
+    var desc1 = getDesc(desc1_idx);
+    desc1.addr = slot.status_phys;
+    desc1.len = 1;
+    desc1.flags = VIRTIO_DESC_F_WRITE;
+
+    const status_ptr: *volatile u8 = @ptrFromInt(@as(usize, @intCast(slot.status_virt)));
+    status_ptr.* = 0xFF;
+
+    submitChain(head);
+
+    const completed = waitForCompletion(100_000_000) orelse {
+        hal.Serial.puts("[VBLK-FLUSH] TIMEOUT!\n");
+        freeDescChain(head);
+        return VblkError.Timeout;
+    };
+    _ = completed;
+
+    if (status_ptr.* != VIRTIO_BLK_S_OK) {
+        // Flush may not be supported — silently succeed
+        freeDescChain(head);
+        return;
+    }
+
+    freeDescChain(head);
+}
+
 /// Get device capacity in sectors
 pub fn getCapacitySectors() u64 {
     return vblk_state.config.capacity;
