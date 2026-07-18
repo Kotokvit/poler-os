@@ -174,7 +174,7 @@ pub fn freePage(addr: u64) void {
     // v0.9.0: Decrement refcount. Only free when it reaches 0.
     if (refcounts[page_idx] > 1) {
         // Other processes still reference this page (COW)
-        @atomicRmw(u32, &refcounts[page_idx], .Sub, 1, .release);
+        _ = @atomicRmw(u32, &refcounts[page_idx], .Sub, 1, .release);
         hal.Serial.puts("[PMM] freePage: COW refcount decremented for 0x");
         hal.Serial.putHex(addr);
         hal.Serial.puts(" refcount=");
@@ -251,7 +251,6 @@ pub fn unrefPage(addr: u64) bool {
 
     // Atomic decrement
     const old = @atomicRmw(u32, &refcounts[page_idx], .Sub, 1, .release);
-    _ = old;
 
     // If the old count was 1, it's now 0 — page should be freed
     return old == 1;

@@ -19,7 +19,7 @@
 // which is defined here.
 // ============================================================================
 
-const hal = @import("../hal.zig");
+const hal = @import("hal.zig");
 const subsys = @import("subsystem/subsystem.zig");
 
 // Import the scheduler for exit/yield handling (legacy compatibility)

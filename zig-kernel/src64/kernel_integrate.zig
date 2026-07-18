@@ -97,7 +97,7 @@ pub fn vfsOpen(path: []const u8, is_nt: bool, readable: bool, writable: bool) ?u
     }
     const clean_path = path_buf[0..fat32_path.len];
 
-    var file = fs.openFile(clean_path) orelse return null;
+    const file = fs.openFile(clean_path) orelse return null;
 
     for (&vfs_open_files, 0..) |*slot, i| {
         if (!slot.in_use) {
@@ -309,7 +309,7 @@ pub fn processMgrInit() void {
 fn allocPid() ?u32 {
     var checked: u32 = 0;
     while (checked < MAX_PROCESSES) : ({
-        next_pid = (next_pid + 1) % MAX_PROCESSES;
+        next_pid = @intCast((next_pid + 1) % MAX_PROCESSES);
         if (next_pid == 0) next_pid = 1;
         checked += 1;
     }) {
@@ -516,7 +516,7 @@ pub fn processMgrCreateThread(pid: u32, start_routine: u64, arg: u64) ?u32 {
         vmm.mapPageInPML4(pcb.cr3, stack_page, phys, vmm.PTE_PRESENT | vmm.PTE_WRITABLE | vmm.PTE_USER) catch return null;
     }
 
-    const task_id = scheduler.createUserTask(start_routine, pcb.cr3, THREAD_STACK_TOP) catch return null;
+    _ = scheduler.createUserTask(start_routine, pcb.cr3, THREAD_STACK_TOP) catch return null;
     _ = arg;
 
     hal.Serial.puts("[PROC] Created thread in PID=");
@@ -692,7 +692,6 @@ pub fn memoryMgrMunmap(pid: u32, addr: u64, length: u64) bool {
 /// NT NtAllocateVirtualMemory
 pub fn memoryMgrNtAllocate(pid: u32, size: u64, allocation_type: u64, protect: u64) ?u64 {
     _ = allocation_type;
-    _ = protect;
     var prot: i64 = 0x1 | 0x2;
     if (protect & 0x40 != 0) prot |= 0x4;
     return memoryMgrMmap(pid, size, prot, 0x20);
@@ -1036,7 +1035,7 @@ pub fn polerAuthenticate(action: PolerAction) AuthResult {
     // The MAC is now computed — for v0.8.0 we use it for audit
     // In future versions, the MAC can be verified against a signed
     // capability certificate from the kernel key manager.
-    _ = mix;
+
 
     // Step 5: Determine result — sensitive operations get audited
     const is_sensitive = (required_caps & (CAP_PROCESS_KILL | CAP_PRIVILEGE | CAP_ADMIN | CAP_RAW_IO | CAP_DEVICE)) != 0;

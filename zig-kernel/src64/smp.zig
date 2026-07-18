@@ -382,7 +382,7 @@ pub export fn ap_entry_zig() callconv(.C) void {
     const state_ptr_idle: *u8 = @ptrCast(&cpu.state);
     while (true) {
         // Check if there are tasks in our run queue
-        if (scheduler.cpu_run_queues[cpu_id].count > 0) {
+        if (scheduler.task_count > 0) {
             // Tasks available — let the next timer tick schedule them
             // (schedule() is called from the APIC timer ISR)
         }

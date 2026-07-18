@@ -113,7 +113,11 @@ pub fn init() void {
     // Register COW page fault handler with HAL
     // This allows the HAL's #PF handler to call handleCowPageFault
     // without a direct circular dependency (hal ↔ vmm)
-    hal.cowPageFaultCallback = handleCowPageFault;
+    hal.cowPageFaultCallback = struct {
+        fn handler(vaddr: u64, fault_cr3: u64, err_code: u64) callconv(.C) bool {
+            return handleCowPageFault(vaddr, fault_cr3, err_code);
+        }
+    }.handler;
     hal.Serial.puts("[VMM] COW page fault handler registered with HAL\n");
 
     // Initialize TLB shootdown state
@@ -401,7 +405,7 @@ pub fn clonePML4_COW(parent_pml4_phys: u64) !u64 {
                 // Walk PT entries — this is where actual pages are
                 const parent_pt: [*]volatile u64 = @ptrFromInt(parent_pt_phys);
                 for (0..512) |pt_idx| {
-                    var pte = parent_pt[pt_idx];
+                    const pte = parent_pt[pt_idx];
                     if (pte & PTE_PRESENT == 0) continue;
                     if ((pte & PTE_USER) == 0) continue; // Skip kernel pages in user tables
 
@@ -471,7 +475,7 @@ pub fn handleCowPageFault(fault_virt: u64, fault_cr3: u64, error_code: u64) bool
     const pt_phys = pd[pd_idx] & 0x000FFFFFFFFFF000;
 
     const pt: [*]volatile u64 = @ptrFromInt(pt_phys);
-    var pte = pt[pt_idx];
+    const pte = pt[pt_idx];
 
     // Check if this is a COW page
     if (pte & PTE_COW == 0) return false;
@@ -530,7 +534,7 @@ pub fn handleCowPageFault(fault_virt: u64, fault_cr3: u64, error_code: u64) bool
     //   - Writable (restore the write permission)
     //   - COW and SHARED bits cleared
     var new_pte = pte;
-    new_pte &= ~0x000FFFFFFFFFF000; // Clear old physical address
+    new_pte &= ~@as(u64, 0x000FFFFFFFFFF000); // Clear old physical address
     new_pte |= new_phys; // Set new physical address
     new_pte |= PTE_WRITABLE; // Restore write permission
     new_pte &= ~(PTE_COW | PTE_SHARED); // Clear COW markers
@@ -606,7 +610,7 @@ pub fn unmapPageInPML4(target_pml4_phys: u64, virt: u64) VmmError!u64 {
     const pt_phys = pd[pd_idx] & 0x000FFFFFFFFFF000;
 
     const pt: [*]volatile u64 = @ptrFromInt(pt_phys);
-    var pte = pt[pt_idx];
+    const pte = pt[pt_idx];
     if (pte & PTE_PRESENT == 0) return 0;
 
     // Extract physical page address before clearing
@@ -829,7 +833,7 @@ pub fn protectPageInPML4(target_pml4_phys: u64, virt: u64, new_flags: u64) bool 
     const pt_phys = pd[pd_idx] & 0x000FFFFFFFFFF000;
 
     const pt: [*]volatile u64 = @ptrFromInt(pt_phys);
-    var pte = pt[pt_idx];
+    const pte = pt[pt_idx];
     if (pte & PTE_PRESENT == 0) return false;
 
     // Preserve the physical address, update only the flag bits
@@ -1035,5 +1039,5 @@ pub fn handleTlbShootdownIpi() callconv(.C) void {
     }
 
     // Acknowledge completion
-    @atomicRmw(u32, &req.pending_count, .Sub, 1, .release);
+    _ = @atomicRmw(u32, &req.pending_count, .Sub, 1, .release);
 }

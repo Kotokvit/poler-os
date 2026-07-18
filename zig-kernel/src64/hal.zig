@@ -380,7 +380,6 @@ pub const IDT = struct {
         // v0.9.0: Manually register TLB shootdown IPI handler (vector 240 = 0xF0)
         // This vector is not in the standard ISR stub table (which only has vectors 0-48)
         // but was added as isr_stub_240 in isr64.S
-        const vmm = @import("vmm64.zig");
         // We need the address of isr_stub_240, which is at index 49 in the extended table
         // The ISR stub table now has 50 entries (0-48 + 240)
         if (num_entries > 49) {

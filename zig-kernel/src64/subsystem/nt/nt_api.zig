@@ -494,87 +494,87 @@ pub const NT_SYSCALL = enum(u16) {
     NtPulseEvent = 0x0021,
     NtClearEvent = 0x0059,
 
-    // Registry
-    NtCreateKey = 0x0029, // Same as NtLockFile — need separate numbering
-    NtOpenKey = 0x001D,
-    NtDeleteKey = 0x004D,
-    NtDeleteValueKey = 0x004C,
-    NtSetValueKey = 0x0011,
-    NtQueryValueKey = 0x0018,
-    NtEnumerateKey = 0x000D,
-    NtEnumerateValueKey = 0x000E,
-    NtQueryKey = 0x0010,
-    NtNotifyChangeKey = 0x0013,
-    NtNotifyChangeMultipleKeys = 0x00C2,
-    NtOpenKeyEx = 0x00AF,
+    // Registry (POLER-OS custom range 0x0100+ to avoid collisions with NT numbers)
+    NtCreateKey = 0x0100,
+    NtOpenKey = 0x0101,
+    NtDeleteKey = 0x0102,
+    NtDeleteValueKey = 0x0103,
+    NtSetValueKey = 0x0104,
+    NtQueryValueKey = 0x0105,
+    NtEnumerateKey = 0x0106,
+    NtEnumerateValueKey = 0x0107,
+    NtQueryKey = 0x0108,
+    NtNotifyChangeKey = 0x0109,
+    NtNotifyChangeMultipleKeys = 0x010A,
+    NtOpenKeyEx = 0x010B,
     NtCreateKeyTransacted = 0x00B3,
     NtOpenKeyTransacted = 0x00B4,
 
-    // Memory management
-    NtMapViewOfSection = 0x0028,
-    NtUnmapViewOfSection = 0x0029,
-    NtCreateSection = 0x004A,
-    NtOpenSection = 0x002C,
-    NtExtendSection = 0x0052,
+    // Memory management (POLER-OS custom range 0x0110+ to avoid collisions)
+    NtMapViewOfSection = 0x0110,
+    NtUnmapViewOfSection = 0x0111,
+    NtCreateSection = 0x0112,
+    NtOpenSection = 0x0113,
+    NtExtendSection = 0x0114,
 
-    // Synchronization
-    NtCreateMutant = 0x0048,
-    NtOpenMutant = 0x0049,
-    NtReleaseMutant = 0x0022,
-    NtCreateSemaphore = 0x0046,
-    NtOpenSemaphore = 0x0047,
-    NtReleaseSemaphore = 0x0013,
-    NtCreateTimer = 0x004F,
-    NtOpenTimer = 0x0050,
-    NtSetTimer = 0x0014,
-    NtCancelTimer = 0x0015,
+    // Synchronization (POLER-OS custom range 0x0120+)
+    NtCreateMutant = 0x0120,
+    NtOpenMutant = 0x0121,
+    NtReleaseMutant = 0x0122,
+    NtCreateSemaphore = 0x0123,
+    NtOpenSemaphore = 0x0124,
+    NtReleaseSemaphore = 0x0125,
+    NtCreateTimer = 0x0126,
+    NtOpenTimer = 0x0127,
+    NtSetTimer = 0x0128,
+    NtCancelTimer = 0x0129,
 
-    // IPC / LPC
-    NtCreatePort = 0x0040,
-    NtConnectPort = 0x0041,
-    NtListenPort = 0x0042,
-    NtAcceptConnectPort = 0x0043,
-    NtCompleteConnectPort = 0x0044,
-    NtRequestPort = 0x0045,
-    NtRequestWaitReplyPort = 0x0046,
-    NtReplyPort = 0x0047,
-    NtReplyWaitReplyPort = 0x0048,
-    NtReplyWaitReceivePort = 0x0049,
-    NtImpersonateClientOfPort = 0x004A,
+    // IPC / LPC (POLER-OS custom range 0x0130+)
+    NtCreatePort = 0x0130,
+    NtConnectPort = 0x0131,
+    NtListenPort = 0x0132,
+    NtAcceptConnectPort = 0x0133,
+    NtCompleteConnectPort = 0x0134,
+    NtRequestPort = 0x0135,
+    NtRequestWaitReplyPort = 0x0136,
+    NtReplyPort = 0x0137,
+    NtReplyWaitReplyPort = 0x0138,
+    NtReplyWaitReceivePort = 0x0139,
+    NtImpersonateClientOfPort = 0x013A,
 
-    // Token / Security
-    NtCreateToken = 0x0051,
-    NtOpenProcessToken = 0x0033,
-    NtOpenThreadToken = 0x0034,
-    NtDuplicateToken = 0x003B,
-    NtQueryInformationToken = 0x0025,
-    NtSetInformationToken = 0x0026,
-    NtAdjustPrivilegesToken = 0x003C,
-    NtAccessCheck = 0x0027,
+    // Token / Security (POLER-OS custom range 0x0140+)
+    NtCreateToken = 0x0140,
+    NtOpenProcessToken = 0x0141,
+    NtOpenThreadToken = 0x0142,
+    NtDuplicateToken = 0x0143,
+    NtQueryInformationToken = 0x0144,
+    NtSetInformationToken = 0x0145,
+    NtAdjustPrivilegesToken = 0x0146,
+    NtAccessCheck = 0x0147,
 
-    // KnownDLLs / Module management
-    NtLoadDriver = 0x0057,
-    NtUnloadDriver = 0x0058,
-    NtLoadKey = 0x0059,
-    NtUnloadKey = 0x005A,
-    NtSaveKey = 0x005B,
-    NtRestoreKey = 0x005C,
+    // KnownDLLs / Module management (POLER-OS custom range 0x0150+)
+    NtLoadDriver = 0x0150,
+    NtUnloadDriver = 0x0151,
+    NtLoadKey = 0x0152,
+    NtUnloadKey = 0x0153,
+    NtSaveKey = 0x0154,
+    NtRestoreKey = 0x0155,
 
-    // Debug
-    NtDebugActiveProcess = 0x00DF,
-    NtDebugContinue = 0x00E0,
-    NtWaitForDebugEvent = 0x00E1,
+    // Debug (POLER-OS custom range 0x0160+)
+    NtDebugActiveProcess = 0x0160,
+    NtDebugContinue = 0x0161,
+    NtWaitForDebugEvent = 0x0162,
 
-    // Time
-    NtQuerySystemTime = 0x005D,
-    NtSetSystemTime = 0x005E,
-    NtQueryPerformanceCounter = 0x0061,
+    // Time (POLER-OS custom range 0x0170+)
+    NtQuerySystemTime = 0x0170,
+    NtSetSystemTime = 0x0171,
+    NtQueryPerformanceCounter = 0x0172,
 
-    // System information
-    NtQuerySystemInformation = 0x0036,
-    NtSetSystemInformation = 0x0037,
-    NtQuerySystemEnvironmentValue = 0x009F,
-    NtSetSystemEnvironmentValue = 0x00A0,
+    // System information (POLER-OS custom range 0x0180+)
+    NtQuerySystemInformation = 0x0180,
+    NtSetSystemInformation = 0x0181,
+    NtQuerySystemEnvironmentValue = 0x0182,
+    NtSetSystemEnvironmentValue = 0x0183,
 
     _,
 };
@@ -584,7 +584,7 @@ pub const NT_SYSCALL = enum(u16) {
 // ============================================================================
 
 pub fn handleSyscall(nt_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) NTSTATUS {
-    const syscall_tag: NT_SYSCALL = @enumFromInt(@intCast(nt_num));
+    const syscall_tag: NT_SYSCALL = @enumFromInt(@as(u32, @intCast(nt_num)));
 
     switch (syscall_tag) {
         .NtCreateFile => return ntCreateFile(arg1, arg2, arg3, arg4, arg5, arg6),
@@ -623,15 +623,11 @@ fn ntCreateFile(
     desired_access: u64, // ACCESS_MASK
     obj_attrs: u64, // POBJECT_ATTRIBUTES
     io_status: u64, // PIO_STATUS_BLOCK
-    allocation_size: u64, // PLARGE_INTEGER
-    file_attributes: u64, // ULONG
-    share_access: u64, // ULONG
-    _create_disposition: u64, // ULONG
-    _create_options: u64, // ULONG
+    alloc_and_attrs: u64, // (allocation_size << 32) | file_attributes packed
+    share_and_disp: u64, // (share_access << 32) | create_disposition packed
 ) NTSTATUS {
-    _ = allocation_size;
-    _ = file_attributes;
-    _ = share_access;
+    _ = alloc_and_attrs;
+    _ = share_and_disp;
 
     if (objmgr_ref == null) return STATUS_INVALID_HANDLE;
 
@@ -682,15 +678,15 @@ fn ntOpenFile(handle_out: u64, desired_access: u64, obj_attrs: u64, io_status: u
     _ = share_access;
     _ = open_options;
     // NtOpenFile is a simplified NtCreateFile with FILE_OPEN disposition
-    return ntCreateFile(handle_out, desired_access, obj_attrs, io_status, 0, 0, 0, 1, 0);
+    return ntCreateFile(handle_out, desired_access, obj_attrs, io_status, 0, 0);
 }
 
-fn ntReadFile(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_status: u64, buffer: u64, length: u64, byte_offset: u64) NTSTATUS {
+fn ntReadFile(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_status: u64, buffer_and_length: u64) NTSTATUS {
     _ = event;
     _ = apc_routine;
     _ = apc_context;
     _ = io_status;
-    _ = byte_offset;
+    _ = buffer_and_length;
 
     if (objmgr_ref == null) return STATUS_INVALID_HANDLE;
 
@@ -698,39 +694,27 @@ fn ntReadFile(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_st
     const obj = objmgr_ref.?.lookupHandle(handle) orelse return STATUS_INVALID_HANDLE;
     if (obj.obj_type != .File) return STATUS_INVALID_HANDLE;
 
-    // TODO: Read from VFS/file system
-    _ = buffer;
-    _ = length;
-
     hal.Serial.puts("[NT] NtReadFile: handle=");
     hal.Serial.putHex(handle);
-    hal.Serial.puts(" len=");
-    hal.Serial.putDecimal(length);
     hal.Serial.puts("\n");
 
     return STATUS_NOT_IMPLEMENTED;
 }
 
-fn ntWriteFile(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_status: u64, buffer: u64, length: u64, byte_offset: u64) NTSTATUS {
+fn ntWriteFile(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_status: u64, buffer_and_length: u64) NTSTATUS {
     _ = event;
     _ = apc_routine;
     _ = apc_context;
     _ = io_status;
-    _ = byte_offset;
+    _ = buffer_and_length;
 
     if (objmgr_ref == null) return STATUS_INVALID_HANDLE;
 
     const obj = objmgr_ref.?.lookupHandle(handle) orelse return STATUS_INVALID_HANDLE;
     if (obj.obj_type != .File) return STATUS_INVALID_HANDLE;
 
-    // TODO: Write to VFS/file system
-    _ = buffer;
-    _ = length;
-
     hal.Serial.puts("[NT] NtWriteFile: handle=");
     hal.Serial.putHex(handle);
-    hal.Serial.puts(" len=");
-    hal.Serial.putDecimal(length);
     hal.Serial.puts("\n");
 
     return STATUS_NOT_IMPLEMENTED;
@@ -852,7 +836,6 @@ fn ntWaitForSingleObject(handle: u64, alertable: u64, timeout: u64) NTSTATUS {
 }
 
 fn ntCreateEvent(event_handle: u64, desired_access: u64, obj_attrs: u64, initial_state: u64) NTSTATUS {
-    _ = desired_access;
     _ = obj_attrs;
     _ = initial_state;
 
