@@ -148,6 +148,9 @@ pub const MCFGEntry = extern struct {
 
 pub var rsdp: ?*const RSDP = null;
 pub var cpu_count: u32 = 0;
+
+/// Maximum number of CPUs supported by SMP subsystem
+pub const MAX_CPUS: u32 = 256;
 pub var local_apic_addr: u64 = 0;
 pub var io_apic_addr: u64 = 0;
 pub var io_apic_count: u32 = 0;

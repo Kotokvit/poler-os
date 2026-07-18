@@ -1440,7 +1440,7 @@ pub fn allocateTcbForThread(cr3: u64, thread_id: u32) DynLinkError!u64 {
 
     // Map at TCB base address (per-thread offset)
     const tcb_vaddr = TCB_BASE_ADDR - @as(u64, thread_id) * 0x10000; // 64KB per thread
-    const tls_vaddr = tcb_vaddr + tcb_size;
+    _ = tcb_vaddr + tcb_size; // TLS area starts after TCB (used by tlsGetAddr)
 
     var i: u64 = 0;
     while (i < num_pages) : (i += 1) {
@@ -1859,7 +1859,8 @@ fn loadFromVfs(path: []const u8, out_data: *VfsFileData) bool {
 ///
 /// Returns an array of string slices pointing into the ELF data.
 /// The caller must provide the output array.
-pub fn getNeededLibraries(elf_data: []const u8, load_base: u64, out_names: []UnsizedSlice, out_count: *usize) DynLinkError!void {
+pub fn getNeededLibraries(elf_data: []const u8, _load_base: u64, out_names: []UnsizedSlice, out_count: *usize) DynLinkError!void {
+    _ = _load_base;
     out_count.* = 0;
 
     if (elf_data.len < @sizeOf(elf_loader.Elf64_Ehdr)) return;

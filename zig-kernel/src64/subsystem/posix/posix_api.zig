@@ -425,7 +425,7 @@ pub const VfsRoot = struct {
     sys_fs: VfsNode, // /sys → kernel info
 
     pub fn init() VfsRoot {
-        var vfs = VfsRoot{
+        const root_vfs = VfsRoot{
             .root = VfsNode.init("/", .Directory),
             .mnt_c = VfsNode.init("mnt", .Directory),
             .dev = VfsNode.init("dev", .Directory),
@@ -459,7 +459,7 @@ pub const VfsRoot = struct {
         dev_console.parent = &vfs.dev;
         vfs.dev.first_child = &dev_null;
 
-        return vfs;
+        return root_vfs;
     }
 
     /// Resolve a POSIX path to a VFS node
@@ -711,7 +711,7 @@ fn posixOpen(path_addr: u64, flags: i32, _mode: i32) i64 {
 
         if (fd_table.getFd(fd)) |entry| {
             entry.obj_handle = 0; // VFS-managed
-            entry.flags = @intCast(flags & 0xFFFFFFFF);
+            entry.flags = @intCast(@as(u32, @bitCast(flags)) & 0xFFFFFFFF);
             entry.object_data = @intCast(vfs_fd.?); // Store VFS index
         }
 
@@ -738,7 +738,7 @@ fn posixOpen(path_addr: u64, flags: i32, _mode: i32) i64 {
         const handle = om.createHandle(.File, access);
         if (fd_table.getFd(fd)) |entry| {
             entry.obj_handle = handle;
-            entry.flags = @intCast(flags & 0xFFFFFFFF);
+            entry.flags = @intCast(@as(u32, @bitCast(flags)) & 0xFFFFFFFF);
         }
     }
 
@@ -841,7 +841,7 @@ fn posixGetppid() i64 {
 
 fn posixExit(exit_code: i32) i64 {
     hal.Serial.puts("[POSIX] exit(");
-    hal.Serial.putDecimal(exit_code);
+    hal.Serial.putDecimal(@as(u64, @bitCast(@as(i64, exit_code))));
     hal.Serial.puts(")\n");
     // Route through process manager
     _ = ki.processMgrTerminate(1, exit_code);
@@ -889,13 +889,11 @@ fn posixWait4(pid: i32, status: u64, options: i32, rusage: u64) i64 {
     return -@as(i64, subsys.ECHILD); // No children
 }
 
-fn posixKill(pid: i32, sig: i32) i64 {
-    _ = pid;
-    _ = sig;
+fn posixKill(_pid: i32, _sig: i32) i64 {
     hal.Serial.puts("[POSIX] kill(pid=");
-    hal.Serial.putDecimal(pid);
+    hal.Serial.putDecimal(@as(u64, @bitCast(@as(i64, _pid))));
     hal.Serial.puts(", sig=");
-    hal.Serial.putDecimal(sig);
+    hal.Serial.putDecimal(@as(u64, @bitCast(@as(i64, _sig))));
     hal.Serial.puts(")\n");
     return 0;
 }
@@ -1059,9 +1057,8 @@ fn writeUtsnameField(buf: [*]u8, offset: usize, value: []const u8) void {
     buf[offset + copy_len] = 0;
 }
 
-fn posixOpenat(dirfd: i32, path: u64, flags: i32, mode: i32) i64 {
-    _ = dirfd;
-    _ = mode;
+fn posixOpenat(_dirfd: i32, path: u64, flags: i32, mode: i32) i64 {
+    _ = _dirfd;
     // openat is similar to open but with a directory fd
     return posixOpen(path, flags, mode);
 }

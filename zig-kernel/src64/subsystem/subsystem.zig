@@ -293,10 +293,7 @@ fn getCurrentPid() u32 {
 // POLER-OS Native syscalls (0x2000+)
 // ============================================================================
 
-fn handlePolerNative(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) u64 {
-    _ = arg4;
-    _ = arg5;
-    _ = arg6;
+fn handlePolerNative(num: u64, arg1: u64, arg2: u64, _: u64, _: u64, _: u64, _: u64) u64 {
 
     switch (num) {
         0 => {
@@ -308,9 +305,6 @@ fn handlePolerNative(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5:
         },
         1 => {
             // POLER_SYSCALL_GET_SUBSYSTEM — query process subsystem identity
-            _ = arg1;
-            _ = arg2;
-            _ = arg3;
             return @intFromEnum(SubsystemId.Hybrid); // Both available
         },
         2 => {
