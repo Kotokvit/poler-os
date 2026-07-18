@@ -36,6 +36,7 @@ const fat32 = @import("fat32.zig");
 const subsys = @import("subsystem/subsystem.zig");
 const syscall_int = @import("syscall_integration.zig");
 const ki = @import("kernel_integrate.zig");
+const vfs = @import("vfs.zig");
 const cap = @import("capability.zig");
 const policy = @import("policy_engine.zig");
 const ipc = @import("ipc.zig");
@@ -653,6 +654,9 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
             puts("[FAT32] Root directory:\n");
             const fs = fat32.getFs().?;
             _ = fs.listRootDir();
+
+            // v0.9.0: Initialize VFS and mount FAT32 as root filesystem
+            vfs.initAndMountFat32();
         } else {
             puts("[FAT32] No FAT32 filesystem found on virtio-blk\n");
         }
@@ -712,6 +716,11 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
             puts("[INITRD] Total files parsed: ");
             putDecimal(file_count);
             puts("\n");
+
+            // v0.9.0: Mount CPIO initrd as read-only filesystem at /initrd
+            if (file_count > 0) {
+                vfs.mountInitrd(archive_slice);
+            }
         }
     } else {
         puts("[INITRD] No initrd modules loaded by bootloader.\n");
@@ -807,28 +816,32 @@ fn sys_print(str: []const u8) void {
 }
 
 fn task1() noreturn {
-    // v1.2.0: Kernel tasks must NOT use syscalls (SYSCALL/SYSRET assumes Ring 3 → Ring 0
+    // v0.9.0: Kernel tasks must NOT use syscalls (SYSCALL/SYSRET assumes Ring 3 → Ring 0
     // transition). Kernel tasks run in Ring 0, so we call kernel functions directly.
-    // All shell I/O uses hal.Serial.puts() and hal.Serial.readChar().
-    hal.Serial.puts("\n=== POLER-OS v0.8.0 Interactive Shell ===\n");
+    // v0.9.0 fix: Shell now reads from BOTH PS/2 keyboard and serial COM1 via hal.readKey().
+    // Previously only Serial.readChar() was used, which ignored all keyboard input.
+    hal.Serial.puts("\n=== POLER-OS v0.9.0 Interactive Shell ===\n");
     hal.Serial.puts("Type 'help' for commands.\n\n");
     
     var buf: [128]u8 = undefined;
     var len: usize = 0;
     
     hal.Serial.puts("poler> ");
+    if (use_fb) framebuffer.puts("poler> ");
     
     while (true) {
-        const ch = hal.Serial.readChar();
+        const ch = hal.readKey(); // Unified: PS/2 keyboard + Serial COM1
         if (ch != 0) {
             if (ch == '\n' or ch == '\r') {
                 hal.Serial.puts("\n");
+                if (use_fb) framebuffer.puts("\n");
                 if (len > 0) {
                     const cmd = buf[0..len];
                     execute_command(cmd);
                     len = 0;
                 }
                 hal.Serial.puts("poler> ");
+                if (use_fb) framebuffer.puts("poler> ");
             } else if (ch == '\x08' or ch == '\x7F') {
                 if (len > 0) {
                     len -= 1;
@@ -839,6 +852,7 @@ fn task1() noreturn {
                 len += 1;
                 const ech = [1]u8{ch};
                 hal.Serial.puts(&ech);
+                if (use_fb) framebuffer.puts(&ech);
             }
         } else {
             // Yield CPU

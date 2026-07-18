@@ -1058,6 +1058,18 @@ pub fn kbd_pop() u8 {
     return ch;
 }
 
+/// Unified key input — checks PS/2 keyboard buffer first, then serial COM1.
+/// Returns 0 if no input is available from either source.
+/// This is the primary input function for the interactive shell
+/// and any kernel-mode code that needs keyboard input.
+pub fn readKey() u8 {
+    // PS/2 keyboard has priority (direct hardware input)
+    const kbd_ch = kbd_pop();
+    if (kbd_ch != 0) return kbd_ch;
+    // Fall back to serial port (COM1, e.g. QEMU -serial stdio)
+    return Serial.readChar();
+}
+
 fn kbd_init() void {
     // Flush pending data from keyboard controller
     while ((inb(0x64) & 0x01) != 0) {

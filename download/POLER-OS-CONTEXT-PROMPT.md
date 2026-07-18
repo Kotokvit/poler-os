@@ -142,8 +142,9 @@ zig-kernel/
 │   ├── ai_capsule.zig           # ★ AI Capsule Manager (lifecycle, restricted caps, rollback)
 │   ├── ipc.zig                  # ★ Channel-based IPC (Zircon-inspired, handle transfer)
 │   ├── iommu.zig                # ★ Intel VT-d IOMMU driver
-│   ├── kernel_integrate.zig     # ★ VFS↔FAT32, Process Mgr, ACL↔Auth, COW fork
+│   ├── kernel_integrate.zig     # ★ VFS↔FAT32 (legacy), Process Mgr, ACL↔Auth, COW fork
 │   ├── syscall_integration.zig  # ★ Syscall→Intent→Subsystem bridge
+│   ├── vfs.zig                  # ★★ VFS Layer v1.0 — abstract filesystem (VfsOps vtable, mount table, unified path resolution)
 │   │
 │   ├── poler/
 │   │   └── intent.zig           # ★★ Intent Layer — 5-phase semantic security dispatcher (~900 строк)
@@ -189,7 +190,9 @@ zig-kernel/
 | Object Manager (13 types, unified namespace, per-process handles) | `object_manager.zig` | ✅ |
 | Syscall Integration (syscall→Intent→Subsystem bridge) | `syscall_integration.zig` | ✅ |
 | Kernel Integration (VFS↔FAT32, Process Mgr, ACL↔Auth, COW fork) | `kernel_integrate.zig` | ✅ |
+| **VFS Layer v1.0** (VfsOps vtable, mount table, unified path, FAT32+CPIO drivers) | `vfs.zig` | ✅ **NEW** |
 | Interactive Shell (ls, cat, mkdir, touch, write, rm, disk, caps, run) | `main64.zig` | ✅ |
+| **Unified Input** (PS/2 keyboard + Serial COM1 via `hal.readKey()`) | `hal.zig` | ✅ **FIXED** |
 
 ---
 
@@ -197,11 +200,11 @@ zig-kernel/
 
 ### 5.1. Критические (блокируют нормальную работу)
 
-| # | Проблема | Причина | Решение |
-|---|----------|---------|---------|
-| 1 | **Клавиатура не вводит текст в shell** | KBD scan codes генерируются, но не доходят до shell input buffer | Нужно связать PS/2 keyboard handler с shell readline buffer |
-| 2 | **Нет virtio-blk при загрузке с -cdrom** | QEMU запущен с `-cdrom` вместо `-drive` | Использовать `run64-blk` target или `-drive file=disk.img,format=raw,if=virtio` |
-| 3 | **VFS не реализован** | FAT32 используется напрямую, без VFS абстракции | Нужен VFS layer (Priority 2 в roadmap) |
+| # | Проблема | Статус | Решение |
+|---|----------|--------|---------|
+| 1 | **Клавиатура не вводит текст в shell** | ✅ **ИСПРАВЛЕНО** | Добавлена `hal.readKey()` — единая функция ввода (kbd_pop + Serial.readChar). Shell теперь использует `readKey()` |
+| 2 | **Нет virtio-blk при загрузке с -cdrom** | ✅ **ИСПРАВЛЕНО** | `run64-iso` теперь всегда включает `-drive file=disk.img,if=virtio,format=raw` |
+| 3 | **VFS не реализован** | ✅ **ИСПРАВЛЕНО** | Создан `vfs.zig` с VfsOps vtable, mount table, FAT32+CPIO драйверами |
 
 ### 5.2. Частичные реализации
 
@@ -222,6 +225,9 @@ zig-kernel/
 | 3 | Hardcoded paths в build скриптах | `build-iso-local.sh`: динамические пути, GRUB auto-detection |
 | 4 | `@fence(.Release)` → `.release` | Zig 0.13.0 использует lowercase enum values |
 | 5 | `cli()` return type | Разделён на `cli()` (void) + `cliSave()` (bool) для обратной совместимости |
+| 6 | **Keyboard input disconnect** | Добавлена `hal.readKey()` (kbd_pop + Serial.readChar). Shell использует `readKey()` вместо `Serial.readChar()` |
+| 7 | **virtio-blk missing in run64-iso** | `build.zig`: `run64-iso` теперь включает `-drive file=disk.img,if=virtio,format=raw` |
+| 8 | **No VFS abstraction** | Создан `vfs.zig` с VfsOps vtable, mount table, FAT32+CPIO драйверами |
 
 ---
 
@@ -320,6 +326,49 @@ zig-kernel/
 - 4-level IOMMU page tables для production
 - CNode/handle table полная интеграция
 - Per-handle audit logging для чувствительных операций
+
+---
+
+## 8.1. VFS АРХИТЕКТУРА (v0.9.0, НОВЫЙ МОДУЛЬ)
+
+### Структура VFS (vfs.zig, ~1050 строк)
+
+```
+POSIX syscalls ──┐
+                  ├──→ VFS Core ──→ Mount Table ──┬──→ Fat32VfsOps ──→ Fat32Fs ──→ virtio_blk
+NT syscalls ────┘     │                          ├──→ CpioVfsOps  ──→ Ramdisk (memory)
+                      ├──→ Path Resolution (unified /posix + \??\C:\nt)
+                      ├──→ File Handle Table (filesystem-agnostic)
+                      └──→ VfsInode abstraction
+```
+
+### Ключевые компоненты
+
+| Компонент | Описание |
+|-----------|----------|
+| `VfsOps` | Vtable (13 функций): open/read/write/close/seek/stat/chmod/mkdir/rmdir/unlink/rename/listDir/sync |
+| `VfsFileHandle` | Файловый дескриптор (opaque: ops + fs_instance + fs_private) |
+| `VfsInode` | Файловая метаинформация (ino, file_type, size, mode, timestamps) |
+| `VfsMount` | Запись в mount table (path prefix → fs_ops + fs_instance) |
+| `VfsStat` | POSIX-совместимый stat (st_dev, st_ino, st_mode, st_size, timestamps) |
+| `Fat32VfsOps` | Драйвер FAT32: обёртка над fat32.zig |
+| `CpioVfsOps` | Драйвер CPIO: read-only ramdisk из initrd |
+| `resolvePath()` | Унифицированное разрешение путей (/posix и \??\C:\nt) |
+
+### Mount table (пример после загрузки)
+
+```
+/          → Fat32VfsOps (virtio-blk, read/write)
+/initrd    → CpioVfsOps  (memory, read-only)
+```
+
+### Что ещё нужно для VFS
+
+- Wire POSIX/NT subsystems через `vfs.open()` вместо прямых `ki.vfsOpen()` → `fat32.getFs()`
+- Wire NT subsystem: `NtReadFile`/`NtWriteFile` через VFS
+- Per-process mount namespace (для контейнеров/shim-изоляции)
+- ProcFS драйвер (виртуальная ФС для /proc/pid, /proc/cpuinfo)
+- Inode cache / dcache (кэш разрешения путей)
 
 ---
 

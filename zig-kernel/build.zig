@@ -127,10 +127,11 @@ pub fn build(b: *std.Build) void {
         "-serial", "stdio",
         "-vga", "std",
         "-no-reboot",
+        "-drive", "file=disk.img,if=virtio,format=raw",
     });
     run64_iso_cmd.step.dependOn(b.getInstallStep());
 
-    const run64_iso_step = b.step("run64-iso", "Run POLER-OS from ISO in QEMU");
+    const run64_iso_step = b.step("run64-iso", "Run POLER-OS from ISO in QEMU (with virtio-blk)");
     run64_iso_step.dependOn(&run64_iso_cmd.step);
 
     // ═══ Run from ISO with virtio-blk disk ══════════════════════════════
