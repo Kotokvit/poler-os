@@ -148,6 +148,45 @@ pub fn build(b: *std.Build) void {
     const run64_iso_blk_step = b.step("run64-iso-blk", "Run POLER-OS from ISO in QEMU with virtio-blk");
     run64_iso_blk_step.dependOn(&run64_iso_blk_cmd.step);
 
+    // ═══ Run with VT-d / IOMMU (q35 machine + intel-iommu) ═══════════════
+    // Tests Intel VT-d IOMMU functionality for DMA protection.
+    // QEMU: -machine q35 enables the Q35 chipset which supports VT-d.
+    // -device intel-iommu,intremap=on creates a virtual IOMMU.
+    // Requires: disk.img for virtio-blk DMA testing.
+    const run64_vtd_cmd = b.addSystemCommand(&.{
+        "/home/z/my-project/qemu-portable/qemu-portable.sh",
+        "-machine", "q35",
+        "-device", "intel-iommu,intremap=on",
+        "-cdrom", "poler-os64.iso",
+        "-m", "256M",
+        "-serial", "stdio",
+        "-vga", "std",
+        "-no-reboot",
+        "-boot", "d",
+        "-drive", "file=disk.img,if=virtio,format=raw",
+    });
+    run64_vtd_cmd.step.dependOn(b.getInstallStep());
+
+    const run64_vtd_step = b.step("run64-vtd", "Run POLER-OS with Intel VT-d IOMMU (q35 machine, DMA protection)");
+    run64_vtd_step.dependOn(&run64_vtd_cmd.step);
+
+    // ═══ Run with VT-d headless ══════════════════════════════════════════
+    const run64_vtd_headless_cmd = b.addSystemCommand(&.{
+        "/home/z/my-project/qemu-portable/qemu-portable.sh",
+        "-machine", "q35",
+        "-device", "intel-iommu,intremap=on",
+        "-cdrom", "poler-os64.iso",
+        "-m", "256M",
+        "-nographic",
+        "-no-reboot",
+        "-boot", "d",
+        "-drive", "file=disk.img,if=virtio,format=raw",
+    });
+    run64_vtd_headless_cmd.step.dependOn(b.getInstallStep());
+
+    const run64_vtd_headless_step = b.step("run64-vtd-headless", "Run POLER-OS with VT-d IOMMU headless (serial console)");
+    run64_vtd_headless_step.dependOn(&run64_vtd_headless_cmd.step);
+
     // ═══ POLER Core Tests (native x86_64 linux) ════════════════════════════
     const test_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,

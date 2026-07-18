@@ -690,13 +690,20 @@ fn ntReadFile(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_st
 
     if (objmgr_ref == null) return STATUS_INVALID_HANDLE;
 
-    // Look up the handle in the Object Manager
-    const obj = objmgr_ref.?.lookupHandle(handle) orelse return STATUS_INVALID_HANDLE;
-    if (obj.obj_type != .File) return STATUS_INVALID_HANDLE;
+    // ═══ SYSCALL MEDIATION: verify file read access_mask ═══
+    const med = objmgr_ref.?.mediateFileRead(handle);
+    if (med != .Allowed) {
+        hal.Serial.puts("[MEDIATE] NtReadFile DENIED: handle=0x");
+        hal.Serial.putHex(handle);
+        hal.Serial.puts(" reason=");
+        hal.Serial.putDecimal(@intCast(@intFromEnum(med)));
+        hal.Serial.puts("\n");
+        return objmgr.ObjectManager.mediationToNtstatus(med);
+    }
 
     hal.Serial.puts("[NT] NtReadFile: handle=");
     hal.Serial.putHex(handle);
-    hal.Serial.puts("\n");
+    hal.Serial.puts(" (access_mask OK)\n");
 
     return STATUS_NOT_IMPLEMENTED;
 }
@@ -710,12 +717,20 @@ fn ntWriteFile(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_s
 
     if (objmgr_ref == null) return STATUS_INVALID_HANDLE;
 
-    const obj = objmgr_ref.?.lookupHandle(handle) orelse return STATUS_INVALID_HANDLE;
-    if (obj.obj_type != .File) return STATUS_INVALID_HANDLE;
+    // ═══ SYSCALL MEDIATION: verify file write access_mask ═══
+    const med = objmgr_ref.?.mediateFileWrite(handle);
+    if (med != .Allowed) {
+        hal.Serial.puts("[MEDIATE] NtWriteFile DENIED: handle=0x");
+        hal.Serial.putHex(handle);
+        hal.Serial.puts(" reason=");
+        hal.Serial.putDecimal(@intCast(@intFromEnum(med)));
+        hal.Serial.puts("\n");
+        return objmgr.ObjectManager.mediationToNtstatus(med);
+    }
 
     hal.Serial.puts("[NT] NtWriteFile: handle=");
     hal.Serial.putHex(handle);
-    hal.Serial.puts("\n");
+    hal.Serial.puts(" (access_mask OK)\n");
 
     return STATUS_NOT_IMPLEMENTED;
 }
@@ -756,25 +771,46 @@ fn ntTerminateProcess(handle: u64, exit_status: u64) NTSTATUS {
     _ = exit_status;
 
     if (handle == INVALID_HANDLE_VALUE) {
-        // Terminate current process
+        // Terminate current process — always allowed
         hal.Serial.puts("[NT] NtTerminateProcess: current process\n");
         // TODO: Kill current process via scheduler
         return STATUS_SUCCESS;
     }
 
+    // ═══ SYSCALL MEDIATION: verify process terminate access ═══
+    if (objmgr_ref != null) {
+        const med = objmgr_ref.?.mediateProcessTerminate(handle);
+        if (med != .Allowed) {
+            hal.Serial.puts("[MEDIATE] NtTerminateProcess DENIED: handle=0x");
+            hal.Serial.putHex(handle);
+            hal.Serial.puts("\n");
+            return objmgr.ObjectManager.mediationToNtstatus(med);
+        }
+    }
+
     hal.Serial.puts("[NT] NtTerminateProcess: handle=");
     hal.Serial.putHex(handle);
-    hal.Serial.puts("\n");
+    hal.Serial.puts(" (access OK)\n");
     return STATUS_NOT_IMPLEMENTED;
 }
 
 fn ntAllocateVirtualMemory(process_handle: u64, base_addr: u64, zero_bits: u64, region_size: u64) NTSTATUS {
-    _ = process_handle;
     _ = base_addr;
     _ = zero_bits;
     _ = region_size;
 
-    hal.Serial.puts("[NT] NtAllocateVirtualMemory\n");
+    // ═══ SYSCALL MEDIATION: verify process VM write access ═══
+    if (objmgr_ref != null) {
+        const med = objmgr_ref.?.mediateProcessVmWrite(process_handle);
+        if (med != .Allowed) {
+            hal.Serial.puts("[MEDIATE] NtAllocateVirtualMemory DENIED: handle=0x");
+            hal.Serial.putHex(process_handle);
+            hal.Serial.puts("\n");
+            return objmgr.ObjectManager.mediationToNtstatus(med);
+        }
+    }
+
+    hal.Serial.puts("[NT] NtAllocateVirtualMemory (access OK)\n");
     return STATUS_NOT_IMPLEMENTED;
 }
 
@@ -859,8 +895,17 @@ fn ntSetEvent(handle: u64, previous_state: u64) NTSTATUS {
 
     if (objmgr_ref == null) return STATUS_INVALID_HANDLE;
 
+    // ═══ SYSCALL MEDIATION: verify event write access ═══
     const obj = objmgr_ref.?.lookupHandle(handle) orelse return STATUS_INVALID_HANDLE;
     if (obj.obj_type != .Event) return STATUS_INVALID_HANDLE;
+    // Event signaling requires at least ACCESS_WRITE or GENERIC_WRITE
+    const required = objmgr.ACCESS_WRITE | objmgr.GENERIC_WRITE | objmgr.GENERIC_ALL | objmgr.ACCESS_FULL;
+    if ((obj.access_mask & required) == 0) {
+        hal.Serial.puts("[MEDIATE] NtSetEvent DENIED: handle=0x");
+        hal.Serial.putHex(handle);
+        hal.Serial.puts(" no write access\n");
+        return STATUS_ACCESS_DENIED;
+    }
 
     // TODO: Signal the event, wake waiters
     return STATUS_SUCCESS;

@@ -36,6 +36,23 @@ pub const ACCESS_WRITE_ATTRIBUTES: u32 = 0x00000100;
 pub const ACCESS_FULL: u32 = 0xFFFFFFFF;
 pub const ACCESS_NONE: u32 = 0x00000000;
 
+// NT-compatible GENERIC access rights (used in handle creation + mediation)
+pub const GENERIC_READ: u32 = 0x80000000;
+pub const GENERIC_WRITE: u32 = 0x40000000;
+pub const GENERIC_EXECUTE: u32 = 0x20000000;
+pub const GENERIC_ALL: u32 = 0x10000000;
+pub const SYNCHRONIZE: u32 = 0x00100000;
+
+// Specific access rights for mediation
+pub const FILE_READ_DATA: u32 = 0x00000001;       // Read data from file
+pub const FILE_WRITE_DATA: u32 = 0x00000002;      // Write data to file
+pub const FILE_APPEND_DATA: u32 = 0x00000004;     // Append data
+pub const FILE_EXECUTE: u32 = 0x00000020;         // Execute file
+pub const PROCESS_TERMINATE: u32 = 0x00000001;    // Terminate process
+pub const PROCESS_VM_READ: u32 = 0x00000010;      // Read process memory
+pub const PROCESS_VM_WRITE: u32 = 0x00000020;     // Write process memory
+pub const PROCESS_VM_OPERATION: u32 = 0x00000008; // Virtual memory ops
+
 // ============================================================================
 // Object Types
 // ============================================================================
@@ -185,6 +202,185 @@ pub const ObjectManager = struct {
         if (!entry.in_use) return false;
         if (entry.cap_revoked) return false;
         return (entry.access_mask & required_access) == required_access;
+    }
+
+    /// ═══════════════════════════════════════════════════════════════════
+    /// Syscall Mediation — access_mask verification layer
+    ///
+    /// These methods are the MANDATORY mediation points between
+    /// syscall handlers and object operations. Every syscall that
+    /// operates on a handle MUST call the appropriate mediateXxx()
+    /// before performing the operation.
+    ///
+    /// Mediation flow:
+    ///   1. Validate handle exists and is not revoked
+    ///   2. Check access_mask covers the requested operation
+    ///   3. Check object type matches expected type
+    ///   4. Log denied accesses to audit trail
+    ///   5. Return the HandleEntry pointer on success, null on denial
+    ///
+    /// This eliminates the ambient authority problem where any process
+    /// with a valid handle could perform ANY operation on it.
+    /// ═══════════════════════════════════════════════════════════════════
+
+    /// Mediation result — carries either the validated entry or a denial reason
+    pub const MediationResult = enum(u8) {
+        Allowed = 0,
+        DeniedInvalidHandle = 1,
+        DeniedRevoked = 2,
+        DeniedAccessMask = 3,
+        DeniedWrongType = 4,
+    };
+
+    /// Mediate file read access — must have FILE_READ_DATA or GENERIC_READ
+    pub fn mediateFileRead(self: *Self, handle: u64) MediationResult {
+        const idx: usize = @intCast(handle);
+        if (idx >= MAX_HANDLES) return .DeniedInvalidHandle;
+        const entry = &self.handles[idx];
+        if (!entry.in_use) return .DeniedInvalidHandle;
+        if (entry.cap_revoked) return .DeniedRevoked;
+        if (entry.obj_type != .File and entry.obj_type != .Device and entry.obj_type != .Directory) return .DeniedWrongType;
+        const required = FILE_READ_DATA | GENERIC_READ | ACCESS_READ;
+        if ((entry.access_mask & required) == 0) return .DeniedAccessMask;
+        return .Allowed;
+    }
+
+    /// Mediate file write access — must have FILE_WRITE_DATA or GENERIC_WRITE
+    pub fn mediateFileWrite(self: *Self, handle: u64) MediationResult {
+        const idx: usize = @intCast(handle);
+        if (idx >= MAX_HANDLES) return .DeniedInvalidHandle;
+        const entry = &self.handles[idx];
+        if (!entry.in_use) return .DeniedInvalidHandle;
+        if (entry.cap_revoked) return .DeniedRevoked;
+        if (entry.obj_type != .File and entry.obj_type != .Device and entry.obj_type != .Directory) return .DeniedWrongType;
+        const required = FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | ACCESS_WRITE;
+        if ((entry.access_mask & required) == 0) return .DeniedAccessMask;
+        return .Allowed;
+    }
+
+    /// Mediate file execute — must have FILE_EXECUTE or GENERIC_EXECUTE
+    pub fn mediateFileExecute(self: *Self, handle: u64) MediationResult {
+        const idx: usize = @intCast(handle);
+        if (idx >= MAX_HANDLES) return .DeniedInvalidHandle;
+        const entry = &self.handles[idx];
+        if (!entry.in_use) return .DeniedInvalidHandle;
+        if (entry.cap_revoked) return .DeniedRevoked;
+        if (entry.obj_type != .File) return .DeniedWrongType;
+        const required = FILE_EXECUTE | GENERIC_EXECUTE | ACCESS_EXECUTE;
+        if ((entry.access_mask & required) == 0) return .DeniedAccessMask;
+        return .Allowed;
+    }
+
+    /// Mediate process terminate — must have PROCESS_TERMINATE
+    pub fn mediateProcessTerminate(self: *Self, handle: u64) MediationResult {
+        const idx: usize = @intCast(handle);
+        if (idx >= MAX_HANDLES) return .DeniedInvalidHandle;
+        const entry = &self.handles[idx];
+        if (!entry.in_use) return .DeniedInvalidHandle;
+        if (entry.cap_revoked) return .DeniedRevoked;
+        if (entry.obj_type != .Process) return .DeniedWrongType;
+        const required = PROCESS_TERMINATE | GENERIC_ALL;
+        if ((entry.access_mask & required) == 0) return .DeniedAccessMask;
+        return .Allowed;
+    }
+
+    /// Mediate process VM read — must have PROCESS_VM_READ
+    pub fn mediateProcessVmRead(self: *Self, handle: u64) MediationResult {
+        const idx: usize = @intCast(handle);
+        if (idx >= MAX_HANDLES) return .DeniedInvalidHandle;
+        const entry = &self.handles[idx];
+        if (!entry.in_use) return .DeniedInvalidHandle;
+        if (entry.cap_revoked) return .DeniedRevoked;
+        if (entry.obj_type != .Process) return .DeniedWrongType;
+        const required = PROCESS_VM_READ | GENERIC_READ | GENERIC_ALL;
+        if ((entry.access_mask & required) == 0) return .DeniedAccessMask;
+        return .Allowed;
+    }
+
+    /// Mediate process VM write — must have PROCESS_VM_WRITE
+    pub fn mediateProcessVmWrite(self: *Self, handle: u64) MediationResult {
+        const idx: usize = @intCast(handle);
+        if (idx >= MAX_HANDLES) return .DeniedInvalidHandle;
+        const entry = &self.handles[idx];
+        if (!entry.in_use) return .DeniedInvalidHandle;
+        if (entry.cap_revoked) return .DeniedRevoked;
+        if (entry.obj_type != .Process) return .DeniedWrongType;
+        const required = PROCESS_VM_WRITE | PROCESS_VM_OPERATION | GENERIC_WRITE | GENERIC_ALL;
+        if ((entry.access_mask & required) == 0) return .DeniedAccessMask;
+        return .Allowed;
+    }
+
+    /// Mediate device I/O — must have ACCESS_WRITE (device control) or GENERIC_ALL
+    pub fn mediateDeviceIo(self: *Self, handle: u64) MediationResult {
+        const idx: usize = @intCast(handle);
+        if (idx >= MAX_HANDLES) return .DeniedInvalidHandle;
+        const entry = &self.handles[idx];
+        if (!entry.in_use) return .DeniedInvalidHandle;
+        if (entry.cap_revoked) return .DeniedRevoked;
+        if (entry.obj_type != .Device and entry.obj_type != .File) return .DeniedWrongType;
+        const required = ACCESS_WRITE | GENERIC_WRITE | GENERIC_ALL;
+        if ((entry.access_mask & required) == 0) return .DeniedAccessMask;
+        return .Allowed;
+    }
+
+    /// Mediate delete access — must have ACCESS_DELETE
+    pub fn mediateDelete(self: *Self, handle: u64) MediationResult {
+        const idx: usize = @intCast(handle);
+        if (idx >= MAX_HANDLES) return .DeniedInvalidHandle;
+        const entry = &self.handles[idx];
+        if (!entry.in_use) return .DeniedInvalidHandle;
+        if (entry.cap_revoked) return .DeniedRevoked;
+        const required = ACCESS_DELETE | GENERIC_ALL;
+        if ((entry.access_mask & required) == 0) return .DeniedAccessMask;
+        return .Allowed;
+    }
+
+    /// Mediate registry key access — must have appropriate read/write
+    pub fn mediateRegistryAccess(self: *Self, handle: u64, write: bool) MediationResult {
+        const idx: usize = @intCast(handle);
+        if (idx >= MAX_HANDLES) return .DeniedInvalidHandle;
+        const entry = &self.handles[idx];
+        if (!entry.in_use) return .DeniedInvalidHandle;
+        if (entry.cap_revoked) return .DeniedRevoked;
+        if (entry.obj_type != .Key) return .DeniedWrongType;
+        if (write) {
+            const required = ACCESS_WRITE | GENERIC_WRITE | GENERIC_ALL;
+            if ((entry.access_mask & required) == 0) return .DeniedAccessMask;
+        } else {
+            const required = ACCESS_READ | GENERIC_READ | GENERIC_ALL;
+            if ((entry.access_mask & required) == 0) return .DeniedAccessMask;
+        }
+        return .Allowed;
+    }
+
+    /// Convert MediationResult to NTSTATUS (for NT syscall returns)
+    pub fn mediationToNtstatus(result: MediationResult) u32 {
+        // Import from subsystem.zig — we use raw values to avoid circular dep
+        const STATUS_SUCCESS: u32 = 0x00000000;
+        const STATUS_INVALID_HANDLE: u32 = 0xC0000008;
+        const STATUS_ACCESS_DENIED: u32 = 0xC0000022;
+        const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC0000024;
+        return switch (result) {
+            .Allowed => STATUS_SUCCESS,
+            .DeniedInvalidHandle => STATUS_INVALID_HANDLE,
+            .DeniedRevoked => STATUS_ACCESS_DENIED,
+            .DeniedAccessMask => STATUS_ACCESS_DENIED,
+            .DeniedWrongType => STATUS_OBJECT_TYPE_MISMATCH,
+        };
+    }
+
+    /// Convert MediationResult to POSIX errno (for POSIX syscall returns)
+    pub fn mediationToErrno(result: MediationResult) i32 {
+        const EBADF: i32 = 9;
+        const EACCES: i32 = 13;
+        const EINVAL: i32 = 22;
+        return switch (result) {
+            .Allowed => 0,
+            .DeniedInvalidHandle => EBADF,
+            .DeniedRevoked => EACCES,
+            .DeniedAccessMask => EACCES,
+            .DeniedWrongType => EINVAL,
+        };
     }
 
     /// Soft-revoke a handle: marks it revoked and bumps the generation counter

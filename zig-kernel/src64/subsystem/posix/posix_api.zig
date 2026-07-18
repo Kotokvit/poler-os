@@ -649,6 +649,21 @@ fn posixRead(fd: i32, buf_addr: u64, count: u64) i64 {
     const entry = fd_table.getFd(fd) orelse return -@as(i64, subsys.EBADF);
     if (entry.flags & 3 == O_WRONLY) return -@as(i64, subsys.EBADF); // Not open for reading
 
+    // ═══ SYSCALL MEDIATION: verify access_mask before reading ═══
+    if (objmgr_ref) |om| {
+        if (entry.obj_handle != 0) {
+            const med = om.mediateFileRead(entry.obj_handle);
+            if (med != .Allowed) {
+                hal.Serial.puts("[MEDIATE] read() DENIED: fd=");
+                hal.Serial.putDecimal(@intCast(fd));
+                hal.Serial.puts(" reason=");
+                hal.Serial.putDecimal(@intCast(@intFromEnum(med)));
+                hal.Serial.puts("\n");
+                return -@as(i64, objmgr.ObjectManager.mediationToErrno(med));
+            }
+        }
+    }
+
     // Route through VFS if the handle has a VFS file descriptor
     if (entry.object_data != 0) {
         const vfs_fd: usize = @intCast(entry.object_data);
@@ -673,7 +688,7 @@ fn posixRead(fd: i32, buf_addr: u64, count: u64) i64 {
 
 fn posixWrite(fd: i32, buf_addr: u64, count: u64) i64 {
     if (fd == 1 or fd == 2) {
-        // stdout/stderr → serial output
+        // stdout/stderr → serial output (always allowed for console)
         const ptr: [*]const u8 = @ptrFromInt(buf_addr);
         hal.Serial.puts(ptr[0..@intCast(count)]);
         return @intCast(count);
@@ -681,6 +696,21 @@ fn posixWrite(fd: i32, buf_addr: u64, count: u64) i64 {
 
     const entry = fd_table.getFd(fd) orelse return -@as(i64, subsys.EBADF);
     if (entry.flags & 3 == O_RDONLY) return -@as(i64, subsys.EBADF); // Not open for writing
+
+    // ═══ SYSCALL MEDIATION: verify access_mask before writing ═══
+    if (objmgr_ref) |om| {
+        if (entry.obj_handle != 0) {
+            const med = om.mediateFileWrite(entry.obj_handle);
+            if (med != .Allowed) {
+                hal.Serial.puts("[MEDIATE] write() DENIED: fd=");
+                hal.Serial.putDecimal(@intCast(fd));
+                hal.Serial.puts(" reason=");
+                hal.Serial.putDecimal(@intCast(@intFromEnum(med)));
+                hal.Serial.puts("\n");
+                return -@as(i64, objmgr.ObjectManager.mediationToErrno(med));
+            }
+        }
+    }
 
     // Route through VFS if the handle has a VFS file descriptor
     if (entry.object_data != 0) {
@@ -828,6 +858,18 @@ fn posixIoctl(fd: i32, request: i64, arg: u64) i64 {
     _ = request;
     _ = arg;
     if (fd < 0 or fd >= MAX_FDS) return -@as(i64, subsys.EBADF);
+
+    // ═══ SYSCALL MEDIATION: verify device I/O access for ioctl ═══
+    const entry = fd_table.getFd(fd) orelse return -@as(i64, subsys.EBADF);
+    if (objmgr_ref) |om| {
+        if (entry.obj_handle != 0) {
+            const med = om.mediateDeviceIo(entry.obj_handle);
+            if (med != .Allowed) {
+                return -@as(i64, objmgr.ObjectManager.mediationToErrno(med));
+            }
+        }
+    }
+
     return -@as(i64, subsys.ENOTTY);
 }
 
