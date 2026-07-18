@@ -1,0 +1,506 @@
+
+================================================================================
+  POLER-OS v0.8.0 — 12-Section Architecture & Security Audit
+  Date: 2026-07-18 16:22 UTC
+  Auditor: Super Z (automated)
+  Codebase: ~20K LOC, Zig 0.13.0, x86_64 freestanding kernel
+================================================================================
+
+SECURITY SCORE: 4.2 / 10  (pre-fix)
+TARGET SCORE:   7.0 / 10  (post P0-fix)
+
+================================================================================
+  §1  BOOT & PRIVILEGE LEVELS
+================================================================================
+
+  FINDING 1.1 [P0 — CRITICAL]: Shell runs in Ring 0
+  ─────────────────────────────────────────────────
+  FILE: scheduler.zig:136-196 (createTask)
+  FILE: main64.zig (shell task creation)
+
+  The shell task is created via createTask() which sets CS=0x08, SS=0x10
+  (Ring 0 kernel mode). This means any shell command runs with full kernel
+  privileges — a single bug in the shell compromises the entire system.
+
+  createUserTask() exists (lines 217-291) and correctly sets CS=0x1B, SS=0x23
+  (Ring 3), but the shell is NOT using it.
+
+  FIX: Change shell task creation from createTask() to createUserTask()
+       with a dedicated user CR3 and user stack.
+
+  SEVERITY: P0 — any shell input can corrupt kernel memory, page tables,
+  device registers, or the scheduler itself. This is a fundamental
+  violation of the ring protection model.
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 1.2 [P2]: No SMEP/SMAP enforcement
+  FILE: hal.zig (no CR4 bit setting for SMEP/SMAP)
+
+  The kernel does not set CR4.SMEP (bit 20) or CR4.SMAP (bit 21).
+  Without SMEP, Ring 0 can accidentally execute user-space code.
+  Without SMAP, Ring 0 can accidentally access user-space data.
+
+  FIX: Set CR4.SMEP | CR4.SMAP during HAL init.
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 1.3 [P1]: Kernel stack not guarded
+  FILE: scheduler.zig:47
+
+  Each task has kernel_stack[8192] with no guard page. Stack overflow
+  silently corrupts adjacent memory. Add a canary or guard page below
+  each kernel stack.
+
+================================================================================
+  §2  SYSCALL INTERFACE & DISPATCH
+================================================================================
+
+  FINDING 2.1 [P1]: Syscall handler re-enables interrupts immediately
+  FILE: syscall_integration.zig:61
+
+  hal.sti() is called at the very start of zig_syscall_handler(). This
+  means a syscall can be preempted mid-execution, potentially causing
+  race conditions if the same process's data structures are modified
+  by a timer interrupt handler that triggers a context switch.
+
+  FIX: Only re-enable interrupts after the ACL check and before the
+  actual subsystem dispatch (after line 286).
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 2.2 [P2]: No syscall number validation for upper bound
+  FILE: subsystem.zig:256-301
+
+  The dispatch() function checks ranges but allows any value within
+  the 0x0000-0x0FFF (POSIX), 0x1000-0x1FFF (NT), 0x2000-0x2FFF
+  ranges. Individual syscall numbers within these ranges are not
+  validated — calling an unimplemented syscall number returns ENOSYS
+  or STATUS_NOT_IMPLEMENTED, which is correct but should be logged.
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 2.3 [P3]: Legacy syscall compatibility adds attack surface
+  FILE: syscall_integration.zig:66-126
+
+  The LEGACY_PRINT syscall (1) copies a user pointer directly without
+  validation: const ptr: [*]const u8 = @ptrFromInt(arg1). A Ring 3
+  process could pass a kernel address and read arbitrary kernel memory.
+
+  FIX: Validate that arg1 points to user-space (below KERNEL_BASE = 0xFFFF800000000000).
+
+================================================================================
+  §3  CAPABILITY MODEL & ACL ENFORCEMENT
+================================================================================
+
+  FINDING 3.1 [P0 — CRITICAL]: POLER token MAC is NOT verified
+  FILE: kernel_integrate.zig:1042-1054
+
+  The polerAuthenticate() function checks if the token is all-zeros
+  (lines 1043-1048). If ANY byte is non-zero, token_valid = true.
+  This is NOT a MAC verification — it's just a null check!
+
+  An attacker can set poler_token to any non-zero garbage and pass
+  authentication. The "MAC computation" on lines 1059-1074 computes
+  a mix value but NEVER compares it against anything — it's dead code.
+
+  FIX: Implement real MAC verification using POLER Core's PND-Feistel:
+       1. On process creation, compute MAC = poler_prf(secret_key | pid | caps)
+       2. Store MAC in poler_token[0..15], keep token[16..31] as nonce
+       3. On authenticate, recompute MAC and compare with stored value
+       4. The kernel secret_key is generated once at boot from RDRAND
+
+  SEVERITY: P0 — any process can forge a token and bypass ACL.
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 3.2 [P1]: Capability inheritance during fork is too permissive
+  FILE: kernel_integrate.zig:477
+
+  child.acl_capabilities = parent.acl_capabilities copies ALL capabilities
+  from parent to child without reduction. This violates the principle of
+  least privilege — a child should start with a subset of parent's caps
+  and request additional ones through explicit delegation.
+
+  FIX: Apply deriveCapability() from capability.zig to reduce child caps:
+       child.acl_capabilities = cap.deriveWithMask(parent.acl_capabilities, DEFAULT_CAPABILITIES);
+       This ensures the child starts with at most DEFAULT_CAPABILITIES,
+       even if the parent has more.
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 3.3 [P1]: processMgrSetCaps allows same-level capability setting
+  FILE: kernel_integrate.zig:1110
+
+  The check (new_caps & ~caller.acl_capabilities) != 0 prevents
+  escalation beyond the caller's caps, but a process with CAP_ADMIN
+  can set ANY capabilities on ANY process (as long as it doesn't
+  exceed its own). There's no restriction on what CAP_ADMIN can do.
+
+  FIX: Add a capability delegation chain — when setting caps on another
+  process, the caller's caps are recorded as the "granter" and the
+  target cannot exceed the granter's caps at the time of granting.
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 3.4 [P2]: Audit log is too small and not persistent
+  FILE: kernel_integrate.zig:916-930
+
+  ACL_AUDIT_LOG_SIZE = 256 entries. On a busy system, this wraps in
+  milliseconds. There's no mechanism to flush the log to disk (FAT32).
+  After a crash, all audit data is lost.
+
+================================================================================
+  §4  OBJECT MANAGER & HANDLE TABLE
+================================================================================
+
+  FINDING 4.1 [P0 — CRITICAL]: access_mask is NEVER verified at syscall time
+  FILE: object_manager.zig
+
+  HandleEntry has access_mask: u32 but it is set during createHandle()
+  and NEVER checked by any syscall handler. NT NtWriteFile() does not
+  check if the handle has ACCESS_WRITE. POSIX write() does not check
+  if the fd has write permission.
+
+  The checkHandleAccess() function EXISTS (lines 182-188) but is
+  NEVER CALLED from any syscall path.
+
+  FIX: Add access_mask checks to every syscall that uses a handle:
+       - NtWriteFile → check ACCESS_WRITE on the handle
+       - NtReadFile → check ACCESS_READ on the handle
+       - POSIX write() → check ACCESS_WRITE
+       - POSIX read() → check ACCESS_READ
+       - All handle-based operations must verify access_mask
+
+  SEVERITY: P0 — a process with a read-only handle can write to it.
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 4.2 [P1]: Default access mask is ACCESS_FULL
+  FILE: object_manager.zig:148
+
+  const mask = initial_access_mask orelse ACCESS_FULL;
+  When no access mask is specified, handles get FULL access. This
+  violates least privilege.
+
+  FIX: Require explicit access mask — remove the ACCESS_FULL default
+  and force callers to specify the minimum required access.
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 4.3 [P2]: Handle table is global, not per-process
+  FILE: object_manager.zig:328
+
+  global_om is a single ObjectManager shared by ALL processes.
+  Process A can access Process B's handles by guessing the handle
+  index. There's no per-process handle table isolation.
+
+  FIX: Move ObjectManager into ProcessControlBlock, one per process.
+
+================================================================================
+  §5  MEMORY MANAGEMENT (VMM)
+================================================================================
+
+  FINDING 5.1 [P1]: No bounds checking on user-space addresses
+  FILE: kernel_integrate.zig:626-644 (memoryMgrBrk)
+
+  brk() does not check if addr is within the user-space range.
+  A process could set brk_current to a kernel address and then
+  mmap would map physical pages into kernel space.
+
+  FIX: Add bounds check: if addr >= KERNEL_BASE, deny.
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 5.2 [P2]: COW page fault handler lacks recursion protection
+  FILE: vmm64.zig (handleCowPageFault)
+
+  If a COW page fault occurs while handling another COW page fault
+  (e.g., the page table page itself needs COW), the handler could
+  recurse infinitely. Add a per-CPU depth counter.
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 5.3 [P2]: Process termination does not free page tables
+  FILE: kernel_integrate.zig:564
+
+  TODO comment: "Walk the PML4, free all user pages and page table
+  structures". Process termination marks pages as Zombie but never
+  frees the PML4, PDPT, PD, or PT structures. This is a memory leak.
+
+================================================================================
+  §6  IOMMU / DMA PROTECTION
+================================================================================
+
+  FINDING 6.1 [P0 — CRITICAL]: DMA identity mapping without IOMMU
+  FILE: virtio_blk.zig
+
+  The virtio-blk driver uses identity mapping (phys==virt) for DMA
+  buffers. When IOMMU is not enabled, any DMA device can read/write
+  any physical address. When IOMMU IS enabled, the mapping is done
+  but the mapIdentityRegion() function has bugs:
+
+  BUG 1 (line 537-550): The function first writes 512 entries as 2MB
+  huge pages, then OVERWRITES some of them as 4KB pages. The huge
+  page entries at indices 0-511 conflict with the 4KB entries.
+
+  BUG 2 (line 564): slpt[pt_idx] = ... | 0x03 — sets present+write
+  but NOT read (bit 2). VT-d requires read=1 for write=1 to work.
+
+  FIX: Rewrite mapIdentityRegion() to use proper 4-level IOMMU page
+  tables (PML4 → PDPT → PD → PT) with only 4KB page mappings for
+  approved DMA regions, and set read+write+present bits (0x07).
+
+  SEVERITY: P0 — without correct IOMMU mapping, VT-d will block ALL
+  DMA or allow unrestricted DMA, defeating the protection model.
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 6.2 [P1]: IOMMU is not enabled at boot
+  FILE: iommu.zig:326
+
+  init() detects VT-d and sets up structures but does NOT call enable().
+  The comment says "Call enable() after setting up DMA mappings" but
+  no code actually calls enable().
+
+  FIX: After virtio_blk init + DMA mapping, call iommu.enable().
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 6.3 [P2]: isDmaAllowed() is never called
+  FILE: iommu.zig:366-378
+
+  The function exists but virtio_blk never calls it before DMA.
+  The IOMMU hardware enforces the mapping, but the kernel should
+  also do software-level checks for defense in depth.
+
+================================================================================
+  §7  FILESYSTEM (FAT32)
+================================================================================
+
+  FINDING 7.1 [P1]: No journaling / crash consistency
+  FILE: fat32.zig
+
+  Write operations (createFile, writeFile, deleteFile, createDir)
+  modify the FAT and directory entries without any journaling or
+  atomic commit. A power failure during a write can corrupt the
+  filesystem structure.
+
+  FIX (P1): Implement a simple write-ahead log (WAL):
+            1. Before modifying FAT/directory, write intent to log sector
+            2. Perform the actual modification
+            3. Clear the log entry
+            On mount: if log has entries, replay or roll back.
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 7.2 [P2]: Path traversal not fully sanitized
+  FILE: kernel_integrate.zig:82-86
+
+  posixPathToFat32() strips leading slashes but does not handle
+  ".." components. A user process could pass "/../../kernel_data"
+  and escape the intended directory.
+
+  FIX: Validate path components — reject ".." and resolve symlinks.
+
+================================================================================
+  §8  IPC & CHANNELS
+================================================================================
+
+  FINDING 8.1 [P1]: IPC channel has no access control
+  FILE: ipc.zig
+
+  Any process with a handle to a channel endpoint can send/receive.
+  There's no per-process access check. The handle's access_mask
+  (0x00000003 = READ|WRITE) is set at creation but never verified.
+
+  FIX: Check handle access_mask on channelSend/channelReceive:
+       - Send requires ACCESS_WRITE
+       - Receive requires ACCESS_READ
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 8.2 [P2]: Channel queue overflow drops messages silently
+  FILE: ipc.zig:226-228
+
+  When the queue is full, messages are dropped with only a serial
+  print. The sender gets no error indication. This violates the
+  channel contract.
+
+  FIX: Return error to sender, or block (when scheduler supports it).
+
+================================================================================
+  §9  POLER CORE (CRYPTOGRAPHY)
+================================================================================
+
+  FINDING 9.1 [P2]: PND-Feistel MAC not connected to authentication
+  FILE: poler_core.zig
+
+  The PND-Feistel cipher with 20 rounds and S-box is implemented
+  but the token MAC in polerAuthenticate() uses a weak XOR+rotl
+  hash instead of the PND PRF. The crypto primitives exist but
+  are not wired into the security model.
+
+  FIX: Use poler.pndPrf() for token MAC computation in polerAuthenticate().
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 9.2 [P3]: No kernel secret key derivation at boot
+  FILE: kernel_integrate.zig
+
+  generateProcessToken() uses hardcoded constants (0x504F4C45, 0x524F5300)
+  instead of a per-boot random secret. This means the same PID + subsystem
+  always produces the same token across reboots.
+
+  FIX: Generate a 256-bit kernel secret at boot using RDRAND + TSC entropy,
+  store in a kernel-only variable, and use it as the PRF key.
+
+================================================================================
+  §10  SMP / MULTIPROCESSOR
+================================================================================
+
+  FINDING 10.1 [P2]: Spinlocks without interrupt protection
+  FILE: object_manager.zig:311-319
+
+  The spinlock implementation uses atomics but does not disable
+  interrupts. If an interrupt fires while holding the lock and
+  the ISR tries to acquire the same lock, the system deadlocks.
+
+  FIX: Wrap spinLock/spinUnlock with cli()/sti() or use a
+  ticket lock with interrupt-safe save/restore.
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 10.2 [P3]: TLB shootdown IPI is fire-and-forget
+  FILE: vmm64.zig
+
+  The SMP TLB shootdown sends IPIs but the completion check
+  uses a busy loop without timeout. If an AP is stuck, the
+  BSP spins forever.
+
+================================================================================
+  §11  POLICY ENGINE
+================================================================================
+
+  FINDING 11.1 [P1]: Policy rules are mutable at runtime without auth
+  FILE: policy_engine.zig:195-201
+
+  addRule() and removeRule() have no authentication check. Any
+  kernel code path can add or remove policy rules. There should
+  be a CAP_POLICY_SET check before modifying the rule table.
+
+  FIX: Add capability check in addRule/removeRule:
+       if (caller_caps & CAP_POLICY_SET == 0) return false;
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 11.2 [P2]: No rule priority or conflict resolution
+  FILE: policy_engine.zig:222-246
+
+  evaluate() uses first-match-wins. If two rules overlap for the
+  same syscall, the order of insertion determines which wins.
+  There's no explicit priority field or conflict detection.
+
+================================================================================
+  §12  ELF LOADER & DYNAMIC LINKING
+================================================================================
+
+  FINDING 12.1 [P1]: ELF loader does not validate segment permissions
+  FILE: elf_loader.zig
+
+  The ELF loader maps program headers with permissions from the
+  ELF file, but does not enforce W^X (write XOR execute). A
+  segment with PF_W | PF_X is mapped as both writable and
+  executable, enabling shellcode injection.
+
+  FIX: Enforce W^X: if PF_W is set, clear PF_X (and vice versa).
+       Only the kernel may create WX pages (for JIT with CAP_DEVICE).
+
+  ────────────────────────────────────────────────────────────────────────
+
+  FINDING 12.2 [P2]: No ELF signature verification
+  FILE: elf_loader.zig
+
+  The ELF is loaded without any signature check. Any binary on
+  the FAT32 volume can be executed. For POLER-OS security model,
+  executables should be signed and verified before loading.
+
+================================================================================
+  SUMMARY — Priority Matrix
+================================================================================
+
+  P0 (CRITICAL — Fix Immediately):
+    1.1  Shell Ring 0→3                          [scheduler + main64]
+    3.1  POLER token MAC not verified            [kernel_integrate]
+    4.1  access_mask never checked at syscall    [object_manager + subsystems]
+    6.1  IOMMU page table mapping bugs           [iommu]
+
+  P1 (HIGH — Fix Next Sprint):
+    1.3  Kernel stack guard pages                 [scheduler]
+    2.1  Interrupt re-enable timing               [syscall_integration]
+    2.3  Legacy syscall user pointer validation   [syscall_integration]
+    3.2  Fork capability inheritance              [kernel_integrate]
+    4.2  Default ACCESS_FULL                      [object_manager]
+    5.1  User-space address bounds check          [kernel_integrate]
+    6.2  IOMMU not enabled at boot               [main64]
+    7.1  FAT32 no journaling                      [fat32]
+    8.1  IPC channel access control               [ipc]
+    11.1 Policy rules mutation without auth       [policy_engine]
+    12.1 ELF W^X enforcement                      [elf_loader]
+
+  P2 (MEDIUM — Fix in Coming Sprints):
+    1.2  SMEP/SMAP                               [hal]
+    3.4  Audit log too small                     [kernel_integrate]
+    4.3  Global vs per-process handle table       [object_manager]
+    5.2  COW recursion protection                [vmm64]
+    5.3  Process termination page table leak      [kernel_integrate]
+    6.3  isDmaAllowed never called               [virtio_blk]
+    7.2  Path traversal                          [kernel_integrate]
+    8.2  IPC message drop                         [ipc]
+    9.1  PND-Feistel not connected to auth       [kernel_integrate + poler_core]
+    10.1 Spinlock interrupt protection            [object_manager + ipc]
+    10.2 TLB shootdown timeout                    [vmm64]
+    11.2 Policy rule conflicts                    [policy_engine]
+    12.2 ELF signature verification               [elf_loader]
+
+  P3 (LOW — Future Work):
+    9.2  Kernel secret key from RDRAND           [kernel_integrate]
+
+================================================================================
+  P0 FIX PLAN
+================================================================================
+
+  FIX 1: Shell Ring 0→3
+    File: main64.zig
+    Change: Replace scheduler.createTask(shell_entry, ...) with
+            processMgrCreateProcess(0, .POSIX, shell_entry)
+            This creates a user-space process with Ring 3, own CR3,
+            own stack, and DEFAULT_CAPABILITIES.
+
+  FIX 2: POLER Token MAC Verification
+    File: kernel_integrate.zig
+    Change:
+    - Add kernel_secret_key: [32]u8 (initialized from RDRAND at boot)
+    - generateProcessToken: compute MAC = pndPrf(key | pid | caps)
+    - polerAuthenticate: recompute MAC and compare with stored token
+    - If MAC mismatch → return .Denied
+
+  FIX 3: Object Manager access_mask Verification
+    File: subsystem/nt/nt_api.zig, subsystem/posix/posix_api.zig
+    Change:
+    - NtWriteFile: check objmgr.checkHandleAccess(handle, ACCESS_WRITE)
+    - NtReadFile: check objmgr.checkHandleAccess(handle, ACCESS_READ)
+    - POSIX write(): check checkHandleAccess(fd, ACCESS_WRITE)
+    - POSIX read(): check checkHandleAccess(fd, ACCESS_READ)
+    - Return EACCES/STATUS_ACCESS_DENIED on failure
+
+  FIX 4: IOMMU Page Table Mapping
+    File: iommu.zig
+    Change:
+    - Remove the broken 2MB huge page mapping loop
+    - Implement proper 4-level IOMMU page table walk
+    - Map only approved DMA regions with 4KB pages
+    - Set PTE bits: present(1) + write(2) + read(4) = 0x07
+    - Call iommu.enable() after virtio_blk init in main64.zig
+
+================================================================================
