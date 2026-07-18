@@ -226,10 +226,14 @@ pub fn build(b: *std.Build) void {
     });
     iso_cp_cmd.step.dependOn(b.getInstallStep());
 
-    // Use environment variable GRUB_MKRESCUE if set, otherwise default
-    const iso_grub_cmd = b.addSystemCommand(&.{
-        "grub-mkrescue", "-o", "poler-os64.iso", "iso",
-    });
+    // grub-mkrescue with --directory flag to ensure El Torito boot record
+    // is properly embedded. Without it, some GRUB installations produce
+    // an ISO with MBR only (no El Torito), which cannot boot from CDROM.
+    const grub_dir = b.option([]const u8, "grub-dir", "Path to GRUB i386-pc platform directory") orelse "";
+    const iso_grub_cmd = if (grub_dir.len > 0)
+        b.addSystemCommand(&.{ "grub-mkrescue", "--directory", grub_dir, "-o", "poler-os64.iso", "iso" })
+    else
+        b.addSystemCommand(&.{ "grub-mkrescue", "-o", "poler-os64.iso", "iso" });
     iso_grub_cmd.step.dependOn(&iso_cp_cmd.step);
 
     const iso_step = b.step("iso", "Build POLER-OS bootable ISO");

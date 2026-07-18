@@ -1,43 +1,58 @@
 #!/bin/bash
 # ============================================================================
-# POLER-OS ISO Builder — uses locally installed tools (no sudo needed)
+# POLER-OS ISO Builder — portable, no hardcoded paths
+# ============================================================================
+# Fixed: grub-mkrescue requires --directory=<grub-i386-pc-path> to properly
+# embed the El Torito boot record. Without it, the ISO has MBR only and
+# cannot boot from CDROM in QEMU/VirtualBox.
 # ============================================================================
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Local toolchain
-LOCAL="/home/z/my-project/.local"
+# Resolve GRUB platform directory (contains boot.img, cdboot.img, *.mod)
+# Priority: 1) repo-local grub-local  2) system /usr/lib/grub/i386-pc
+GRUB_DIR=""
+if [ -d "$SCRIPT_DIR/../grub-local/lib/grub/i386-pc/boot.img" ]; then
+    GRUB_DIR="$SCRIPT_DIR/../grub-local/lib/grub/i386-pc"
+elif [ -d "/usr/lib/grub/i386-pc/boot.img" ]; then
+    GRUB_DIR="/usr/lib/grub/i386-pc"
+elif [ -d "/usr/share/grub/i386-pc/boot.img" ]; then
+    GRUB_DIR="/usr/share/grub/i386-pc"
+else
+    # Fallback: let grub-mkrescue auto-detect
+    GRUB_DIR=""
+fi
+
+# Resolve local toolchain paths
+LOCAL="$SCRIPT_DIR/../grub-local"
 export PATH="$LOCAL/bin:$PATH"
 export LD_LIBRARY_PATH="$LOCAL/lib:${LD_LIBRARY_PATH:-}"
 
-# Colors
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-
-echo -e "${GREEN}╔══════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║     POLER-OS ISO Builder (local toolchain)       ║${NC}"
-echo -e "${GREEN}╚══════════════════════════════════════════════════╝${NC}"
+echo "╔══════════════════════════════════════════════════╗"
+echo "║     POLER-OS ISO Builder (portable)              ║"
+echo "╚══════════════════════════════════════════════════╝"
 
 # Verify tools
-echo -e "${YELLOW}[0/4] Checking tools...${NC}"
-command -v zig >/dev/null 2>&1 || { echo -e "${RED}ERROR: zig not found${NC}"; exit 1; }
-command -v grub-mkrescue >/dev/null 2>&1 || { echo -e "${RED}ERROR: grub-mkrescue not found${NC}"; exit 1; }
-command -v xorriso >/dev/null 2>&1 || { echo -e "${RED}ERROR: xorriso not found${NC}"; exit 1; }
-echo -e "${GREEN}  ✓ zig $(zig version)${NC}"
-echo -e "${GREEN}  ✓ grub-mkrescue $(grub-mkrescue --version 2>&1 | head -1)${NC}"
-echo -e "${GREEN}  ✓ xorriso $(xorriso -version 2>&1 | head -1)${NC}"
+echo "[0/4] Checking tools..."
+command -v zig >/dev/null 2>&1 || { echo "ERROR: zig not found"; exit 1; }
+command -v grub-mkrescue >/dev/null 2>&1 || { echo "ERROR: grub-mkrescue not found"; exit 1; }
+command -v xorriso >/dev/null 2>&1 || { echo "ERROR: xorriso not found (install libisoburn)"; exit 1; }
+echo "  zig $(zig version)"
+echo "  grub-mkrescue $(grub-mkrescue --version 2>&1 | head -1)"
+echo "  GRUB platform dir: ${GRUB_DIR:-auto-detect}"
 
 # Step 1: Build kernel
-echo -e "${YELLOW}[1/4] Building 64-bit kernel...${NC}"
-zig build -Doptimize=ReleaseSmall 2>&1 || zig build 2>&1
-echo -e "${GREEN}  ✓ Kernel built${NC}"
+echo "[1/4] Building 64-bit kernel..."
+zig build 2>&1
+echo "  Kernel built"
 
 # Step 2: Copy kernel
-echo -e "${YELLOW}[2/4] Preparing ISO structure...${NC}"
+echo "[2/4] Preparing ISO structure..."
 mkdir -p iso/boot/grub
 cp -f zig-out/bin/poler-os64 iso/boot/poler-os64
-echo -e "${GREEN}  ✓ Kernel copied to iso/boot/poler-os64${NC}"
+echo "  Kernel copied to iso/boot/poler-os64"
 
 # Step 3: GRUB config
 cat > iso/boot/grub/grub.cfg << 'EOF'
@@ -61,32 +76,52 @@ menuentry "POLER-OS v0.7.0 (64-bit, serial console)" {
     multiboot2 /boot/poler-os64 console=serial
     boot
 }
-EOF
-echo -e "${GREEN}  ✓ GRUB config written${NC}"
 
-# Step 4: Create ISO
-echo -e "${YELLOW}[3/4] Creating bootable ISO...${NC}"
-grub-mkrescue -o poler-os64.iso iso/ 2>&1
-echo -e "${GREEN}  ✓ ISO created: poler-os64.iso${NC}"
+menuentry "POLER-OS v0.7.0 (64-bit, QEMU VT-d)" {
+    insmod multiboot2
+    insmod part_msdos
+    insmod elf
+    echo "Loading POLER-OS v0.7.0 with IOMMU/VT-d..."
+    multiboot2 /boot/poler-os64 iommu=on
+    boot
+}
+EOF
+echo "  GRUB config written"
+
+# Step 4: Create ISO with El Torito boot record
+echo "[3/4] Creating bootable ISO..."
+if [ -n "$GRUB_DIR" ]; then
+    grub-mkrescue --directory="$GRUB_DIR" -o poler-os64.iso iso/ 2>&1
+else
+    grub-mkrescue -o poler-os64.iso iso/ 2>&1
+fi
+
+# Verify El Torito is present
+if xorriso -indev poler-os64.iso 2>&1 | grep -q "El Torito"; then
+    echo "  ISO created with El Torito boot record: poler-os64.iso"
+else
+    echo "  WARNING: El Torito boot record NOT found! ISO may not boot from CDROM."
+    echo "  Try: grub-mkrescue --directory=/usr/lib/grub/i386-pc -o poler-os64.iso iso/"
+fi
 
 # Optional: FAT32 disk for virtio-blk
 if [[ "$1" == "--disk" || "$1" == "--run" ]]; then
-    echo -e "${YELLOW}[4/4] Creating FAT32 disk image...${NC}"
+    echo "[4/4] Creating FAT32 disk image..."
     dd if=/dev/zero of=disk.img bs=1M count=16 2>/dev/null
     if command -v mformat >/dev/null 2>&1; then
         mformat -i disk.img -v POLEROS -F -c 1 ::
-        echo -e "${GREEN}  ✓ FAT32 disk: disk.img (16MB)${NC}"
+        echo "  FAT32 disk: disk.img (16MB)"
     else
-        echo -e "${YELLOW}  ⚠ disk.img raw (no mtools for FAT32)${NC}"
+        echo "  disk.img raw (no mtools for FAT32)"
     fi
 else
-    echo -e "${YELLOW}[4/4] Skipping disk image (use --disk)${NC}"
+    echo "[4/4] Skipping disk image (use --disk)"
 fi
 
 echo ""
-echo -e "${GREEN}╔══════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║  Build complete!                                 ║${NC}"
-echo -e "${GREEN}╚══════════════════════════════════════════════════╝${NC}"
+echo "╔══════════════════════════════════════════════════╗"
+echo "║  Build complete!                                 ║"
+echo "╚══════════════════════════════════════════════════╝"
 echo "  ISO: $SCRIPT_DIR/poler-os64.iso"
 echo "  Test: qemu-system-x86_64 -cdrom poler-os64.iso -m 256M -serial stdio"
 
