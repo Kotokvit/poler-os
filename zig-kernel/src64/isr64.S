@@ -293,6 +293,18 @@ isr_stub_48:
     jmp isr_common
 
 // ============================================================================
+//  VirtIO-BLK IRQ Stub  (vector 49)
+// ============================================================================
+// v0.8.1: IOAPIC routes virtio-blk IRQ to vector 49.
+// Without this stub, the IDT entry for vector 49 is empty (not present),
+// and the first VirtIO interrupt causes a #GP fault.
+
+isr_stub_49:
+    pushq $0
+    pushq $49
+    jmp isr_common
+
+// ============================================================================
 //  TLB Shootdown IPI Stub  (vector 0xF0 = 240)
 // ============================================================================
 // v0.9.0: SMP TLB shootdown handler — called on APs via broadcast IPI.
@@ -423,6 +435,7 @@ isr_stub_table:
     .quad isr_stub_46
     .quad isr_stub_47
     .quad isr_stub_48
+    .quad isr_stub_49
     .quad isr_stub_240
 
 // ============================================================================

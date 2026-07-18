@@ -7,6 +7,10 @@
 // Breaks circular dependency: hal.zig ↔ scheduler.zig
 pub var timerTickCallback: ?*const fn (u64) callconv(.C) u64 = null;
 
+// v0.8.1: VirtIO-BLK IRQ callback — called from handleIRQ when vector 49 fires.
+// Breaks circular dependency hal.zig ↔ virtio_blk.zig via function pointer.
+pub var virtioBlkIrqCallback: ?*const fn () callconv(.C) void = null;
+
 // COW page fault callback — registered by VMM at init
 // Breaks circular dependency: hal.zig ↔ vmm64.zig
 // Parameters: (fault_virt, fault_cr3, error_code) → true if COW handled
@@ -369,7 +373,7 @@ pub const IDT = struct {
         for (0..num_entries) |i| {
             const ptr_arr: [*]const u64 = @ptrFromInt(table_start);
             const handler: u64 = ptr_arr[i];
-            if (handler > 0x100000 and i < 49) {
+            if (handler > 0x100000 and i < 50) {
                 const dpl: u8 = if (i == 3) 3 else 0;
                 // v0.7.0: Use IST1 for Double Fault (vector 8)
                 const ist: u3 = if (i == 8) 1 else 0;
@@ -378,13 +382,13 @@ pub const IDT = struct {
         }
 
         // v0.9.0: Manually register TLB shootdown IPI handler (vector 240 = 0xF0)
-        // This vector is not in the standard ISR stub table (which only has vectors 0-48)
+        // This vector is not in the standard ISR stub table (which only has vectors 0-49)
         // but was added as isr_stub_240 in isr64.S
-        // We need the address of isr_stub_240, which is at index 49 in the extended table
-        // The ISR stub table now has 50 entries (0-48 + 240)
-        if (num_entries > 49) {
+        // We need the address of isr_stub_240, which is at index 50 in the extended table
+        // The ISR stub table now has 51 entries (0-49 + 240)
+        if (num_entries > 50) {
             const ptr_arr: [*]const u64 = @ptrFromInt(table_start);
-            const shootdown_handler: u64 = ptr_arr[49];
+            const shootdown_handler: u64 = ptr_arr[50];
             if (shootdown_handler > 0x100000) {
                 setGate(240, .interrupt, shootdown_handler, 0x08, 0, 0);
                 Serial.puts("[IDT] TLB shootdown IPI handler registered at vector 0xF0\n");
@@ -488,6 +492,15 @@ fn handleIRQ(frame: *InterruptFrame) *InterruptFrame {
         },
         33 => handleKeyboard(frame),
         36 => handleSerial(frame),
+        49 => {
+            // v0.8.1: VirtIO-BLK device interrupt (IOAPIC routes IRQ -> vector 49)
+            // The driver uses polling mode with waitForCompletion(), but we must
+            // still acknowledge the ISR to prevent interrupt storms.  The ISR
+            // read also clears the interrupt-pending bit in the VirtIO PCI ISR register.
+            if (virtioBlkIrqCallback) |cb| {
+                cb();
+            }
+        },
         240 => {
             // v0.9.0: TLB Shootdown IPI — received from another CPU
             // Call the VMM's shootdown handler
@@ -1232,6 +1245,17 @@ pub const Serial = struct {
             temp /= 10;
         }
         puts(buf[i..20]);
+    }
+
+    /// Read a single character from serial port (non-blocking).
+    /// Returns 0 if no character is available.
+    /// Used by kernel-mode shell task for interactive input.
+    pub fn readChar() u8 {
+        // Check if data is available (bit 0 of Line Status Register)
+        if ((inb(COM1 + 5) & 0x01) != 0) {
+            return inb(COM1);
+        }
+        return 0;
     }
 };
 
