@@ -488,23 +488,32 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
             hal.Serial.puts(" h=");
             hal.Serial.putDecimal(fb_height);
             hal.Serial.puts("\n");
-            if (fb_addr != 0 and fb_width >= 320 and fb_height >= 200 and fb_bpp >= 8 and fb_addr != 0xB8000) {
+            if (fb_addr != 0 and fb_width >= 320 and fb_height >= 200 and fb_bpp >= 8) {
                 // Initialize pixel-based framebuffer for any mode >= 8bpp.
                 // Skip VGA text mode (addr=0xB8000, small w/h like 80x25)
-                // which GRUB sometimes incorrectly reports.
-                // -vga std typically provides 8-bit indexed or 32-bit XRGB8888.
-                hal.Serial.puts("[KERNEL] Initializing framebuffer...\n");
-                framebuffer.init_from_multiboot(
-                    fb_addr,
-                    fb_pitch,
-                    fb_width,
-                    fb_height,
-                    fb_bpp,
-                    fb_type,
-                );
-                hal.Serial.puts("[KERNEL] FB init done, clearing...\n");
-                framebuffer.clear();
-                use_fb = true;
+                // which GRUB sometimes incorrectly reports as framebuffer
+                // when no real graphics mode is set.
+                // VGA text mode has 80x25 "pixels" at 0xB8000 with 16bpp —
+                // this is NOT a real linear framebuffer.
+                if (fb_addr == 0xB8000 or (fb_width <= 80 and fb_height <= 25)) {
+                    hal.Serial.puts("[KERNEL] Skipping VGA text mode pseudo-framebuffer\n");
+                } else {
+                    // -vga std typically provides 8-bit indexed or 32-bit XRGB8888.
+                    // We accept both — the framebuffer driver handles palette setup
+                    // for 8-bit indexed mode via VGA DAC programming.
+                    hal.Serial.puts("[KERNEL] Initializing framebuffer...\n");
+                    framebuffer.init_from_multiboot(
+                        fb_addr,
+                        fb_pitch,
+                        fb_width,
+                        fb_height,
+                        fb_bpp,
+                        fb_type,
+                    );
+                    hal.Serial.puts("[KERNEL] FB init done, clearing...\n");
+                    framebuffer.clear();
+                    use_fb = true;
+                }
             }
         } else {
             hal.Serial.puts("[KERNEL] No FB tag found\n");
@@ -949,30 +958,41 @@ fn sys_clear_screen() void {
 
 fn execute_command(cmd: []const u8) void {
     if (eq(cmd, "help")) {
-        hal.Serial.puts("=== POLER-OS Shell Commands ===\n");
-        hal.Serial.puts("  help           - Show this help menu\n");
-        hal.Serial.puts("  about          - About POLER-OS\n");
-        hal.Serial.puts("  clear          - Clear screen\n");
-        hal.Serial.puts("  poler          - Run POLER core self-tests\n");
-        hal.Serial.puts("  ls             - List files in current dir\n");
-        hal.Serial.puts("  ls <dir>       - List files in subdirectory\n");
-        hal.Serial.puts("  cat <file>     - Read a file (supports paths)\n");
-        hal.Serial.puts("  mkdir <dir>    - Create a directory\n");
-        hal.Serial.puts("  touch <file>   - Create an empty file\n");
-        hal.Serial.puts("  write <f> <t>  - Write text to a file\n");
-        hal.Serial.puts("  rm <file>      - Delete a file\n");
-        hal.Serial.puts("  cp <src> <dst> - Copy a file\n");
-        hal.Serial.puts("  mv <src> <dst> - Move/rename a file\n");
-        hal.Serial.puts("  cd <dir>       - Change working directory\n");
-        hal.Serial.puts("  pwd            - Print working directory\n");
-        hal.Serial.puts("  disk           - Show disk info\n");
-        hal.Serial.puts("  intents        - Intent dispatcher stats (v1.1.0)\n");
-        hal.Serial.puts("  handles        - Show Object Table handles\n");
-        hal.Serial.puts("  format         - Format disk as FAT32\n");
-        hal.Serial.puts("  storage_test   - Persistent storage test\n");
-        hal.Serial.puts("  nested_test    - Test nested directory operations\n");
-        hal.Serial.puts("  fbinfo         - Show framebuffer info\n");
-        hal.Serial.puts("  commands       - List all available commands\n");
+        hal.Serial.puts("╔══════════════════════════════════════════════╗\n");
+        hal.Serial.puts("║       POLER-OS v0.9.1 Shell Commands        ║\n");
+        hal.Serial.puts("╠══════════════════════════════════════════════╣\n");
+        hal.Serial.puts("║ Navigation:                                 ║\n");
+        hal.Serial.puts("║   ls             List files in current dir   ║\n");
+        hal.Serial.puts("║   ls <dir>       List files in subdirectory  ║\n");
+        hal.Serial.puts("║   cd <dir>       Change working directory    ║\n");
+        hal.Serial.puts("║   cd ..          Go up one directory level   ║\n");
+        hal.Serial.puts("║   pwd            Print working directory     ║\n");
+        hal.Serial.puts("╠══════════════════════════════════════════════╣\n");
+        hal.Serial.puts("║ File Operations:                            ║\n");
+        hal.Serial.puts("║   cat <file>     Read a file (supports paths)║\n");
+        hal.Serial.puts("║   touch <file>   Create an empty file        ║\n");
+        hal.Serial.puts("║   write <f> <t>  Write text to a file        ║\n");
+        hal.Serial.puts("║   rm <file>      Delete a file               ║\n");
+        hal.Serial.puts("║   cp <src> <dst> Copy a file                 ║\n");
+        hal.Serial.puts("║   mv <src> <dst> Move/rename a file          ║\n");
+        hal.Serial.puts("║   mkdir <dir>    Create a directory          ║\n");
+        hal.Serial.puts("╠══════════════════════════════════════════════╣\n");
+        hal.Serial.puts("║ System:                                     ║\n");
+        hal.Serial.puts("║   about          About POLER-OS             ║\n");
+        hal.Serial.puts("║   clear          Clear screen               ║\n");
+        hal.Serial.puts("║   disk           Show disk info             ║\n");
+        hal.Serial.puts("║   format         Format disk as FAT32       ║\n");
+        hal.Serial.puts("║   fbinfo         Show framebuffer info      ║\n");
+        hal.Serial.puts("║   poler          Run POLER core self-tests   ║\n");
+        hal.Serial.puts("╠══════════════════════════════════════════════╣\n");
+        hal.Serial.puts("║ Security & Testing:                         ║\n");
+        hal.Serial.puts("║   intents        Intent dispatcher stats     ║\n");
+        hal.Serial.puts("║   handles        Show Object Table handles   ║\n");
+        hal.Serial.puts("║   storage_test   Persistent storage test     ║\n");
+        hal.Serial.puts("║   nested_test    Nested directory test       ║\n");
+        hal.Serial.puts("╠══════════════════════════════════════════════╣\n");
+        hal.Serial.puts("║   commands       Quick command list          ║\n");
+        hal.Serial.puts("╚══════════════════════════════════════════════╝\n");
     } else if (eq(cmd, "commands")) {
         // Short-form command listing
         hal.Serial.puts("help about clear poler ls cat mkdir touch write rm cp mv cd pwd disk intents handles format storage_test nested_test fbinfo commands\n");

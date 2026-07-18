@@ -617,6 +617,8 @@ pub const Fat32Fs = struct {
         // Strip leading slashes
         var p = path;
         while (p.len > 0 and p[0] == '/') p = p[1..];
+        // Strip trailing slashes
+        while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
 
         if (p.len == 0) {
             // Root directory requested
@@ -627,40 +629,62 @@ pub const Fat32Fs = struct {
                 .position = 0,
                 .is_valid = true,
                 .is_directory = true,
-                .dir_cluster = 0,
+                .dir_cluster = self.root_cluster,
                 .name = undefined,
                 .name_len = 0,
             };
         }
 
-        // Split path into components
+        // Split path into components and count them
+        var components: [32][]const u8 = undefined;
+        var num_components: usize = 0;
+        var s: usize = 0;
+        while (s < p.len and num_components < 32) {
+            // Skip slashes
+            while (s < p.len and p[s] == '/') : (s += 1) {}
+            if (s >= p.len) break;
+            // Find end of component
+            var e = s;
+            while (e < p.len and p[e] != '/') : (e += 1) {}
+            components[num_components] = p[s..e];
+            num_components += 1;
+            s = e;
+        }
+
+        if (num_components == 0) {
+            // Path was all slashes
+            return File{
+                .first_cluster = self.root_cluster,
+                .current_cluster = self.root_cluster,
+                .file_size = 0,
+                .position = 0,
+                .is_valid = true,
+                .is_directory = true,
+                .dir_cluster = self.root_cluster,
+                .name = undefined,
+                .name_len = 0,
+            };
+        }
+
+        // Traverse the path components
         var current_dir: u32 = self.root_cluster;
-        var start: usize = 0;
+        for (components[0..num_components], 0..) |component, idx| {
+            const is_last = (idx == num_components - 1);
 
-        while (start < p.len) {
-            // Find end of this component
-            var end = start;
-            while (end < p.len and p[end] != '/') : (end += 1) {}
-            const component = p[start..end];
-
-            if (component.len == 0) {
-                start = end + 1;
-                continue;
-            }
+            if (component.len == 0) continue;
 
             // P0 SECURITY: Path traversal protection — reject ".." to prevent
             // escaping the intended directory hierarchy, and skip "." (no-op).
             if (component.len == 2 and component[0] == '.' and component[1] == '.') return null;
-            if (component.len == 1 and component[0] == '.') {
-                start = end + 1;
-                continue; // Skip "." — current directory, no traversal needed
-            }
+            if (component.len == 1 and component[0] == '.') continue;
 
-            // Is this the last component?
-            const remaining = if (end < p.len) p[end + 1 ..] else "";
-            var rem_clean = remaining;
-            while (rem_clean.len > 0 and rem_clean[0] == '/') rem_clean = rem_clean[1..];
-            const is_last = rem_clean.len == 0;
+            // Validate current_dir cluster before searching
+            if (current_dir < 2 or current_dir >= self.total_data_clusters + 2) {
+                hal.Serial.puts("[FAT32] openFile: invalid cluster ");
+                hal.Serial.putHex(current_dir);
+                hal.Serial.puts(" in path traversal\n");
+                return null;
+            }
 
             // Look up this component in the current directory
             const entry = self.findEntryInDir(current_dir, component) orelse return null;
@@ -671,9 +695,11 @@ pub const Fat32Fs = struct {
                 @memcpy(file_name[0..component.len], component);
                 file_name[component.len] = 0;
 
+                // Validate first_cluster
+                const valid_cluster = entry.first_cluster >= 2 and entry.first_cluster < self.total_data_clusters + 2;
                 return File{
                     .first_cluster = entry.first_cluster,
-                    .current_cluster = if (entry.first_cluster >= 2) entry.first_cluster else 0,
+                    .current_cluster = if (valid_cluster) entry.first_cluster else 0,
                     .file_size = entry.file_size,
                     .position = 0,
                     .is_valid = true,
@@ -685,10 +711,17 @@ pub const Fat32Fs = struct {
             } else {
                 // Intermediate component — must be a directory
                 if (!entry.is_directory) return null;
-                current_dir = if (entry.first_cluster >= 2) entry.first_cluster else self.root_cluster;
+                if (entry.first_cluster >= 2 and entry.first_cluster < self.total_data_clusters + 2) {
+                    current_dir = entry.first_cluster;
+                } else {
+                    hal.Serial.puts("[FAT32] openFile: directory '");
+                    hal.Serial.puts(component);
+                    hal.Serial.puts("' has invalid cluster ");
+                    hal.Serial.putHex(entry.first_cluster);
+                    hal.Serial.puts("\n");
+                    current_dir = self.root_cluster;
+                }
             }
-
-            start = end + 1;
         }
 
         return null;
@@ -701,8 +734,12 @@ pub const Fat32Fs = struct {
         var lfn_buf: [256]u16 = undefined;
         var lfn_len: usize = 0;
 
+        // Validate starting cluster
+        if (cluster < 2 or cluster >= self.total_data_clusters + 2) return null;
+
         while (true) {
             if (cluster < 2) break;
+            if (cluster >= self.total_data_clusters + 2) break;
             if (chain_len >= MAX_CLUSTER_CHAIN) break;
 
             for (0..self.sectors_per_cluster) |sec_idx| {
@@ -787,7 +824,7 @@ pub const Fat32Fs = struct {
         if (p.len == 0) return self.root_cluster;
 
         // Open the path — if it's a directory, return its cluster
-        const f = self.openFile(path) orelse return null;
+        const f = self.openFile(p) orelse return null;
         if (!f.is_directory) return null; // Not a directory
 
         // Root directory's first_cluster is always >= 2 on FAT32,
@@ -1403,9 +1440,9 @@ pub const Fat32Fs = struct {
 
     /// Update an existing directory entry (e.g. file size, first cluster).
     fn updateDirEntry(self: *Fat32Fs, file: *const File) bool {
-        if (file.dir_cluster < 2) return false;
-
-        var cluster: u32 = file.dir_cluster;
+        // Use root_cluster for files in root (dir_cluster might be 0 for root)
+        const dir_cluster = if (file.dir_cluster >= 2) file.dir_cluster else self.root_cluster;
+        var cluster: u32 = dir_cluster;
         var chain_len: u32 = 0;
 
         while (true) {

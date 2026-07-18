@@ -216,7 +216,7 @@ pub fn init_from_multiboot(addr: u64, pitch: u32, width: u32, height: u32, bpp: 
     fb.height = height;
     fb.bpp = bpp;
     fb.pixel_type = pixel_type;
-    fb.valid = (addr != 0 and width > 0 and height > 0);
+    fb.valid = (addr != 0 and width > 0 and height > 0 and bpp >= 8);
     
     // Default color masks for XRGB8888
     if (pixel_type == @intFromEnum(PixelFormat.rgb888)) {
@@ -229,8 +229,75 @@ pub fn init_from_multiboot(addr: u64, pitch: u32, width: u32, height: u32, bpp: 
         fb.blue_shift = 16; fb.blue_mask = 8;
     }
     
+    // For indexed/palette mode (-vga std), set up the VGA DAC palette
+    // This allows proper color rendering in 8-bit indexed mode
+    if (pixel_type == @intFromEnum(PixelFormat.indexed) and bpp == 8) {
+        initVgaPalette();
+    }
+    
     cursor_x = 0;
     cursor_y = 0;
+}
+
+/// Initialize the VGA DAC palette for -vga std 8-bit indexed mode.
+/// We program a simple 16-color palette at indices 0-15 matching
+/// the standard VGA text mode colors, plus a 6x6x6 color cube at
+/// indices 16-231 (216 colors) and 24 grayscale entries at 232-255.
+fn initVgaPalette() void {
+    // VGA DAC registers: write index to 0x3C8, then R/G/B triplets to 0x3C9
+    const dac_idx: *volatile u8 = @ptrFromInt(0x3C8);
+    const dac_data: *volatile u8 = @ptrFromInt(0x3C9);
+    
+    // Standard VGA 16-color palette (indices 0-15)
+    const vga_colors = [16][3]u8{
+        .{0x00, 0x00, 0x00}, // 0:  Black
+        .{0x00, 0x00, 0x2A}, // 1:  Blue
+        .{0x00, 0x2A, 0x00}, // 2:  Green
+        .{0x00, 0x2A, 0x2A}, // 3:  Cyan
+        .{0x2A, 0x00, 0x00}, // 4:  Red
+        .{0x2A, 0x00, 0x2A}, // 5:  Magenta
+        .{0x2A, 0x15, 0x00}, // 6:  Brown
+        .{0x2A, 0x2A, 0x2A}, // 7:  Light Gray
+        .{0x15, 0x15, 0x15}, // 8:  Dark Gray
+        .{0x15, 0x15, 0x3F}, // 9:  Light Blue
+        .{0x15, 0x3F, 0x15}, // 10: Light Green
+        .{0x15, 0x3F, 0x3F}, // 11: Light Cyan
+        .{0x3F, 0x15, 0x15}, // 12: Light Red
+        .{0x3F, 0x15, 0x3F}, // 13: Light Magenta
+        .{0x3F, 0x3F, 0x15}, // 14: Yellow
+        .{0x3F, 0x3F, 0x3F}, // 15: White
+    };
+    
+    dac_idx.* = 0;
+    for (vga_colors) |color| {
+        // VGA DAC uses 6-bit values (0-63), our colors are 6-bit already
+        dac_data.* = color[0];
+        dac_data.* = color[1];
+        dac_data.* = color[2];
+    }
+    
+    // 6x6x6 color cube (indices 16-231)
+    var r: u8 = 0;
+    while (r < 6) : (r += 1) {
+        var g: u8 = 0;
+        while (g < 6) : (g += 1) {
+            var b: u8 = 0;
+            while (b < 6) : (b += 1) {
+                dac_data.* = if (r == 0) 0 else r * 10 + 3;
+                dac_data.* = if (g == 0) 0 else g * 10 + 3;
+                dac_data.* = if (b == 0) 0 else b * 10 + 3;
+            }
+        }
+    }
+    
+    // Grayscale ramp (indices 232-255)
+    var i: u8 = 0;
+    while (i < 24) : (i += 1) {
+        const val = i * 2 + 4;
+        dac_data.* = val;
+        dac_data.* = val;
+        dac_data.* = val;
+    }
 }
 
 /// Is framebuffer available?
