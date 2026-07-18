@@ -1,0 +1,3 @@
+QEMU 7.0.0 monitor - type 'help' for more information
+(qemu) qemu-system-x86_64: -serial pipe:/tmp/qemu-serial: Could not open '/tmp/qemu-serial': No such file or directory
+qemu-system-x86_64: -serial pipe:/tmp/qemu-serial: could not connect serial device to character backend 'pipe:/tmp/qemu-serial'
