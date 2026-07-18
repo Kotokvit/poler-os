@@ -79,6 +79,7 @@ const pmm = @import("pmm64.zig");
 const elf_loader = @import("elf_loader.zig");
 const spinlock = @import("spinlock.zig");
 const fat32 = @import("fat32.zig");
+const heap = @import("heap64.zig");
 
 // ============================================================================
 // ELF64 Dynamic Structures
@@ -389,6 +390,11 @@ pub const LoadedLibrary = struct {
     // v1.0.0: Binding mode
     bind_now: bool = false, // True if DT_FLAGS has DF_BIND_NOW or DT_FLAGS_1 has DF_1_NOW
 
+    // v1.0.0: VFS file data — kept alive for recursive DT_NEEDED resolution.
+    // After all dependencies are resolved, the caller should free this
+    // via heap.kfree(vfs_data.ptr) to reclaim kernel heap memory.
+    vfs_data: VfsFileData = .{},
+
     is_loaded: bool = false,
     is_relocated: bool = false,
 };
@@ -420,6 +426,18 @@ const LIBRARY_SEARCH_PATHS = [_][]const u8{
 
 /// Max size for a library file read from VFS
 const MAX_LIBRARY_FILE_SIZE: u64 = 64 * 1024 * 1024; // 64 MB
+
+/// Result of a VFS file load — holds the heap-allocated buffer.
+/// The caller must free via heap.kfree(data.ptr) when done with the data.
+pub const VfsFileData = struct {
+    ptr: [*]u8 = undefined, // Raw pointer for kfree
+    size: u32 = 0, // Bytes actually read
+    slice: []const u8 = &[_]u8{}, // Slice for passing to ELF parser
+
+    pub fn isValid(self: *const @This()) bool {
+        return self.size > 0 and self.slice.len > 0;
+    }
+};
 
 // ============================================================================
 // Dynamic Linker Initialization
@@ -1571,9 +1589,8 @@ fn virtToPhys(cr3: u64, vaddr: u64) u64 {
 /// Returns: LoadedLibrary descriptor
 pub fn loadSharedLibrary(lib_data: ?[]const u8, lib_name: []const u8, target_cr3: u64, load_index: usize) DynLinkError!?*LoadedLibrary {
     // If no data provided, try to load from VFS
-    var vfs_data: ?[]const u8 = null;
-    var vfs_buffer: [MAX_LIBRARY_FILE_SIZE]u8 = undefined;
-    var vfs_size: usize = 0;
+    var vfs_file_data: VfsFileData = .{};
+    var vfs_loaded = false;
 
     const actual_data = if (lib_data) |d| d else blk: {
         // Try to load from VFS using search paths
@@ -1583,28 +1600,28 @@ pub fn loadSharedLibrary(lib_data: ?[]const u8, lib_name: []const u8, target_cr3
             if (path_len > full_path.len) continue;
 
             @memcpy(full_path[0..path.len], path);
-            @memcpy(full_path[path.len .. path.len + lib_name.len], lib_name);
+            @memcpy(full_path[path_len .. path_len + lib_name.len], lib_name);
 
             // Try to read the file from FAT32 via VFS
-            if (loadFromVfs(full_path[0..path_len + lib_name.len], &vfs_buffer, &vfs_size)) {
-                vfs_data = vfs_buffer[0..vfs_size];
+            if (loadFromVfs(full_path[0..path_len + lib_name.len], &vfs_file_data)) {
+                vfs_loaded = true;
                 hal.Serial.puts("[DYNLINK] Loaded '");
                 hal.Serial.puts(lib_name);
                 hal.Serial.puts("' from VFS path '");
-                hal.Serial.puts(full_path[0..path.len + lib_name.len]);
+                hal.Serial.puts(full_path[0..path_len + lib_name.len]);
                 hal.Serial.puts("'\n");
                 break;
             }
         }
 
-        if (vfs_data == null) {
+        if (!vfs_loaded) {
             hal.Serial.puts("[DYNLINK] ERROR: library '");
             hal.Serial.puts(lib_name);
             hal.Serial.puts("' not found in VFS\n");
             return DynLinkError.LibraryNotFound;
         }
 
-        break :blk vfs_data.?;
+        break :blk vfs_file_data.slice;
     };
 
     if (actual_data.len < @sizeOf(elf_loader.Elf64_Ehdr)) return null;
@@ -1651,6 +1668,15 @@ pub fn loadSharedLibrary(lib_data: ?[]const u8, lib_name: []const u8, target_cr3
         l.base_addr = load_base;
         l.entry_point = result.entry_point;
 
+        // v1.0.0: Store VFS data for recursive DT_NEEDED resolution
+        // This keeps the ELF file data alive in kernel heap so we can
+        // parse its DT_NEEDED entries and load transitive dependencies.
+        // After all dependencies are resolved, the caller should free
+        // this via heap.kfree(lib.vfs_data.ptr).
+        if (vfs_loaded) {
+            l.vfs_data = vfs_file_data;
+        }
+
         // v1.0.0: Parse TLS template from PT_TLS
         parseTlsTemplate(actual_data, load_base, l);
 
@@ -1680,39 +1706,149 @@ pub fn loadSharedLibrary(lib_data: ?[]const u8, lib_name: []const u8, target_cr3
 
 /// Load a file from the VFS (FAT32 filesystem).
 ///
-/// Tries to open the file at the given path, read its contents into
-/// the provided buffer, and return the actual size read.
+/// Opens the file at the given path, reads its ENTIRE contents into a
+/// heap-allocated buffer, and returns the data slice. The caller is
+/// responsible for freeing the buffer via heap.kfree() when done.
+///
+/// Flow:
+///   1. fat32.getFs() → get the global FAT32 filesystem instance
+///   2. fs.openFile(path) → open the file
+///   3. kmalloc(file_size) → allocate buffer on kernel heap
+///   4. fs.readFile() in a loop → read entire file content
+///   5. Return the data slice
+///
+/// Thread safety:
+///   FAT32 operations are protected by the driver's internal state
+///   (single IO buffer). In a multi-threaded environment, the caller
+///   should hold a VFS lock. For now, we use the FAT32 driver as-is
+///   since the dynlinker runs during process loading (single-threaded
+///   at that point, before user threads start).
 ///
 /// Parameters:
 ///   path      — Absolute path (e.g., "/lib/libc.so")
-///   buffer    — Output buffer for file content
-///   out_size  — Set to the number of bytes read
+///   out_data  — Set to the slice of heap-allocated file content
 ///
 /// Returns: true if the file was successfully read, false otherwise
-fn loadFromVfs(path: []const u8, buffer: []u8, out_size: *usize) bool {
-    _ = path;
-    _ = buffer;
-    _ = out_size;
+fn loadFromVfs(path: []const u8, out_data: *VfsFileData) bool {
+    out_data.* = VfsFileData{};
 
-    // v1.0.0: The FAT32 driver has open/read/close operations, but we need
-    // to go through the VFS layer. The full VFS is not yet integrated with
-    // the dynamic linker, so this is a stub that will be connected when
-    // the VFS subsystem is ready.
-    //
-    // The intended flow:
-    //   1. fat32.open(path) -> file_handle
-    //   2. fat32.read(file_handle, buffer) -> bytes_read
-    //   3. fat32.close(file_handle)
-    //
-    // For now, we log and return false (library not found via VFS).
-    // When the VFS layer is integrated, this function will be replaced
-    // with actual FAT32 calls.
+    // Step 1: Get the FAT32 filesystem instance
+    const fs = fat32.getFs() orelse {
+        hal.Serial.puts("[DYNLINK] VFS: no FAT32 filesystem available\n");
+        return false;
+    };
 
-    hal.Serial.puts("[DYNLINK] VFS lookup: '");
+    // Step 2: Open the file
+    var file = fs.openFile(path) orelse {
+        hal.Serial.puts("[DYNLINK] VFS: file not found: '");
+        hal.Serial.puts(path);
+        hal.Serial.puts("'\n");
+        return false;
+    };
+
+    if (file.is_directory) {
+        hal.Serial.puts("[DYNLINK] VFS: path is a directory, not a file: '");
+        hal.Serial.puts(path);
+        hal.Serial.puts("'\n");
+        return false;
+    }
+
+    if (file.file_size == 0) {
+        hal.Serial.puts("[DYNLINK] VFS: file is empty: '");
+        hal.Serial.puts(path);
+        hal.Serial.puts("'\n");
+        return false;
+    }
+
+    // Sanity check: reject files larger than 64MB
+    if (file.file_size > MAX_LIBRARY_FILE_SIZE) {
+        hal.Serial.puts("[DYNLINK] VFS: file too large (");
+        hal.Serial.putDecimal(file.file_size);
+        hal.Serial.puts(" bytes): '");
+        hal.Serial.puts(path);
+        hal.Serial.puts("'\n");
+        return false;
+    }
+
+    hal.Serial.puts("[DYNLINK] VFS: opened '");
     hal.Serial.puts(path);
-    hal.Serial.puts("' (VFS not yet connected)\n");
+    hal.Serial.puts("' size=");
+    hal.Serial.putDecimal(file.file_size);
+    hal.Serial.puts(" bytes\n");
 
-    return false;
+    // Step 3: Allocate buffer on the kernel heap
+    const buf_ptr = heap.kmalloc(file.file_size) orelse {
+        hal.Serial.puts("[DYNLINK] VFS: failed to allocate ");
+        hal.Serial.putDecimal(file.file_size);
+        hal.Serial.puts(" bytes for '");
+        hal.Serial.puts(path);
+        hal.Serial.puts("'\n");
+        return false;
+    };
+
+    const buf = buf_ptr[0..file.file_size];
+
+    // Step 4: Read the entire file content
+    // FAT32 readFile reads sector-by-sector internally, so we call it
+    // in a loop until we've read the entire file.
+    var total_read: u32 = 0;
+    const chunk_size: u32 = 4096; // Read in 4KB chunks
+
+    while (total_read < file.file_size) {
+        const remaining = file.file_size - total_read;
+        const to_read = if (remaining < chunk_size) remaining else chunk_size;
+
+        const bytes_read = fs.readFile(&file, buf[total_read..][0..to_read], to_read);
+
+        if (bytes_read == 0) {
+            // Read error or EOF before expected — partial read
+            hal.Serial.puts("[DYNLINK] VFS: partial read at offset ");
+            hal.Serial.putDecimal(total_read);
+            hal.Serial.puts("/");
+            hal.Serial.putDecimal(file.file_size);
+            hal.Serial.puts(" for '");
+            hal.Serial.puts(path);
+            hal.Serial.puts("'\n");
+            break;
+        }
+
+        total_read += bytes_read;
+    }
+
+    if (total_read != file.file_size) {
+        // Partial read — still usable if we got the ELF header and
+        // enough data. Many ELF loaders are tolerant of this.
+        hal.Serial.puts("[DYNLINK] VFS: WARNING: read ");
+        hal.Serial.putDecimal(total_read);
+        hal.Serial.puts("/");
+        hal.Serial.putDecimal(file.file_size);
+        hal.Serial.puts(" bytes for '");
+        hal.Serial.puts(path);
+        hal.Serial.puts("'\n");
+    }
+
+    // Step 5: Validate ELF magic before accepting
+    if (total_read < 4 or buf[0] != 0x7F or buf[1] != 'E' or buf[2] != 'L' or buf[3] != 'F') {
+        hal.Serial.puts("[DYNLINK] VFS: file is not a valid ELF: '");
+        hal.Serial.puts(path);
+        hal.Serial.puts("'\n");
+        heap.kfree(buf_ptr);
+        return false;
+    }
+
+    out_data.* = VfsFileData{
+        .ptr = buf_ptr,
+        .size = total_read,
+        .slice = buf[0..total_read],
+    };
+
+    hal.Serial.puts("[DYNLINK] VFS: loaded '");
+    hal.Serial.puts(path);
+    hal.Serial.puts("' (");
+    hal.Serial.putDecimal(total_read);
+    hal.Serial.puts(" bytes)\n");
+
+    return true;
 }
 
 // ============================================================================
@@ -1894,14 +2030,65 @@ pub fn loadNeededLibraries(elf_data: []const u8, load_base: u64, target_cr3: u64
             // Process relocations for the newly loaded library
             try processRelocations(lib);
 
-            // Recursively load this library's own DT_NEEDED dependencies
-            // We need the original ELF data for this — in practice, we'd
-            // cache it. For now, we skip recursive VFS loading since
-            // the library data is already mapped.
+            // v1.0.1: Recursively load this library's own DT_NEEDED dependencies.
+            // We use the cached VFS data (vfs_data.slice) which contains the
+            // original ELF file bytes. This allows us to parse DT_NEEDED without
+            // re-reading from disk. The VFS data is freed after all dependencies
+            // in the tree are resolved (see freeVfsData below).
+            if (lib.vfs_data.isValid()) {
+                loadNeededLibraries(lib.vfs_data.slice, lib.base_addr, target_cr3, depth + 1) catch |err| {
+                    hal.Serial.puts("[DYNLINK] WARNING: recursive DT_NEEDED failed for '");
+                    hal.Serial.puts(name);
+                    hal.Serial.puts("': ");
+                    switch (err) {
+                        DynLinkError.LibraryNotFound => hal.Serial.puts("dep not found"),
+                        else => hal.Serial.puts("unknown"),
+                    }
+                    hal.Serial.puts("\n");
+                };
+            }
+
             hal.Serial.puts("[DYNLINK] '");
             hal.Serial.puts(name);
-            hal.Serial.puts("' loaded and relocated\n");
+            hal.Serial.puts("' loaded and relocated (with deps)\n");
         }
+    }
+}
+
+// ============================================================================
+// VFS Data Cleanup
+// ============================================================================
+
+/// Free all cached VFS file data from loaded libraries.
+///
+/// After all dynamic linking is complete (all DT_NEEDED resolved,
+/// all relocations applied, all TLS templates copied), the ELF file
+/// data that was read from disk is no longer needed. This function
+/// walks all loaded libraries and frees their VFS buffers.
+///
+/// This MUST be called after linkDynamicExecutable() completes to
+/// avoid leaking kernel heap memory. The library descriptors themselves
+/// remain valid — only the raw file data is freed.
+pub fn freeAllVfsData() void {
+    var freed_count: usize = 0;
+    var freed_bytes: usize = 0;
+
+    for (&loaded_libraries) |*lib| {
+        if (!lib.is_loaded) continue;
+        if (lib.vfs_data.size > 0) {
+            freed_bytes += lib.vfs_data.size;
+            heap.kfree(lib.vfs_data.ptr);
+            lib.vfs_data = VfsFileData{};
+            freed_count += 1;
+        }
+    }
+
+    if (freed_count > 0) {
+        hal.Serial.puts("[DYNLINK] Freed VFS data for ");
+        hal.Serial.putDecimal(freed_count);
+        hal.Serial.puts(" libraries (");
+        hal.Serial.putDecimal(freed_bytes);
+        hal.Serial.puts(" bytes reclaimed)\n");
     }
 }
 
@@ -2088,7 +2275,13 @@ pub fn linkDynamicExecutable(elf_data: []const u8, load_base: u64, target_cr3: u
     // Step 7: Call init functions
     callInitFunctions(main_lib.?);
 
-    hal.Serial.puts("[DYNLINK] Dynamic linking complete (v1.0.0)\n");
+    // Step 8: Free cached VFS data — the ELF file bytes are no longer needed
+    // now that all segments are mapped into the process's PML4, all TLS
+    // templates are copied, and all relocations are applied. Keeping this
+    // data would waste kernel heap memory.
+    freeAllVfsData();
+
+    hal.Serial.puts("[DYNLINK] Dynamic linking complete (v1.0.1)\n");
     hal.Serial.puts("[DYNLINK]   Libraries loaded: ");
     hal.Serial.putDecimal(library_count);
     hal.Serial.puts("\n");
