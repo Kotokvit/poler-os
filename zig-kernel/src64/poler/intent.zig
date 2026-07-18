@@ -2,7 +2,7 @@
 // POLER-OS Intent Layer — Semantic Security Dispatcher (v1.1.0)
 // ============================================================================
 //
-// Architecture:
+// Architecture (5-phase pipeline):
 //   ┌─────────────┐
 //   │  Userspace   │  NT/POSIX syscalls
 //   └──────┬──────┘
@@ -13,14 +13,14 @@
 //   └──────┬──────┘
 //          │ Creates Intent
 //   ┌──────▼──────┐
-//   │   Intent     │  Intercepts & validates ALL I/O operations
-//   │  Dispatcher  │  via POLER Firewall (PND v8 tensor verification)
-//   └──────┬──────┘
+//   │   Intent     │  Phase 1: PND v8 nonce verification (tamper detection)
+//   │  Dispatcher  │  Phase 1b: POLER Firewall semantic evaluation
+//   └──────┬──────┘  (SipHash PRF + cognitive cycle anomaly detection)
 //          │ Authorized
 //   ┌──────▼──────┐
-//   │ Object Table │  Per-handle access_mask verification
-//   │ (Handles)    │  (Zircon/seL4 model)
-//   └──────┬──────┘
+//   │ Object Table │  Phase 3: Process-level capability check
+//   │ (Handles)    │  Phase 4: Per-handle access_mask verification
+//   └──────┬──────┘  (Zircon/seL4 model)
 //          │ Permitted
 //   ┌──────▼──────┐
 //   │     VFS      │  Virtual File System → FAT32 / VirtIO-BLK
@@ -30,12 +30,19 @@
 // Instead of checking global process flags (pcb.acl_capabilities),
 // every I/O operation is:
 //   1. Encapsulated as an Intent (72 bytes)
-//   2. Verified by the POLER Firewall (PND v8 tensor check)
-//   3. Authorized against the specific Object Handle's access_mask
-//   4. Only then dispatched to VFS/drivers
+//   2. Verified by the POLER Firewall (PND v8 tensor check + SipHash PRF)
+//   3. Semantically evaluated for anomaly patterns (cognitive cycle)
+//   4. Authorized against the specific Object Handle's access_mask
+//   5. Only then dispatched to VFS/drivers
 //
 // This ensures: CAP_FILE_READ on a process does NOT give access to ALL files.
 // Access is granted per-handle, per-object, with explicit delegation chains.
+//
+// v1.1.0 change: Integrated PolerFirewall into the dispatch pipeline.
+// Previously, PolerFirewall was a standalone module in poler_core.zig
+// that was never called from the Intent path. Now Phase 1b uses the
+// Firewall's SipHash PRF + cognitive cycle to detect anomalous Intent
+// patterns (behavioral analysis beyond simple nonce verification).
 // ============================================================================
 
 const hal = @import("../hal.zig");
@@ -231,12 +238,82 @@ var total_intents: u64 = 0;
 var allowed_intents: u64 = 0;
 var denied_intents: u64 = 0;
 var blocked_intents: u64 = 0;
+var suspicious_intents: u64 = 0;
 
 // Rate limiting per caller
 var caller_intent_count: [64]u64 = undefined;
 var caller_intent_window_start: [64]u64 = undefined;
 const MAX_RATE_LIMITED_CALLERS = 64;
 const MAX_INTENTS_PER_WINDOW = 1000;
+
+// ============================================================================
+// POLER Firewall Instance — v1.1.0 integrated into Intent Dispatcher
+// ============================================================================
+//
+// The PolerFirewall provides TWO layers beyond the PND nonce:
+//   1. SipHash-2-4 PRF with SECRET key — attacker cannot forge Intent
+//      patterns that pass the semantic hash check without inverting PRF.
+//   2. Cognitive cycle (℘-O-L-ε-R-Ψ) — anomaly detection based on
+//      behavioral patterns. A process that suddenly changes its Intent
+//      profile (e.g., a compromised process starts sending NET_SEND
+//      after only doing FS_READ) will have high free energy → DENIED.
+//
+// The Firewall is per-caller: each caller_id has its own cognitive state
+// so that one process's anomaly pattern doesn't pollute another's.
+
+const MAX_FIREWALL_INSTANCES = 16;
+var firewall_instances: [MAX_FIREWALL_INSTANCES]poler.PolerFirewall = undefined;
+var firewall_owner: [MAX_FIREWALL_INSTANCES]u32 = undefined; // caller_id
+var firewall_count: usize = 0;
+
+/// Get or create a Firewall instance for the given caller.
+/// Returns null if no slots are available (fallback: use global firewall).
+fn getFirewallForCaller(caller_id: u32) ?*poler.PolerFirewall {
+    // Search for existing instance
+    for (firewall_instances[0..firewall_count], 0..) |*fw, i| {
+        if (firewall_owner[i] == caller_id) {
+            return fw;
+        }
+    }
+    // Create new instance
+    if (firewall_count < MAX_FIREWALL_INSTANCES) {
+        const idx = firewall_count;
+        firewall_instances[idx] = poler.PolerFirewall.init(1);
+        firewall_owner[idx] = caller_id;
+        firewall_count += 1;
+        return &firewall_instances[idx];
+    }
+    // No slots — return null, caller should use global firewall
+    return null;
+}
+
+/// Global fallback firewall (for callers without a dedicated instance)
+var global_firewall: poler.PolerFirewall = undefined;
+var global_firewall_initialized = false;
+
+// Intent → SyscallCategory mapping for Firewall evaluation
+fn intentCategoryToSyscallCategory(cat: IntentCategory) poler.SyscallCategory {
+    return switch (cat) {
+        .FS   => .file_io,
+        .NET  => .network,
+        .PROC => .process_control,
+        .MEM  => .memory_access,
+        .HW   => .device_access,
+        .IPC  => .ipc,
+        .SYS  => .process_control, // SYS maps to process_control for Firewall
+    };
+}
+
+/// Map IntentAction access flags to Firewall access_flags (R=1, W=2, X=4)
+fn intentActionToFirewallAccess(act: IntentAction) u32 {
+    const access = actionToAccessMask(act);
+    var flags: u32 = 0;
+    if (access & ACCESS_READ != 0) flags |= 1;   // R
+    if (access & ACCESS_WRITE != 0) flags |= 2;   // W
+    if (access & ACCESS_EXECUTE != 0) flags |= 4; // X
+    if (flags == 0) flags = 1; // At minimum, read intent
+    return flags;
+}
 
 /// Initialize the Intent Dispatcher
 pub fn init() void {
@@ -253,15 +330,31 @@ pub fn init() void {
     allowed_intents = 0;
     denied_intents = 0;
     blocked_intents = 0;
+    suspicious_intents = 0;
 
     for (&caller_intent_count) |*c| c.* = 0;
     for (&caller_intent_window_start) |*s| s.* = 0;
 
-    hal.Serial.puts("[INTENT] Intent Dispatcher initialized (v1.1.0)\n");
+    // Initialize Firewall instances
+    for (&firewall_owner) |*o| o.* = 0xFFFFFFFF; // Invalid caller
+    firewall_count = 0;
+
+    // Initialize global fallback firewall
+    global_firewall = poler.PolerFirewall.init(1);
+    global_firewall_initialized = true;
+
+    hal.Serial.puts("[INTENT] Intent Dispatcher initialized (v1.1.0 + Firewall)\n");
 }
 
-/// Dispatch an Intent through the authorization pipeline.
+/// Dispatch an Intent through the 5-phase authorization pipeline.
 /// This is the MAIN entry point for all I/O operations in POLER-OS v1.1.0.
+///
+/// Phases:
+///   1.  PND v8 nonce verification (tamper detection)
+///   1b. POLER Firewall semantic evaluation (SipHash PRF + cognitive cycle)
+///   2.  Rate limiting (DoS prevention)
+///   3.  Process-level capability check
+///   4.  Per-handle access_mask verification
 ///
 /// Returns:
 ///   .Allowed — the intent is authorized, proceed with the operation
@@ -271,16 +364,68 @@ pub fn init() void {
 pub fn dispatch(intent: *const Intent) IntentVerdict {
     total_intents += 1;
 
-    // ── Phase 1: POLER Firewall Tensor Verification ──────────────────────
-    // Use PND v8 to verify the intent's cryptographic nonce.
+    // ── Phase 1: PND v8 Nonce Verification ───────────────────────────────
+    // Use PND v8 tensor algebra to verify the intent's cryptographic nonce.
     // This detects tampering: if any field was modified after create(),
     // the nonce won't match the recomputed value.
+    //
+    // The nonce binds: category + action + caller_id + handle + params[6] + timestamp
+    // into a single u32 via pndMix cascade. Any modification invalidates it.
     const expected_nonce = computeNonce(intent);
     if (intent.nonce != expected_nonce) {
         blocked_intents += 1;
         logIntent(intent, .Blocked);
         hal.Serial.puts("[INTENT] BLOCKED: nonce mismatch (tampered intent?)\n");
         return .Blocked;
+    }
+
+    // ── Phase 1b: POLER Firewall Semantic Evaluation ─────────────────────
+    // Beyond the nonce check, the Firewall provides BEHAVIORAL analysis:
+    //
+    //   SipHash-2-4 PRF: binds process_id + category + resource + access
+    //   into a semantic hash with a SECRET key. An attacker who compromises
+    //   a process cannot forge Intent patterns that bypass the Firewall
+    //   without inverting the PRF (computationally infeasible).
+    //
+    //   Cognitive cycle (℘-O-L-ε-R-Ψ): tracks the behavioral profile of
+    //   each caller. If a process suddenly changes its Intent pattern
+    //   (e.g., FS_READ → NET_SEND), the cognitive state's free energy
+    //   spikes → detected as anomaly → SUSPICIOUS or DENIED.
+    //
+    //   Verdicts:
+    //     .allow      → proceed to Phase 2
+    //     .suspicious → log but allow (throttled, monitored)
+    //     .deny       → block immediately (anomaly threshold exceeded)
+    const fw_ptr: ?*poler.PolerFirewall = getFirewallForCaller(intent.caller_id);
+    const firewall: ?*poler.PolerFirewall = fw_ptr orelse
+        (if (global_firewall_initialized) &global_firewall else null);
+
+    if (firewall) |fw| {
+        const fw_request = poler.FirewallRequest{
+            .process_id = intent.caller_id,
+            .category = intentCategoryToSyscallCategory(intent.category),
+            .resource_hash = computeResourceHash(intent),
+            .access_flags = intentActionToFirewallAccess(intent.action),
+            .timestamp = @truncate(intent.timestamp),
+        };
+        const fw_verdict = fw.evaluate(&fw_request);
+        switch (fw_verdict) {
+            .deny => {
+                denied_intents += 1;
+                logIntent(intent, .Blocked);
+                hal.Serial.puts("[INTENT] BLOCKED: Firewall semantic deny (anomaly detected)\n");
+                return .Blocked;
+            },
+            .suspicious => {
+                // Allow but flag — increase monitoring
+                suspicious_intents += 1;
+                hal.Serial.puts("[INTENT] SUSPICIOUS: Firewall anomaly score elevated\n");
+                // Don't block — proceed with extra logging
+            },
+            .allow => {
+                // Normal behavior — proceed
+            },
+        }
     }
 
     // ── Phase 2: Rate Limiting ───────────────────────────────────────────
@@ -433,6 +578,25 @@ fn computeNonce(intent: *const Intent) u32 {
     return n;
 }
 
+/// Compute a resource hash for the Intent — used by the Firewall to
+/// identify the target resource across multiple Intent evaluations.
+/// This enables the cognitive cycle to detect when a process suddenly
+/// accesses a completely different resource (anomaly signal).
+///
+/// The hash is derived from: category + handle + params[0:2] (which
+/// typically contain the resource identifier — fd, address, path_ptr).
+fn computeResourceHash(intent: *const Intent) u32 {
+    const a: u32 = (@as(u32, @intFromEnum(intent.category)) << 24) |
+                   (intent.handle & 0x00FFFFFF);
+    const p0: u32 = @truncate(intent.params[0]);
+    const p0_hi: u32 = @truncate(intent.params[0] >> 32);
+    const p1: u32 = @truncate(intent.params[1]);
+    const p1_hi: u32 = @truncate(intent.params[1] >> 32);
+    const b: u32 = p0 ^ p0_hi;
+    const c: u32 = p1 ^ p1_hi;
+    return poler.pndMix(a, b, c);
+}
+
 // ============================================================================
 // Capability Mapping — IntentCategory → process capability bits
 // ============================================================================
@@ -543,12 +707,13 @@ fn logIntent(intent: *const Intent, verdict: IntentVerdict) void {
 }
 
 /// Get statistics about intent dispatching
-pub fn getStats() struct { total: u64, allowed: u64, denied: u64, blocked: u64 } {
+pub fn getStats() struct { total: u64, allowed: u64, denied: u64, blocked: u64, suspicious: u64 } {
     return .{
         .total = total_intents,
         .allowed = allowed_intents,
         .denied = denied_intents,
         .blocked = blocked_intents,
+        .suspicious = suspicious_intents,
     };
 }
 
@@ -562,6 +727,8 @@ pub fn printStats() void {
     hal.Serial.putDecimal(denied_intents);
     hal.Serial.puts(" blocked=");
     hal.Serial.putDecimal(blocked_intents);
+    hal.Serial.puts(" suspicious=");
+    hal.Serial.putDecimal(suspicious_intents);
     hal.Serial.puts("\n");
 }
 

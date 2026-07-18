@@ -1,5 +1,5 @@
 // ============================================================================
-// POLER-OS v0.8.0 — 64-bit x86_64 Dual-Personality OS Kernel
+// POLER-OS v0.9.0 — 64-bit x86_64 Semantic Security Kernel
 // ============================================================================
 //
 // Эволюция:
@@ -11,6 +11,11 @@
 //           Both APIs are first-class, neither is a translation layer.
 //           Object Manager provides unified namespace.
 //           Syscall dispatcher routes to NT/POSIX/POLER handlers.
+//   v0.9.0: Semantic Security — Intent Layer + POLER Firewall integration
+//           5-phase Intent dispatch: nonce → Firewall → rate limit → cap → handle
+//           .so integrity verification (SHA-256)
+//           Per-caller Firewall instances (SipHash PRF + cognitive cycle)
+//           Per-process handle tables (Zircon-style Object Table)
 // ============================================================================
 
 const hal = @import("hal.zig");
@@ -715,12 +720,12 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     // 9. Ready!
     vga_setcolor(0x0B);
     puts("\n╔══════════════════════════════════════════════════════╗\n");
-    puts("║     POLER-OS v0.8.0 — DUAL-PERSONALITY KERNEL       ║\n");
-    puts("║   NT API + POSIX — Neither is a crutch. Both native. ║\n");
+    puts("║     POLER-OS v0.9.0 — SEMANTIC SECURITY KERNEL      ║\n");
+    puts("║   Intent + Firewall + Capabilities — Zero Trust I/O  ║\n");
     puts("╚══════════════════════════════════════════════════════╝\n");
     vga_setcolor(0x07);
 
-    puts("\nNext steps: Memory Manager (PMM/VMM) → Process Service → Intent Layer\n");
+    puts("\nNext steps: Shell pipes → text editor → self-hosting Zig compiler\n");
     puts("Timer: APIC periodic, tick count will increment in idle loop\n");
 
     // 8.5a. Initialize Dual-Personality Subsystem Dispatcher

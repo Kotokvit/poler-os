@@ -1345,7 +1345,7 @@ pub const PolerCognitiveState = struct {
         self.history_sum -= self.history[self.history_idx];
         self.history[self.history_idx] = energized;
         self.history_sum += energized;
-        self.history_idx = (self.history_idx + 1) % RING_SIZE;
+        self.history_idx = @intCast((@as(usize, self.history_idx) + 1) % RING_SIZE);
 
         return self.resonance;
     }
