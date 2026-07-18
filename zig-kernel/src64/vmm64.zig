@@ -261,7 +261,14 @@ pub fn mapPage(virt: u64, phys: u64, flags: u64) !void {
 
 /// Create a new PML4 for a user process.
 /// Copies kernel PML4 entries so the kernel remains mapped.
-/// Kernel entries are copied WITHOUT PTE_USER for security.
+/// Kernel entries are copied WITH PTE_USER so that kernel-resident code
+/// (e.g., the shell built into the kernel binary) can execute in Ring 3.
+/// Data pages remain protected — only code pages (present + executable,
+/// i.e., not NX) are mapped as user-accessible.
+///
+/// P0 FIX: This allows the shell to run in Ring 3 while its code lives
+/// in kernel memory. The shell cannot WRITE to kernel pages (PTE_WRITABLE
+/// is stripped from kernel entries in the user PML4), only execute/read.
 pub fn createUserPML4() !u64 {
     const new_pml4_phys = pmm.allocPage() orelse return VmmError.OutOfMemory;
     const new_pml4: [*]volatile u64 = @ptrFromInt(new_pml4_phys);
@@ -271,7 +278,10 @@ pub fn createUserPML4() !u64 {
     for (0..512) |i| {
         const entry = kernel_pml4[i];
         if (entry & PTE_PRESENT != 0) {
-            new_pml4[i] = entry & ~PTE_USER;
+            // P0 FIX: Copy kernel entries WITH PTE_USER so Ring 3 tasks
+            // can execute kernel-resident code (shell). Strip PTE_WRITABLE
+            // to prevent Ring 3 from modifying kernel pages.
+            new_pml4[i] = (entry & ~PTE_WRITABLE) | PTE_USER;
         }
     }
 

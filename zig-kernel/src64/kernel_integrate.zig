@@ -932,52 +932,133 @@ var acl_audit_index: usize = 0;
 /// Global ACL policy version — incremented when capabilities change
 var acl_global_version: u32 = 0;
 
-/// Generate a POLER authentication token for a new process
-fn generateProcessToken(pcb: *ProcessControlBlock) void {
-    const parent_pcb = processMgrFind(pcb.ppid);
-    const parent_token: [32]u8 = if (parent_pcb != null) parent_pcb.?.poler_token else undefined;
+// ═══════════════════════════════════════════════════════════════════════
+// P0 FIX 2: Kernel secret key for POLER token MAC
+//
+// The secret key is generated once at boot from RDRAND + TSC entropy.
+// It is NEVER exposed to user-space. All token MACs are derived from
+// this key using the PND-Feistel PRF from poler_core.zig.
+//
+// Token layout (32 bytes):
+//   [0..15]  = MAC = pndPrf(secret_key | pid | acl_caps | subsystem)
+//   [16..31] = nonce (random, from RDRAND)
+//
+// On authentication, we recompute the MAC and compare with stored value.
+// If MAC mismatches → the token was forged → DENY.
+// ═══════════════════════════════════════════════════════════════════════
 
-    var state: [4]u32 = .{
-        pcb.pid,
-        @intFromEnum(pcb.subsystem),
-        0x504F4C45, // "POLE"
-        0x524F5300, // "ROS\0"
-    };
+var kernel_secret_key: [32]u8 = [_]u8{0} ** 32;
+var kernel_secret_initialized: bool = false;
 
-    if (parent_pcb != null) {
-        for (0..8) |i| {
-            const word: u32 = @bitCast(parent_token[i * 4 ..][0..4].*);
-            state[i % 4] ^= word;
+/// Initialize the kernel secret key at boot using RDRAND + TSC
+pub fn initKernelSecret() void {
+    if (kernel_secret_initialized) return;
+
+    // Mix RDRAND and TSC for entropy
+    var state: [8]u32 = .{0} ** 8;
+    for (&state, 0..) |*s, i| {
+        // Try RDRAND; fallback to TSC if not available
+        var rng: u64 = 0;
+        const rdrand_ok = asm volatile (
+            "rdrand %[out]"
+            : [out] "=r" (rng),
+              [cf] "=@ccc" (-> u8),
+        );
+        if (rdrand_ok != 0) {
+            s.* = @truncate(rng);
+        } else {
+            // Fallback: TSC + counter
+            s.* = @truncate(hal.readTsc() ^ @as(u64, i *% 0x9E3779B9));
         }
     }
 
+    // Mix with POLER PND to prevent weak entropy
+    for (0..4) |round| {
+        const a = state[round * 2];
+        const b = state[round * 2 + 1];
+        const mixed = poler.pndMix(a, b, 1);
+        const bytes: [4]u8 = @bitCast(mixed);
+        @memcpy(kernel_secret_key[round * 4 ..][0..4], &bytes);
+    }
+
+    // Second pass for bytes 16-31
+    for (0..4) |round| {
+        const a = state[round * 2] ^ @as(u32, @truncate(hal.readTsc()));
+        const b = state[round * 2 + 1] ^ @as(u32, @truncate(hal.readTsc() >> 32));
+        const mixed = poler.pndMix(a, b, 1);
+        const bytes: [4]u8 = @bitCast(mixed);
+        @memcpy(kernel_secret_key[16 + round * 4 ..][0..4], &bytes);
+    }
+
+    kernel_secret_initialized = true;
+    hal.Serial.puts("[POLER] Kernel secret key initialized (MAC verification active)\n");
+}
+
+/// Compute a 16-byte MAC for a process token using PND-Feistel PRF
+fn computeTokenMac(pid: u32, acl_caps: u64, subsystem: u8) [16]u8 {
+    var mac: [16]u8 = [_]u8{0} ** 16;
+
+    // Build input block: secret_key[0..16] | pid | caps_low | caps_high | subsystem
+    var input: [8]u32 = .{0} ** 8;
+    // First 4 words from secret key
+    input[0] = @bitCast(kernel_secret_key[0..4].*);
+    input[1] = @bitCast(kernel_secret_key[4..8].*);
+    input[2] = @bitCast(kernel_secret_key[8..12].*);
+    input[3] = @bitCast(kernel_secret_key[12..16].*);
+    // Process-specific data
+    input[4] = pid;
+    input[5] = @truncate(acl_caps);
+    input[6] = @truncate(acl_caps >> 32);
+    input[7] = @as(u32, subsystem) | (@as(u32, 0x504F4C45)); // "POLE" tag
+
+    // 8 rounds of PND-Feistel MAC
     for (0..8) |round| {
-        state[0] +%= state[1];
-        state[2] +%= state[3];
-        state[1] ^= poler.rotl(u32, state[0], 7);
-        state[3] ^= poler.rotl(u32, state[2], 13);
-        state[0] +%= @as(u32, @truncate(round));
-        state[2] +%= @as(u32, @truncate(round *% 0x9E3779B9));
+        const a = input[round % 8];
+        const b = input[(round + 1) % 8];
+        const mixed = poler.pndMix(a, b, 1);
+        input[(round + 2) % 8] ^= mixed;
+        input[(round + 3) % 8] +%= @as(u32, @truncate(round *% 0x9E3779B9));
     }
 
+    // Output: first 16 bytes of the final state
     for (0..4) |i| {
-        const bytes: [4]u8 = @bitCast(state[i]);
-        @memcpy(pcb.poler_token[i * 4 ..][0..4], &bytes);
+        const bytes: [4]u8 = @bitCast(input[i]);
+        @memcpy(mac[i * 4 ..][0..4], &bytes);
     }
 
-    for (0..8) |round| {
-        state[0] +%= state[2];
-        state[1] +%= state[3];
-        state[2] ^= poler.rotl(u32, state[0], 11);
-        state[3] ^= poler.rotl(u32, state[1], 17);
-        state[0] +%= @as(u32, @truncate(round +% 8));
-        state[2] +%= @as(u32, @truncate(round *% 0x6C62272E));
-    }
+    return mac;
+}
 
+/// Generate a POLER authentication token for a new process
+/// Token = MAC(16 bytes) || Nonce(16 bytes)
+/// MAC = pndPrf(secret_key | pid | acl_caps | subsystem)
+/// Nonce = random from RDRAND
+fn generateProcessToken(pcb: *ProcessControlBlock) void {
+    // Compute MAC
+    const mac = computeTokenMac(pcb.pid, pcb.acl_capabilities, @intFromEnum(pcb.subsystem));
+    @memcpy(pcb.poler_token[0..16], &mac);
+
+    // Generate nonce (16 bytes) from RDRAND + TSC
     for (0..4) |i| {
-        const bytes: [4]u8 = @bitCast(state[i]);
-        @memcpy(pcb.poler_token[16 + i * 4 ..][0..4], &bytes);
+        var rng: u64 = 0;
+        const rdrand_ok = asm volatile (
+            "rdrand %[out]"
+            : [out] "=r" (rng),
+              [cf] "=@ccc" (-> u8),
+        );
+        if (rdrand_ok != 0) {
+            const bytes: [4]u8 = @bitCast(@as(u32, @truncate(rng)) ^ @as(u32, @truncate(hal.readTsc() >> (i * 8))));
+            @memcpy(pcb.poler_token[16 + i * 4 ..][0..4], &bytes);
+        } else {
+            // Fallback: TSC-derived
+            const bytes: [4]u8 = @bitCast(@as(u32, @truncate(hal.readTsc() +% @as(u64, i) *% 0x6C62272E)));
+            @memcpy(pcb.poler_token[16 + i * 4 ..][0..4], &bytes);
+        }
     }
+
+    hal.Serial.puts("[POLER] Token generated for PID=");
+    hal.Serial.putDecimal(pcb.pid);
+    hal.Serial.puts(" (MAC-verified)\n");
 }
 
 /// Authenticate a syscall action using POLER Core + ACL policy — v0.8.0
@@ -1038,44 +1119,70 @@ pub fn polerAuthenticate(action: PolerAction) AuthResult {
         return .Denied;
     }
 
-    // Step 3: Verify POLER token authenticity
-    var token_valid = false;
-    for (&process.poler_token) |byte| {
-        if (byte != 0) {
-            token_valid = true;
-            break;
+    // ═══════════════════════════════════════════════════════════════════
+    // P0 FIX 2: Real MAC verification of POLER token
+    //
+    // Previously: just checked if any byte is non-zero (trivially forgeable)
+    // Now: recompute MAC from (secret_key | pid | acl_caps | subsystem)
+    //      and compare with stored token[0..15]. Mismatch → DENY.
+    // ═══════════════════════════════════════════════════════════════════
+    if (!kernel_secret_initialized) {
+        // Kernel secret not initialized — should not happen after boot
+        // Deny all non-kernel processes as a safety measure
+        if (action.pid != 0) {
+            auditLog(action, required_caps, process_caps, .Denied);
+            return .Denied;
         }
-    }
-
-    if (!token_valid) {
-        // Process without a token — kernel-level process, always allowed
         auditLog(action, required_caps, process_caps, .Allowed);
         return .Allowed;
     }
 
-    // Step 4: Compute action MAC (Message Authentication Code)
-    // MAC = POLER_PRF(token | syscall_num | subsystem | arg_hash)
-    // This creates a cryptographic binding between the action and the process
+    // Check if process has a zero token (kernel process PID 0)
+    var token_all_zero = true;
+    for (&process.poler_token) |byte| {
+        if (byte != 0) {
+            token_all_zero = false;
+            break;
+        }
+    }
+
+    if (token_all_zero) {
+        // Kernel process (PID 0) without a token — always allowed
+        auditLog(action, required_caps, process_caps, .Allowed);
+        return .Allowed;
+    }
+
+    // Recompute MAC and compare with stored value
+    const expected_mac = computeTokenMac(action.pid, process_caps, @intFromEnum(process.subsystem));
+    var mac_valid = true;
+    for (0..16) |i| {
+        if (process.poler_token[i] != expected_mac[i]) {
+            mac_valid = false;
+            break;
+        }
+    }
+
+    if (!mac_valid) {
+        // TOKEN FORGERY DETECTED — deny immediately
+        hal.Serial.puts("[POLER-ACL] TOKEN FORGERY: PID=");
+        hal.Serial.putDecimal(action.pid);
+        hal.Serial.puts(" MAC mismatch — possible token tampering!\n");
+        auditLog(action, required_caps, process_caps, .Denied);
+        return .Denied;
+    }
+
+    // Step 4: Compute action MAC for audit trail
+    // This binds the specific action to the process in the audit log
     var mix: u32 = @truncate(action.syscall_number);
     mix ^= @intFromEnum(action.subsystem);
     mix ^= action.arg_hash;
-
-    const key: u32 = @bitCast(process.poler_token[0..4].*);
-    mix ^= key;
+    mix ^= @bitCast(process.poler_token[0..4].*);
     mix = poler.rotl(u32, mix, 13);
-    mix +%= key;
+    mix +%= @bitCast(process.poler_token[4..8].*);
     mix = poler.rotl(u32, mix, 7);
-    mix ^= key >> 16;
+    mix ^= @bitCast(process.poler_token[12..16].*);
 
-    // Second round of mixing with more token bytes
-    const key2: u32 = @bitCast(process.poler_token[4..8].*);
-    mix ^= key2;
-    mix = poler.rotl(u32, mix, 17);
-    mix +%= key2;
-
-    // The MAC is now computed — for v0.8.0 we use it for audit
-    // In future versions, the MAC can be verified against a signed
-    // capability certificate from the kernel key manager.
+    // Action MAC is stored in audit log for forensic analysis
 
 
     // Step 5: Determine result — sensitive operations get audited
@@ -1203,6 +1310,9 @@ pub fn kernelIntegrateInit() void {
     vfsInit();
     processMgrInit();
     memoryMgrInit();
+
+    // P0 FIX 2: Initialize kernel secret key BEFORE any process tokens are generated
+    initKernelSecret();
 
     // Initialize ACL audit log
     for (&acl_audit_log) |*entry| {

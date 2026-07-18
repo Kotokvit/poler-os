@@ -33,6 +33,7 @@ const syscall_int = @import("syscall_integration.zig");
 const ki = @import("kernel_integrate.zig");
 const cap = @import("capability.zig");
 const policy = @import("policy_engine.zig");
+const iommu = @import("iommu.zig");
 const ipc = @import("ipc.zig");
 const ai_capsule = @import("ai_capsule.zig");
 
@@ -527,6 +528,10 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     puts("[BOOT] Initializing ACPI...\n");
     acpi.init();
 
+    // P0 FIX 4: Initialize IOMMU (VT-d) — detects DMAR table via ACPI
+    puts("[BOOT] Initializing IOMMU (VT-d)...\n");
+    iommu.init();
+
     // 6. CPU detection
     puts("[BOOT] Detecting CPU...\n");
     const cpu = detectCPU();
@@ -635,6 +640,20 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
         puts("[VIRTIO-BLK] No virtio-blk device found (expected with -drive)\n");
     }
 
+    // P0 FIX 4: Enable IOMMU after virtio_blk DMA mappings are set up
+    // VT-d protects against DMA attacks — without it, a compromised device
+    // can read/write any physical address including kernel memory.
+    // QEMU: -machine q35 -device intel-iommu,intremap=on
+    if (iommu.isAvailable()) {
+        if (iommu.enable()) {
+            puts("[IOMMU] VT-d DMA protection ENABLED\n");
+        } else {
+            puts("[IOMMU] VT-d enable FAILED — DMA unprotected!\n");
+        }
+    } else {
+        puts("[IOMMU] VT-d not available — DMA identity mapping fallback\n");
+    }
+
     // 8.7. Initialize and parse Initrd/CPIO modules
     puts("[BOOT] Checking for initrd modules...\n");
     const mb_parser = multiboot2.Parser.init(multiboot_info);
@@ -734,12 +753,48 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     scheduler.init();
     puts("[BOOT] Scheduler initialized\n");
 
-    // Create two test tasks (which will run in Ring 3 / User space)
-    _ = scheduler.createTask(@intFromPtr(&task1)) catch |err| {
-        puts("[SCHED] Failed to create task1 (shell): ");
+    // ═══════════════════════════════════════════════════════════════════════
+    // P0 FIX 1: Shell runs in Ring 3 (user mode) via processMgrCreateProcess
+    //
+    // Previously: scheduler.createTask() → Ring 0 (kernel mode)
+    // Now: processMgrCreateProcess() → Ring 3 with own CR3, stack, caps
+    //
+    // This prevents shell bugs from corrupting kernel memory, page tables,
+    // or device registers. Shell uses syscalls for all I/O.
+    // ═══════════════════════════════════════════════════════════════════════
+    const shell_pid = ki.processMgrCreateProcess(0, .POSIX, @intFromPtr(&task1)) catch |err| {
+        puts("[SCHED] Failed to create shell (Ring 3): ");
         puts(@errorName(err));
         puts("\n");
     };
+    if (shell_pid != null) {
+        puts("[BOOT] Shell running in Ring 3 (PID=");
+        // Print PID as decimal
+        var pid_val = shell_pid.?;
+        var pid_buf: [8]u8 = undefined;
+        var pid_len: usize = 0;
+        if (pid_val == 0) {
+            pid_buf[0] = '0';
+            pid_len = 1;
+        } else {
+            var temp_buf: [8]u8 = undefined;
+            var temp_len: usize = 0;
+            while (pid_val > 0) {
+                temp_buf[temp_len] = '0' + @as(u8, @intCast(pid_val % 10));
+                pid_val /= 10;
+                temp_len += 1;
+            }
+            while (temp_len > 0) {
+                temp_len -= 1;
+                pid_buf[pid_len] = temp_buf[temp_len];
+                pid_len += 1;
+            }
+        }
+        puts(pid_buf[0..pid_len]);
+        puts(")\n");
+    }
+
+    // Background worker stays in Ring 0 (kernel task) — non-interactive
     _ = scheduler.createTask(@intFromPtr(&task2)) catch |err| {
         puts("[SCHED] Failed to create task2 (bg worker): ");
         puts(@errorName(err));
@@ -768,38 +823,44 @@ fn sys_print(str: []const u8) void {
 }
 
 fn task1() noreturn {
-    // v1.2.0: Kernel tasks must NOT use syscalls (SYSCALL/SYSRET assumes Ring 3 → Ring 0
-    // transition). Kernel tasks run in Ring 0, so we call kernel functions directly.
-    // All shell I/O uses hal.Serial.puts() and hal.Serial.readChar().
-    hal.Serial.puts("\n=== POLER-OS v0.8.0 Interactive Shell ===\n");
-    hal.Serial.puts("Type 'help' for commands.\n\n");
-    
+    // ═══════════════════════════════════════════════════════════════════════
+    // P0 FIX 1: Shell now runs in Ring 3 (user mode).
+    // All I/O must go through syscalls — direct kernel access is forbidden.
+    //
+    // Syscall convention:
+    //   syscall 1 (LEGACY_PRINT): RDI=ptr, RSI=len → print string
+    //   syscall 6 (LEGACY_READ_SERIAL): → return char or 0
+    // ═══════════════════════════════════════════════════════════════════════
+    const banner = "\n=== POLER-OS v0.8.0 Interactive Shell (Ring 3) ===\n";
+    sys_print(banner);
+    sys_print("Type 'help' for commands.\n\n");
+
     var buf: [128]u8 = undefined;
     var len: usize = 0;
-    
-    hal.Serial.puts("poler> ");
-    
+
+    sys_print("poler> ");
+
     while (true) {
-        const ch = hal.Serial.readChar();
+        const ch = sys_read_serial();
         if (ch != 0) {
             if (ch == '\n' or ch == '\r') {
-                hal.Serial.puts("\n");
+                sys_print("\n");
                 if (len > 0) {
                     const cmd = buf[0..len];
                     execute_command(cmd);
                     len = 0;
                 }
-                hal.Serial.puts("poler> ");
+                sys_print("poler> ");
             } else if (ch == '\x08' or ch == '\x7F') {
                 if (len > 0) {
                     len -= 1;
-                    hal.Serial.puts("\x08 \x08");
+                    sys_print("\x08 \x08");
                 }
             } else if (len < buf.len - 1) {
                 buf[len] = ch;
                 len += 1;
                 const ech = [1]u8{ch};
-                hal.Serial.puts(&ech);
+                sys_print(&ech);
             }
         } else {
             // Yield CPU

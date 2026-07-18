@@ -694,6 +694,11 @@ fn ntReadFile(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_st
     const obj = objmgr_ref.?.lookupHandle(handle) orelse return STATUS_INVALID_HANDLE;
     if (obj.obj_type != .File) return STATUS_INVALID_HANDLE;
 
+    // P0 FIX 3: Verify access_mask before reading
+    if (!objmgr_ref.?.checkHandleAccess(@intCast(handle), objmgr.ACCESS_READ)) {
+        return STATUS_ACCESS_DENIED;
+    }
+
     hal.Serial.puts("[NT] NtReadFile: handle=");
     hal.Serial.putHex(handle);
     hal.Serial.puts("\n");
@@ -712,6 +717,11 @@ fn ntWriteFile(handle: u64, event: u64, apc_routine: u64, apc_context: u64, io_s
 
     const obj = objmgr_ref.?.lookupHandle(handle) orelse return STATUS_INVALID_HANDLE;
     if (obj.obj_type != .File) return STATUS_INVALID_HANDLE;
+
+    // P0 FIX 3: Verify access_mask before writing
+    if (!objmgr_ref.?.checkHandleAccess(@intCast(handle), objmgr.ACCESS_WRITE)) {
+        return STATUS_ACCESS_DENIED;
+    }
 
     hal.Serial.puts("[NT] NtWriteFile: handle=");
     hal.Serial.putHex(handle);

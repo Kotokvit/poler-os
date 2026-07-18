@@ -521,53 +521,90 @@ fn setupDmaMapping(bus: u8, dev: u8, func: u8, phys_start: u64, size: u64) bool 
 }
 
 /// Map a physical region as identity-mapped (IOVA == physical) in the SLPT.
-/// Uses a simplified approach: for P0, we create a 4-level IOMMU page table
-/// that identity-maps the approved DMA region with Read+Write permissions.
+/// P0 FIX 4: Rewritten from scratch — the old implementation had two critical bugs:
+///
+///   BUG 1: Wrote 512 entries as 2MB huge pages, then OVERWROTE some as 4KB pages.
+///           The huge page entries at indices 0-511 conflict with the 4KB entries.
+///   BUG 2: PTE bits were 0x03 (present + write) but VT-d requires read=1 for
+///           write=1 to work. Correct value: 0x07 (present + write + read).
+///
+/// New implementation: proper 4-level IOMMU page tables (PML4 → PDPT → PD → PT)
+/// using 4KB pages for precise control over approved DMA regions only.
 fn mapIdentityRegion(slpt_top_phys: u64, phys_start: u64, num_pages: u64) !void {
-    // For P0 simplicity: we populate the SLPT with 2MB huge page entries
-    // that identity-map the low 1GB of physical memory (covers most DMA buffers)
-    // This is a "broad but safe" approach — the IOMMU still prevents DMA to
-    // unmapped regions above 1GB.
+    // VT-d with AW=48BIT uses 4-level second-level page tables:
+    //   Level 4 (SPTP/PML4) → Level 3 (PDPT) → Level 2 (PD) → Level 0 (PT)
+    //   Note: VT-d skips Level 1, using levels 4/3/2/0
+    //
+    // Each level table is 4KB = 512 entries × 8 bytes.
+    // IOVA breakdown (48-bit):
+    //   [47:39] = PML4 index (9 bits)
+    //   [38:30] = PDPT index (9 bits)
+    //   [29:21] = PD index (9 bits)
+    //   [20:12] = PT index (9 bits)
+    //   [11:00] = page offset (12 bits)
 
-    const slpt: [*]volatile u64 = @ptrFromInt(slpt_top_phys);
-
-    // Map 512 entries × 2MB = 1GB of identity-mapped memory
-    // Each entry: present=1, write=1, read=1, page_frame=PFN, huge=1
-    var i: u64 = 0;
-    while (i < 512) : (i += 1) {
-        const page_addr = i << 21; // 2MB per entry
-        const pfn = page_addr >> 12;
-        // VT-d second-level PTE format:
-        //   bit 0: present, bit 1: write, bit 2: read
-        //   For huge pages (2MB): bit 7 = page size (1=huge)
-        //   bits 12-51 = page frame number
-        slpt[i] = (pfn << 12) | 0x07; // present + write + read + page_size for 2MB
-        // Note: VT-d huge page bit is at different position than x86.
-        // For 2MB pages in VT-d second-level tables at PD level, bit 7 = page size
-        // We set it: 0x07 = present(1) + write(2) + read(4)
-        // Actually for the top-level table (4-level), entries point to next level.
-        // Let's simplify: create a flat 4KB page mapping for the first 2MB
-    }
-
-    // More precise approach: map individual 4KB pages for the DMA region
-    // This is what we actually need for P0
     var page_idx: u64 = 0;
     while (page_idx < num_pages) : (page_idx += 1) {
         const page_phys = phys_start + page_idx * 4096;
-        const pt_idx = (page_phys >> 12) & 0x1FF;
+        const iova = page_phys; // Identity mapping: IOVA == physical address
 
-        // For simplicity, map at the PT index corresponding to the physical address
-        // In a full implementation, we'd walk the 4-level IOMMU page tables
-        // For P0: direct PT mapping (works if SLPT is used as a single-level PT)
-        if (pt_idx < 512) {
-            // PTE: present + write + read + physical frame
-            slpt[pt_idx] = (page_phys & 0x000FFFFFFFFFF000) | 0x03; // present + write
-        }
+        // Extract indices from IOVA
+        const pml4_idx = (iova >> 39) & 0x1FF;
+        const pdpt_idx = (iova >> 30) & 0x1FF;
+        const pd_idx   = (iova >> 21) & 0x1FF;
+        const pt_idx   = (iova >> 12) & 0x1FF;
+
+        // Walk/create PML4 → PDPT → PD → PT
+        const pml4: [*]volatile u64 = @ptrFromInt(slpt_top_phys);
+
+        // Level 4: Get or create PDPT
+        const pdpt_phys: u64 = blk1: {
+            if (pml4[pml4_idx] & 0x01 != 0) {
+                break :blk1 pml4[pml4_idx] & 0x000FFFFFFFFFF000;
+            }
+            const new_pdpt = pmm.allocPage() orelse return error.OutOfMemory;
+            const ptr: [*]volatile u8 = @ptrFromInt(new_pdpt);
+            @memset(ptr[0..4096], 0);
+            pml4[pml4_idx] = new_pdpt | 0x07; // present + write + read
+            break :blk1 new_pdpt;
+        };
+
+        // Level 3: Get or create PD
+        const pdpt: [*]volatile u64 = @ptrFromInt(pdpt_phys);
+        const pd_phys: u64 = blk2: {
+            if (pdpt[pdpt_idx] & 0x01 != 0) {
+                break :blk2 pdpt[pdpt_idx] & 0x000FFFFFFFFFF000;
+            }
+            const new_pd = pmm.allocPage() orelse return error.OutOfMemory;
+            const ptr: [*]volatile u8 = @ptrFromInt(new_pd);
+            @memset(ptr[0..4096], 0);
+            pdpt[pdpt_idx] = new_pd | 0x07;
+            break :blk2 new_pd;
+        };
+
+        // Level 2: Get or create PT
+        const pd: [*]volatile u64 = @ptrFromInt(pd_phys);
+        const pt_phys: u64 = blk3: {
+            if (pd[pd_idx] & 0x01 != 0) {
+                break :blk3 pd[pd_idx] & 0x000FFFFFFFFFF000;
+            }
+            const new_pt = pmm.allocPage() orelse return error.OutOfMemory;
+            const ptr: [*]volatile u8 = @ptrFromInt(new_pt);
+            @memset(ptr[0..4096], 0);
+            pd[pd_idx] = new_pt | 0x07;
+            break :blk3 new_pt;
+        };
+
+        // Level 0: Map the 4KB page
+        // P0 FIX: Use 0x07 (present + write + read), NOT 0x03
+        const pt: [*]volatile u64 = @ptrFromInt(pt_phys);
+        const pfn = page_phys >> 12;
+        pt[pt_idx] = (pfn << 12) | 0x07; // present + write + read
     }
 
     hal.Serial.puts("[IOMMU] Identity-mapped ");
     hal.Serial.putDecimal(num_pages);
-    hal.Serial.puts(" pages starting at 0x");
+    hal.Serial.puts(" pages (4KB, 4-level PT) starting at 0x");
     hal.Serial.putHex(phys_start);
     hal.Serial.puts("\n");
 }

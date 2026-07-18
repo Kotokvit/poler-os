@@ -649,6 +649,15 @@ fn posixRead(fd: i32, buf_addr: u64, count: u64) i64 {
     const entry = fd_table.getFd(fd) orelse return -@as(i64, subsys.EBADF);
     if (entry.flags & 3 == O_WRONLY) return -@as(i64, subsys.EBADF); // Not open for reading
 
+    // P0 FIX 3: Verify access_mask before reading
+    if (entry.obj_handle != 0) {
+        if (objmgr_ref) |om| {
+            if (!om.checkHandleAccess(@intCast(entry.obj_handle), objmgr.ACCESS_READ)) {
+                return -@as(i64, subsys.EACCES); // Access denied — no READ permission
+            }
+        }
+    }
+
     // Route through VFS if the handle has a VFS file descriptor
     if (entry.object_data != 0) {
         const vfs_fd: usize = @intCast(entry.object_data);
@@ -681,6 +690,15 @@ fn posixWrite(fd: i32, buf_addr: u64, count: u64) i64 {
 
     const entry = fd_table.getFd(fd) orelse return -@as(i64, subsys.EBADF);
     if (entry.flags & 3 == O_RDONLY) return -@as(i64, subsys.EBADF); // Not open for writing
+
+    // P0 FIX 3: Verify access_mask before writing
+    if (entry.obj_handle != 0) {
+        if (objmgr_ref) |om| {
+            if (!om.checkHandleAccess(@intCast(entry.obj_handle), objmgr.ACCESS_WRITE)) {
+                return -@as(i64, subsys.EACCES); // Access denied — no WRITE permission
+            }
+        }
+    }
 
     // Route through VFS if the handle has a VFS file descriptor
     if (entry.object_data != 0) {
