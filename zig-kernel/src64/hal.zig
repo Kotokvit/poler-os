@@ -1006,6 +1006,14 @@ pub const IOAPIC = struct {
         write(0x12, 33);
         write(0x13, 0);
         Serial.puts("[IOAPIC] Keyboard redirection configured (IRQ1 -> Vector 33)\n");
+
+        // Redirection table entry for COM1 Serial (IRQ 4) -> Vector 36
+        // IRQ4 maps to I/O APIC redirection entry 4 (registers 0x10 + 2*4 = 0x18)
+        // 0x18: low 32 bits (vector 36, active high, edge triggered)
+        // 0x19: high 32 bits (destination APIC ID 0)
+        write(0x18, 36);
+        write(0x19, 0);
+        Serial.puts("[IOAPIC] Serial COM1 redirection configured (IRQ4 -> Vector 36)\n");
     }
 };
 
@@ -1058,7 +1066,8 @@ pub fn kbd_pop() u8 {
     return ch;
 }
 
-/// Unified key input — checks PS/2 keyboard buffer first, then serial COM1.
+/// Unified key input — checks PS/2 keyboard buffer first, then serial
+/// receive buffer, then polls COM1 directly as a last resort.
 /// Returns 0 if no input is available from either source.
 /// This is the primary input function for the interactive shell
 /// and any kernel-mode code that needs keyboard input.
@@ -1066,8 +1075,21 @@ pub fn readKey() u8 {
     // PS/2 keyboard has priority (direct hardware input)
     const kbd_ch = kbd_pop();
     if (kbd_ch != 0) return kbd_ch;
-    // Fall back to serial port (COM1, e.g. QEMU -serial stdio)
-    return Serial.readChar();
+
+    // Check serial receive buffer (filled by handleSerial ISR)
+    const ser_ch = serial_pop();
+    if (ser_ch != 0) return ser_ch;
+
+    // Last resort: poll COM1 directly (for environments where IRQ4
+    // isn't routed properly, e.g. some QEMU configurations)
+    // This also helps when interrupts are briefly disabled.
+    if ((inb(0x3F8 + 5) & 0x01) != 0) {
+        const ch = inb(0x3F8);
+        if (ch == '\r') return '\n'; // CR -> LF
+        return ch;
+    }
+
+    return 0;
 }
 
 fn kbd_init() void {

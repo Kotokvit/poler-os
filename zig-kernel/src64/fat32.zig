@@ -1333,14 +1333,10 @@ pub const Fat32Fs = struct {
 
                     var match = true;
                     for (0..11) |i| {
-                        if (entry.name[0..8][if (i < 8) i else i - 8] != short_name[i]) {
-                            // Compare case-insensitively for short names
-                            const a = entry.name[0..8][if (i < 8) i else i - 8];
-                            const b = short_name[i];
-                            if (toLower(a) != toLower(b)) {
-                                match = false;
-                                break;
-                            }
+                        const disk_ch: u8 = if (i < 8) entry.name[i] else entry.ext[i - 8];
+                        if (toLower(disk_ch) != toLower(short_name[i])) {
+                            match = false;
+                            break;
                         }
                     }
 

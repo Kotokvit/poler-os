@@ -192,7 +192,7 @@ fn print_banner() void {
     vga_setcolor(0x0B); // Cyan
     puts(
         \\╔══════════════════════════════════════════════════════╗
-        \\║             POLER-OS v0.7.0 (64-bit)                ║
+        \\║             POLER-OS v0.9.1 (64-bit)                ║
         \\║          Semantic Runtime Architecture              ║
         \\║                                                      ║
         \\║   Zig Kernel · VirtIO-BLK · FAT32 · POLER Core     ║
@@ -908,10 +908,12 @@ fn execute_command(cmd: []const u8) void {
         hal.Serial.puts("  rm <f>    - Delete a file\n");
         hal.Serial.puts("  disk      - Show disk info\n");
         hal.Serial.puts("  intents   - Show intent dispatcher stats (v1.1.0)\n");
+        hal.Serial.puts("  format    - Format disk as FAT32\n");
+        hal.Serial.puts("  storage_test - Persistent storage write/read test\n");
     } else if (eq(cmd, "about")) {
-        hal.Serial.puts("POLER-OS v0.8.0 (x86_64 Long Mode)\n");
-        hal.Serial.puts("Cognitive Semantic Runtime Environment.\n");
-        hal.Serial.puts("Dual-personality: NT API + POSIX. Serial input enabled.\n");
+        hal.Serial.puts("POLER-OS v0.9.0 (x86_64 Long Mode)\n");
+        hal.Serial.puts("Semantic Security Kernel — Intent + Firewall + Capabilities.\n");
+        hal.Serial.puts("Dual-personality: NT API + POSIX. Serial + PS/2 keyboard input.\n");
     } else if (eq(cmd, "clear")) {
         clear_screen();
     } else if (eq(cmd, "poler")) {
@@ -936,6 +938,10 @@ fn execute_command(cmd: []const u8) void {
         cmd_write(cmd[6..]);
     } else if (startsWith(cmd, "rm ")) {
         cmd_rm(cmd[3..]);
+    } else if (eq(cmd, "format")) {
+        cmd_format();
+    } else if (eq(cmd, "storage_test")) {
+        cmd_storage_test();
     } else {
         hal.Serial.puts("Unknown command: ");
         hal.Serial.puts(cmd);
@@ -1467,6 +1473,153 @@ fn cmd_rm(filename: []const u8) void {
         hal.Serial.puts(filename);
         hal.Serial.puts(" (not found or is a directory)\n");
     }
+}
+
+fn cmd_format() void {
+    if (!virtio_blk.isInitialized()) {
+        hal.Serial.puts("No disk driver found\n");
+        return;
+    }
+
+    if (virtio_blk.isReadOnly()) {
+        hal.Serial.puts("Device is read-only\n");
+        return;
+    }
+
+    hal.Serial.puts("Formatting disk as FAT32...\n");
+    const capacity = virtio_blk.getCapacityBytes();
+
+    if (fat32.Fat32Fs.format(capacity)) {
+        hal.Serial.puts("Format successful! Remounting...\n");
+        // Re-initialize the FAT32 driver to mount the new filesystem
+        if (fat32.init()) {
+            hal.Serial.puts("FAT32 mounted after format!\n");
+            // Re-initialize VFS mount
+            vfs.initAndMountFat32();
+        } else {
+            hal.Serial.puts("ERROR: Mount failed after format\n");
+        }
+    } else {
+        hal.Serial.puts("Format failed!\n");
+    }
+}
+
+fn cmd_storage_test() void {
+    hal.Serial.puts("=== Persistent Storage Test ===\n");
+
+    const fs = fat32.getFs() orelse {
+        hal.Serial.puts("FAIL: No filesystem mounted\n");
+        hal.Serial.puts("  Run 'format' first to create a FAT32 filesystem.\n");
+        return;
+    };
+
+    // Test 1: Create a file in root directory (simpler path, no nesting)
+    hal.Serial.puts("[Test 1] Creating file 'test.txt' in root...\n");
+    var file: fat32.File = blk: {
+        if (fs.createFile(fs.root_cluster, "test.txt")) |f| {
+            break :blk f;
+        }
+        hal.Serial.puts("  INFO: File may already exist, trying to open...\n");
+        break :blk fs.openFile("test.txt") orelse {
+            hal.Serial.puts("  FAIL: Could not create or open test file\n");
+            return;
+        };
+    };
+
+    // Test 2: Write to the file
+    hal.Serial.puts("[Test 2] Writing test content...\n");
+    const test_content = "POLER-OS storage test OK!";
+    const written = fs.writeFile(&file, test_content);
+    if (written > 0) {
+        hal.Serial.puts("  PASS: Wrote ");
+        putDecimal(written);
+        hal.Serial.puts(" bytes (cluster=");
+        putHex(file.first_cluster);
+        hal.Serial.puts(" size=");
+        putDecimal(file.file_size);
+        hal.Serial.puts(")\n");
+    } else {
+        hal.Serial.puts("  FAIL: Could not write to file\n");
+        return;
+    }
+
+    // Test 3: Read back the file
+    hal.Serial.puts("[Test 3] Reading back 'test.txt'...\n");
+    var read_file = fs.openFile("test.txt") orelse {
+        hal.Serial.puts("  FAIL: Could not reopen file\n");
+        return;
+    };
+
+    hal.Serial.puts("  DEBUG: cluster=");
+    putHex(read_file.first_cluster);
+    hal.Serial.puts(" size=");
+    putDecimal(read_file.file_size);
+    hal.Serial.puts("\n");
+
+    const read_buf_phys = pmm.allocPage() orelse {
+        hal.Serial.puts("  FAIL: Out of memory\n");
+        return;
+    };
+    const read_buf: [*]u8 = @ptrFromInt(@as(usize, @intCast(read_buf_phys)));
+
+    const bytes_read = fs.readFile(&read_file, read_buf[0..256], 256);
+    if (bytes_read > 0) {
+        var match = true;
+        if (bytes_read != test_content.len) {
+            match = false;
+        } else {
+            for (0..bytes_read) |i| {
+                if (read_buf[i] != test_content[i]) {
+                    match = false;
+                    break;
+                }
+            }
+        }
+
+        if (match) {
+            hal.Serial.puts("  PASS: Content verified: \"");
+            hal.Serial.puts(read_buf[0..bytes_read]);
+            hal.Serial.puts("\"\n");
+        } else {
+            hal.Serial.puts("  FAIL: Content mismatch! Got: \"");
+            const show_len = if (bytes_read > 64) @as(usize, 64) else bytes_read;
+            hal.Serial.puts(read_buf[0..show_len]);
+            hal.Serial.puts("\"\n");
+        }
+    } else {
+        hal.Serial.puts("  FAIL: readFile returned 0 bytes\n");
+    }
+
+    pmm.freePage(read_buf_phys);
+
+    // Test 4: Create a directory
+    hal.Serial.puts("[Test 4] Creating directory 'docs'...\n");
+    const dir_cluster = fs.createDir(fs.root_cluster, "docs");
+    if (dir_cluster) |dc| {
+        hal.Serial.puts("  PASS: Directory created (cluster ");
+        putDecimal(dc);
+        hal.Serial.puts(")\n");
+    } else {
+        hal.Serial.puts("  INFO: Directory may already exist (OK)\n");
+    }
+
+    // Test 5: List root directory
+    hal.Serial.puts("[Test 5] Listing root directory...\n");
+    var ctx = LsCtx{ .fs = fs };
+    const count = fs.listDir(fs.root_cluster, &ctx, lsCallback);
+    hal.Serial.puts("  Found ");
+    putDecimal(count);
+    hal.Serial.puts(" entries\n");
+
+    // Test 6: Delete the test file
+    hal.Serial.puts("[Test 6] Deleting 'test.txt'...\n");
+    if (fs.deleteFile("test.txt")) {
+        hal.Serial.puts("  PASS: File deleted successfully\n");
+    } else {
+        hal.Serial.puts("  FAIL: Could not delete test file\n");
+    }
+
+    hal.Serial.puts("=== Storage Test Complete ===\n");
 }
 
 pub fn panic(msg: []const u8, error_return_trace: ?*@import("std").builtin.StackTrace, ret_addr: ?usize) noreturn {
