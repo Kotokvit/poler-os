@@ -160,9 +160,21 @@ pub const ObjectManager = struct {
     }
 
     /// Create a new handle for the given object type
-    /// initial_access_mask: optional ACCESS_MASK bits; defaults to ACCESS_FULL if null
+    /// initial_access_mask: optional ACCESS_MASK bits; if null, maps GENERIC bits
+    /// to type-specific access rights. If ACCESS_FULL is passed, it stays ACCESS_FULL.
+    ///
+    /// GENERIC access mapping (NT-compatible):
+    ///   GENERIC_READ    → type-specific read rights
+    ///   GENERIC_WRITE   → type-specific write rights
+    ///   GENERIC_EXECUTE → type-specific execute rights
+    ///   GENERIC_ALL     → all rights for this type
+    ///
+    /// This ensures handles are created with least-privilege by default,
+    /// preventing the ambient authority problem where every handle grants
+    /// full access regardless of how it was opened.
     pub fn createHandle(self: *Self, obj_type: ObjectType, initial_access_mask: ?u32) u64 {
-        const mask = initial_access_mask orelse ACCESS_FULL;
+        const raw_mask = initial_access_mask orelse ACCESS_FULL;
+        const mask = mapGenericAccess(obj_type, raw_mask);
         self.spinLock();
 
         // Find a free handle slot
@@ -192,6 +204,107 @@ pub const ObjectManager = struct {
 
         self.spinUnlock();
         return INVALID_HANDLE;
+    }
+
+    /// Map GENERIC access rights to type-specific rights.
+    /// This is the NT-compatible GENERIC_MAPPING pattern that converts
+    /// generic access bits (GENERIC_READ/WRITE/EXECUTE/ALL) into
+    /// object-type-specific access bits.
+    ///
+    /// Without this mapping, a file handle opened with GENERIC_READ would
+    /// have bit 0x80000000 set but NOT FILE_READ_DATA (0x00000001),
+    /// causing mediateFileRead() to deny access incorrectly.
+    fn mapGenericAccess(obj_type: ObjectType, access_mask: u32) u32 {
+        var result = access_mask;
+
+        // GENERIC_ALL maps to all type-specific rights
+        if (access_mask & GENERIC_ALL != 0) {
+            result = switch (obj_type) {
+                .File, .Directory => result | FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_EXECUTE | ACCESS_DELETE | ACCESS_READ_ATTRIBUTES | ACCESS_WRITE_ATTRIBUTES | SYNCHRONIZE,
+                .Process => result | PROCESS_TERMINATE | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | ACCESS_DELETE | SYNCHRONIZE,
+                .Device => result | FILE_READ_DATA | FILE_WRITE_DATA | ACCESS_DELETE | SYNCHRONIZE,
+                .Key => result | ACCESS_READ | ACCESS_WRITE | ACCESS_DELETE | ACCESS_READ_ATTRIBUTES | ACCESS_WRITE_ATTRIBUTES,
+                .Event => result | ACCESS_READ | ACCESS_WRITE | SYNCHRONIZE,
+                .Mutant => result | ACCESS_READ | ACCESS_WRITE | SYNCHRONIZE | ACCESS_DELETE,
+                .Semaphore => result | ACCESS_READ | ACCESS_WRITE | SYNCHRONIZE,
+                .Timer => result | ACCESS_READ | ACCESS_WRITE | SYNCHRONIZE,
+                .Section => result | FILE_READ_DATA | FILE_WRITE_DATA | FILE_EXECUTE | ACCESS_READ_ATTRIBUTES,
+                .Token => result | ACCESS_READ | ACCESS_WRITE | ACCESS_DELETE,
+                .Port, .WaitablePort => result | ACCESS_READ | ACCESS_WRITE | SYNCHRONIZE,
+                .IoCompletion => result | ACCESS_READ | ACCESS_WRITE | SYNCHRONIZE,
+                .Job => result | ACCESS_READ | ACCESS_WRITE | ACCESS_DELETE | PROCESS_TERMINATE,
+                .Thread => result | PROCESS_TERMINATE | PROCESS_VM_READ | PROCESS_VM_OPERATION | SYNCHRONIZE,
+                else => result | ACCESS_READ | ACCESS_WRITE,
+            };
+        }
+
+        // GENERIC_READ maps to type-specific read rights
+        if (access_mask & GENERIC_READ != 0) {
+            result = switch (obj_type) {
+                .File, .Directory => result | FILE_READ_DATA | ACCESS_READ_ATTRIBUTES | SYNCHRONIZE,
+                .Process => result | PROCESS_VM_READ | SYNCHRONIZE,
+                .Device => result | FILE_READ_DATA | ACCESS_READ_ATTRIBUTES | SYNCHRONIZE,
+                .Key => result | ACCESS_READ | ACCESS_READ_ATTRIBUTES,
+                .Event => result | ACCESS_READ | SYNCHRONIZE,
+                .Mutant => result | SYNCHRONIZE,
+                .Semaphore => result | ACCESS_READ | SYNCHRONIZE,
+                .Timer => result | ACCESS_READ | SYNCHRONIZE,
+                .Section => result | FILE_READ_DATA | ACCESS_READ_ATTRIBUTES,
+                .Token => result | ACCESS_READ,
+                .Port, .WaitablePort => result | ACCESS_READ | SYNCHRONIZE,
+                .IoCompletion => result | ACCESS_READ,
+                .Job => result | ACCESS_READ,
+                .Thread => result | PROCESS_VM_READ | SYNCHRONIZE,
+                else => result | ACCESS_READ,
+            };
+        }
+
+        // GENERIC_WRITE maps to type-specific write rights
+        if (access_mask & GENERIC_WRITE != 0) {
+            result = switch (obj_type) {
+                .File, .Directory => result | FILE_WRITE_DATA | FILE_APPEND_DATA | ACCESS_WRITE_ATTRIBUTES | SYNCHRONIZE,
+                .Process => result | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | SYNCHRONIZE,
+                .Device => result | FILE_WRITE_DATA | ACCESS_WRITE_ATTRIBUTES | SYNCHRONIZE,
+                .Key => result | ACCESS_WRITE | ACCESS_WRITE_ATTRIBUTES,
+                .Event => result | ACCESS_WRITE,
+                .Mutant => result | ACCESS_WRITE,
+                .Semaphore => result | ACCESS_WRITE,
+                .Timer => result | ACCESS_WRITE,
+                .Section => result | FILE_WRITE_DATA,
+                .Token => result | ACCESS_WRITE,
+                .Port, .WaitablePort => result | ACCESS_WRITE,
+                .IoCompletion => result | ACCESS_WRITE,
+                .Job => result | ACCESS_WRITE | PROCESS_TERMINATE,
+                .Thread => result | PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
+                else => result | ACCESS_WRITE,
+            };
+        }
+
+        // GENERIC_EXECUTE maps to type-specific execute rights
+        if (access_mask & GENERIC_EXECUTE != 0) {
+            result = switch (obj_type) {
+                .File => result | FILE_EXECUTE | ACCESS_READ_ATTRIBUTES | SYNCHRONIZE,
+                .Process => result | PROCESS_TERMINATE | SYNCHRONIZE,
+                .Device => result | ACCESS_READ_ATTRIBUTES | SYNCHRONIZE,
+                .Key => result | ACCESS_READ,
+                .Event => result | SYNCHRONIZE,
+                .Mutant => result | SYNCHRONIZE,
+                .Semaphore => result | SYNCHRONIZE,
+                .Timer => result | SYNCHRONIZE,
+                .Section => result | FILE_EXECUTE,
+                .Token => result | ACCESS_READ,
+                .Port, .WaitablePort => result | SYNCHRONIZE,
+                .IoCompletion => result | SYNCHRONIZE,
+                .Job => result | PROCESS_TERMINATE,
+                .Thread => result | PROCESS_TERMINATE | SYNCHRONIZE,
+                else => result | ACCESS_READ | SYNCHRONIZE,
+            };
+        }
+
+        // Clear the GENERIC bits from result (they have been mapped)
+        result &= ~(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL);
+
+        return result;
     }
 
     /// Check whether a handle grants the required access rights
@@ -351,6 +464,87 @@ pub const ObjectManager = struct {
             if ((entry.access_mask & required) == 0) return .DeniedAccessMask;
         }
         return .Allowed;
+    }
+
+    /// Mediate IPC channel send — must have ACCESS_WRITE on a Port handle
+    pub fn mediateChannelSend(self: *Self, handle: u64) MediationResult {
+        const idx: usize = @intCast(handle);
+        if (idx >= MAX_HANDLES) return .DeniedInvalidHandle;
+        const entry = &self.handles[idx];
+        if (!entry.in_use) return .DeniedInvalidHandle;
+        if (entry.cap_revoked) return .DeniedRevoked;
+        if (entry.obj_type != .Port and entry.obj_type != .WaitablePort) return .DeniedWrongType;
+        const required = ACCESS_WRITE | GENERIC_WRITE | GENERIC_ALL;
+        if ((entry.access_mask & required) == 0) return .DeniedAccessMask;
+        return .Allowed;
+    }
+
+    /// Mediate IPC channel receive — must have ACCESS_READ on a Port handle
+    pub fn mediateChannelReceive(self: *Self, handle: u64) MediationResult {
+        const idx: usize = @intCast(handle);
+        if (idx >= MAX_HANDLES) return .DeniedInvalidHandle;
+        const entry = &self.handles[idx];
+        if (!entry.in_use) return .DeniedInvalidHandle;
+        if (entry.cap_revoked) return .DeniedRevoked;
+        if (entry.obj_type != .Port and entry.obj_type != .WaitablePort) return .DeniedWrongType;
+        const required = ACCESS_READ | GENERIC_READ | GENERIC_ALL;
+        if ((entry.access_mask & required) == 0) return .DeniedAccessMask;
+        return .Allowed;
+    }
+
+    /// Mediate section (shared memory) mapping — must have appropriate access
+    pub fn mediateSectionMap(self: *Self, handle: u64, writable: bool) MediationResult {
+        const idx: usize = @intCast(handle);
+        if (idx >= MAX_HANDLES) return .DeniedInvalidHandle;
+        const entry = &self.handles[idx];
+        if (!entry.in_use) return .DeniedInvalidHandle;
+        if (entry.cap_revoked) return .DeniedRevoked;
+        if (entry.obj_type != .Section) return .DeniedWrongType;
+        if (writable) {
+            const required = FILE_WRITE_DATA | GENERIC_WRITE | GENERIC_ALL;
+            if ((entry.access_mask & required) == 0) return .DeniedAccessMask;
+        } else {
+            const required = FILE_READ_DATA | GENERIC_READ | GENERIC_ALL;
+            if ((entry.access_mask & required) == 0) return .DeniedAccessMask;
+        }
+        return .Allowed;
+    }
+
+    /// Audit log entry for denied access attempts
+    pub const AuditEntry = packed struct {
+        timestamp: u32,
+        handle: u32,
+        required_access: u32,
+        actual_access: u32,
+        result: MediationResult,
+        obj_type: ObjectType,
+        _pad: u8,
+    };
+
+    const MAX_AUDIT_ENTRIES: usize = 64;
+    var audit_log: [MAX_AUDIT_ENTRIES]AuditEntry = undefined;
+    var audit_index: usize = 0;
+    var audit_count: usize = 0;
+
+    /// Log a denied access attempt to the audit trail
+    pub fn logDeniedAccess(handle: u64, required_access: u32, actual_access: u32, result: MediationResult, obj_type: ObjectType) void {
+        const entry = AuditEntry{
+            .timestamp = @truncate(@as(u64, @intFromPtr(&audit_index))), // Approximate timestamp
+            .handle = @truncate(handle),
+            .required_access = required_access,
+            .actual_access = actual_access,
+            .result = result,
+            .obj_type = obj_type,
+            ._pad = 0,
+        };
+        audit_log[audit_index % MAX_AUDIT_ENTRIES] = entry;
+        audit_index += 1;
+        if (audit_count < MAX_AUDIT_ENTRIES) audit_count += 1;
+    }
+
+    /// Get the number of audit entries
+    pub fn getAuditCount() usize {
+        return audit_count;
     }
 
     /// Convert MediationResult to NTSTATUS (for NT syscall returns)

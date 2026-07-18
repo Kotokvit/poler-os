@@ -35,6 +35,7 @@ const cap = @import("capability.zig");
 const policy = @import("policy_engine.zig");
 const ipc = @import("ipc.zig");
 const ai_capsule = @import("ai_capsule.zig");
+const iommu = @import("iommu.zig");
 
 
 
@@ -603,9 +604,18 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
         puts("[HEAP] Failed to allocate first block!\n");
     }
 
+    // 8.6. Initialize Intel VT-d IOMMU (MUST be before PCI/VirtIO so that
+    //      DMA mappings can be registered before device init)
+    //      On QEMU q35 + -device intel-iommu,intremap=on, the DMAR table
+    //      is discovered via ACPI and IOMMU translation is enabled.
+    puts("[BOOT] Initializing IOMMU...\n");
+    iommu.init();
+
     // 9. Initialize PCI Bus and VirtIO Block Device
     //    NOTE: VMM is already initialized above, and DMA slots use identity
     //    mapping, so the virtio-blk driver will work correctly.
+    //    If IOMMU is available, VirtIO DMA regions will be registered
+    //    with the IOMMU for hardware-enforced DMA protection.
     puts("[BOOT] Scanning PCI bus...\n");
     pci.scan();
 
@@ -622,6 +632,15 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
         putDecimal(blk_cap);
         puts(" bytes\n");
 
+        // Enable IOMMU translation now that DMA regions are mapped
+        if (iommu.isAvailable()) {
+            if (iommu.enable()) {
+                puts("[IOMMU] VT-d DMA protection ACTIVE\n");
+            } else {
+                puts("[IOMMU] WARNING: VT-d enable failed — DMA unprotected\n");
+            }
+        }
+
         // Initialize FAT32 filesystem
         if (fat32.init()) {
             puts("[FAT32] Filesystem mounted!\n");
@@ -633,6 +652,12 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
         }
     } else {
         puts("[VIRTIO-BLK] No virtio-blk device found (expected with -drive)\n");
+        // Try to enable IOMMU even without virtio-blk
+        if (iommu.isAvailable()) {
+            if (iommu.enable()) {
+                puts("[IOMMU] VT-d DMA protection ACTIVE (no virtio-blk)\n");
+            }
+        }
     }
 
     // 8.7. Initialize and parse Initrd/CPIO modules

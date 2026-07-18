@@ -25,6 +25,7 @@
 
 const hal = @import("hal.zig");
 const pmm = @import("pmm64.zig");
+const acpi = @import("acpi.zig");
 
 // ============================================================================
 // §1  VT-d Register Offsets & Flags
@@ -188,7 +189,7 @@ fn scanForDmar(start: u64, end: u64) ?u64 {
     // ACPI tables are 16-byte aligned
     var addr = start;
     while (addr + @sizeOf(DmarHeader) <= end) : (addr += 16) {
-        const header: *const DmarHeader = @ptrFromInt(addr);
+        const header: *align(1) const DmarHeader = @ptrFromInt(addr);
         if (header.signature[0] == 'D' and
             header.signature[1] == 'M' and
             header.signature[2] == 'A' and
@@ -213,18 +214,28 @@ pub fn init() void {
     //    but we check for IOMMU via ACPI DMAR table)
     // Actually, VT-d is chipset-level, not CPU-level. We detect via ACPI.
 
-    // 2. Search for DMAR table in common ACPI locations
-    //    ACPI RSDP is typically at 0xE0000-0xFFFFF or 0x40E pointer
+    // 2. Search for DMAR table — prefer ACPI XSDT/RSDT discovery first
     var dmar_addr: ?u64 = null;
 
-    // Search EBDA (Extended BIOS Data Area) region and ACPI area
-    // The RSDP pointer is stored at physical 0x40E (16-bit pointer to EBDA)
-    const ebda_ptr_phys: u16 = @as(*volatile u16, @ptrFromInt(0x40E)).*;
-    if (ebda_ptr_phys != 0) {
-        dmar_addr = scanForDmar(@as(u64, ebda_ptr_phys) << 4, (@as(u64, ebda_ptr_phys) << 4) + 0x400);
+    // Method 1: Use DMAR address discovered by ACPI parser (via XSDT/RSDT)
+    // This is the most reliable method on QEMU q35 + intel-iommu
+    if (acpi.dmar_addr != 0) {
+        dmar_addr = acpi.dmar_addr;
+        hal.Serial.puts("[IOMMU] DMAR found via ACPI XSDT/RSDT at ");
+        hal.Serial.putHex(dmar_addr.?);
+        hal.Serial.puts("\n");
     }
 
-    // Search BIOS ROM area
+    // Method 2: Search EBDA (Extended BIOS Data Area) region and ACPI area
+    // The RSDP pointer is stored at physical 0x40E (16-bit pointer to EBDA)
+    if (dmar_addr == null) {
+        const ebda_ptr_phys: u16 = @as(*volatile u16, @ptrFromInt(0x40E)).*;
+        if (ebda_ptr_phys != 0) {
+            dmar_addr = scanForDmar(@as(u64, ebda_ptr_phys) << 4, (@as(u64, ebda_ptr_phys) << 4) + 0x400);
+        }
+    }
+
+    // Method 3: Search BIOS ROM area
     if (dmar_addr == null) {
         dmar_addr = scanForDmar(0xE0000, 0x100000);
     }
@@ -241,7 +252,9 @@ pub fn init() void {
     hal.Serial.puts("\n");
 
     // 3. Parse DMAR header
-    const dmar: *const DmarHeader = @ptrFromInt(dmar_addr.?);
+    //    Note: ACPI tables may not be naturally aligned in memory,
+    //    so we use align(1) pointer casts (QEMU places DMAR at odd offsets)
+    const dmar: *align(1) const DmarHeader = @ptrFromInt(dmar_addr.?);
     hal.Serial.puts("[IOMMU] Host Address Width: ");
     hal.Serial.putDecimal(dmar.host_address_width);
     hal.Serial.puts(" bits\n");
@@ -250,7 +263,7 @@ pub fn init() void {
     var offset: usize = @sizeOf(DmarHeader);
     var found_engine: bool = false;
     while (offset + 4 <= dmar.length) {
-        const sub: *const DmarDrhd = @ptrFromInt(dmar_addr.? + offset);
+        const sub: *align(1) const DmarDrhd = @ptrFromInt(dmar_addr.? + offset);
 
         if (sub.type == 0) { // DRHD
             hal.Serial.puts("[IOMMU] DRHD: segment=");
@@ -284,6 +297,25 @@ pub fn init() void {
     }
 
     // 5. Read VT-d version and capabilities
+    //    First, verify the register base is accessible by reading the version
+    const test_read = readReg32(VTD_REG_VER);
+    hal.Serial.puts("[IOMMU] Raw read at reg_base+0x00: 0x");
+    hal.Serial.putHex(test_read);
+    hal.Serial.puts("\n");
+
+    // If version reads as 0x00000000, the register base may not be mapped
+    // This can happen if QEMU places the IOMMU MMIO at a different address
+    // than what DRHD reports, or if the MMIO region is not identity-mapped
+    if (test_read == 0) {
+        hal.Serial.puts("[IOMMU] WARNING: VT-d register base reads zero — MMIO not accessible\n");
+        hal.Serial.puts("[IOMMU] This is a known issue with some QEMU versions\n");
+        hal.Serial.puts("[IOMMU] DMA regions are tracked in software but IOMMU translation cannot be enabled\n");
+        vtd_state.is_available = true; // Track regions for software enforcement
+        vtd_state.is_enabled = false; // But hardware translation is unavailable
+        hal.Serial.puts("[IOMMU] Falling back to software DMA allowlist (isDmaAllowed checks)\n");
+        return;
+    }
+
     const ver = readReg32(VTD_REG_VER);
     hal.Serial.puts("[IOMMU] VT-d version: ");
     hal.Serial.putHex((ver >> 16) & 0xFF);

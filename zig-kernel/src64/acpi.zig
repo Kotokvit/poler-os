@@ -155,6 +155,7 @@ pub var local_apic_addr: u64 = 0;
 pub var io_apic_addr: u64 = 0;
 pub var io_apic_count: u32 = 0;
 pub var mcfg_base: u64 = 0;
+pub var dmar_addr: u64 = 0; // DMAR table physical address (for IOMMU)
 
 // IRQ override table (ISA → Global IRQ mapping)
 pub const MAX_IRQ_OVERRIDES = 16;
@@ -328,6 +329,11 @@ fn parseTable(phys_addr: u64) void {
         parseMCFG(phys_addr);
     } else if (signatureEquals(&header.signature, "HPET")) {
         hal.Serial.puts("[ACPI] HPET table found (not yet used)\n");
+    } else if (signatureEquals(&header.signature, "DMAR")) {
+        dmar_addr = phys_addr;
+        hal.Serial.puts("[ACPI] DMAR table found at ");
+        hal.Serial.putHex(phys_addr);
+        hal.Serial.puts(" (Intel VT-d IOMMU)\n");
     }
 }
 

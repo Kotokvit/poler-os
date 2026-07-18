@@ -155,7 +155,19 @@ pub fn createChannel() ?struct { handle_a: u64, handle_b: u64 } {
 /// Send a message through a channel endpoint.
 /// `sender_handle` is the handle of the sending endpoint.
 /// Returns true on success, false if queue is full or handle invalid.
+/// Access mediation: checks ACCESS_WRITE on the Port handle before sending.
 pub fn channelSend(sender_handle: u64, msg: *const IpcMessage) bool {
+    // Access mediation: verify the handle grants WRITE access
+    const om = objmgr.getGlobal();
+    const med = om.mediateChannelSend(sender_handle);
+    if (med != .Allowed) {
+        hal.Serial.puts("[IPC] Send DENIED: access mask violation (");
+        hal.Serial.putDecimal(@intFromEnum(med));
+        hal.Serial.puts(")\n");
+        objmgr.ObjectManager.logDeniedAccess(sender_handle, objmgr.ACCESS_WRITE, 0, med, .Port);
+        return false;
+    }
+
     const ch = findChannelByHandle(sender_handle) orelse {
         hal.Serial.puts("[IPC] Send: handle not found\n");
         return false;
@@ -174,7 +186,19 @@ pub fn channelSend(sender_handle: u64, msg: *const IpcMessage) bool {
 /// Receive a message from a channel endpoint.
 /// `receiver_handle` is the handle of the receiving endpoint.
 /// Returns the message, or null if queue is empty.
+/// Access mediation: checks ACCESS_READ on the Port handle before receiving.
 pub fn channelReceive(receiver_handle: u64) ?IpcMessage {
+    // Access mediation: verify the handle grants READ access
+    const om = objmgr.getGlobal();
+    const med = om.mediateChannelReceive(receiver_handle);
+    if (med != .Allowed) {
+        hal.Serial.puts("[IPC] Receive DENIED: access mask violation (");
+        hal.Serial.putDecimal(@intFromEnum(med));
+        hal.Serial.puts(")\n");
+        objmgr.ObjectManager.logDeniedAccess(receiver_handle, objmgr.ACCESS_READ, 0, med, .Port);
+        return null;
+    }
+
     const ch = findChannelByHandle(receiver_handle) orelse return null;
     
     // If receiver is end_a, messages come from b→a queue
