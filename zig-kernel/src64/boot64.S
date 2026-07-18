@@ -14,8 +14,11 @@
 //   9. Call poler_kernel_main() in Zig
 // ============================================================================
 
-.set MB2_MAGIC,          0xE85250D6   // Multiboot2 header magic
-.set MB2_BOOTLOADER_MAGIC, 0x36D76289 // Значение в EAX при загрузке
+.set MB1_MAGIC,          0x1BADB002   // Multiboot1 header magic (for QEMU -kernel)
+.set MB1_FLAGS,          0x00000003   // Align modules + provide memory info
+.set MB2_MAGIC,          0xE85250D6   // Multiboot2 header magic (for GRUB)
+.set MB2_BOOTLOADER_MAGIC, 0x36D76289 // Значение в EAX при загрузке (MB2)
+.set MB1_BOOTLOADER_MAGIC, 0x2BADB002 // Значение в EAX при загрузке (MB1)
 .set MB2_ARCHITECTURE,   0            // 0 = x86 (protected mode)
 
 .set CR0_PE,             0x00000001
@@ -30,7 +33,18 @@
 // KERNEL_BASE removed — flat identity-mapped kernel for now
 
 // ============================================================================
-// Multiboot2 Header
+// Multiboot1 Header (for QEMU -kernel direct boot)
+// ============================================================================
+.section .multiboot, "a", @progbits
+.balign 4
+mb1_header_start:
+    .long MB1_MAGIC                                    // magic
+    .long MB1_FLAGS                                    // flags
+    .long -(MB1_MAGIC + MB1_FLAGS)                     // checksum
+mb1_header_end:
+
+// ============================================================================
+// Multiboot2 Header (for GRUB)
 // ============================================================================
 .section .multiboot2, "a", @progbits
 .balign 8
@@ -102,10 +116,13 @@ _start:
     movb $'A', %al
     outb %al, %dx
 
-    // Проверяем Multiboot2 magic (из сохранённого регистра EBP)
+    // Проверяем magic — поддерживаем Multiboot1 и Multiboot2
     cmpl $MB2_BOOTLOADER_MAGIC, %ebp
+    je .magic_ok
+    cmpl $MB1_BOOTLOADER_MAGIC, %ebp
     jne .hang
 
+.magic_ok:
     // Output 'C' (magic OK)
     movb $'C', %al
     outb %al, %dx
@@ -234,7 +251,7 @@ _start:
     movw %ax, %gs
     movw %ax, %ss
 
-    // Настраиваем 64-bit стек (16KB)
+    // Настраиваем 64-bit стек (128KB — ObjectManager init needs ~160KB on stack)
     movq $stack_top, %rsp
 
     // Включаем SSE (требуется для Zig SSE-оптимизированного кода)

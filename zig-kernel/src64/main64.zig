@@ -23,6 +23,7 @@ const heap = @import("heap64.zig");
 const cpio = @import("cpio.zig");
 const scheduler = @import("scheduler.zig");
 const multiboot2 = @import("multiboot2.zig");
+const multiboot1 = @import("multiboot1.zig");
 const framebuffer = @import("framebuffer.zig");
 const pci = @import("pci.zig");
 const virtio_blk = @import("virtio_blk.zig");
@@ -319,7 +320,7 @@ fn printCPUInfo(info: *const CPUInfo) void {
 // Memory Map — parsed from Multiboot2 tags
 // ============================================================================
 
-fn printMemoryInfo(mbi: u64) void {
+fn printMemoryInfo(mbi: u64, mb_type: pmm.MultibootType) void {
     // 1. Show register values
     const cr0 = hal.readCr0();
     const cr3 = hal.readCr3();
@@ -338,8 +339,11 @@ fn printMemoryInfo(mbi: u64) void {
     }
 
     // 2. Initialize 64-bit physical memory manager
-    puts("[PMM] Initializing from Multiboot2 memory maps...\n");
-    pmm.init(mbi);
+    switch (mb_type) {
+        .mb2 => puts("[PMM] Initializing from Multiboot2 memory maps...\n"),
+        .mb1 => puts("[PMM] Initializing from Multiboot1 memory maps...\n"),
+    }
+    pmm.init(mbi, mb_type);
 
     // 3. Print memory allocations statistics
     const stats = pmm.getStats();
@@ -353,22 +357,43 @@ fn printMemoryInfo(mbi: u64) void {
     putDecimal(stats.usable_pages * 4);
     puts(" KB)\n");
 
-    // 4. Dump Multiboot2 Memory Map if available
-    const parser = multiboot2.Parser.init(mbi);
-    if (parser.findTag(6)) |tag_addr| {
-        const mmap_tag: *const multiboot2.MmapTag = @ptrFromInt(tag_addr);
-        const entries = mmap_tag.getEntries();
-        puts("  Multiboot2 Memory Map:\n");
-        for (entries) |entry| {
-            puts("    - [");
-            putHex(entry.addr);
-            puts(" .. ");
-            putHex(entry.addr + entry.len);
-            puts("] type=");
-            putDecimal(entry.entry_type);
-            if (entry.entry_type == 1) puts(" (Usable)");
-            puts("\n");
-        }
+    // 4. Dump Memory Map
+    switch (mb_type) {
+        .mb2 => {
+            const parser = multiboot2.Parser.init(mbi);
+            if (parser.findTag(6)) |tag_addr| {
+                const mmap_tag: *const multiboot2.MmapTag = @ptrFromInt(tag_addr);
+                const entries = mmap_tag.getEntries();
+                puts("  Multiboot2 Memory Map:\n");
+                for (entries) |entry| {
+                    puts("    - [");
+                    putHex(entry.addr);
+                    puts(" .. ");
+                    putHex(entry.addr + entry.len);
+                    puts("] type=");
+                    putDecimal(entry.entry_type);
+                    if (entry.entry_type == 1) puts(" (Usable)");
+                    puts("\n");
+                }
+            }
+        },
+        .mb1 => {
+            const parser = multiboot1.Parser.init(mbi);
+            if (parser.getMmapIterator()) |iter| {
+                puts("  Multiboot1 Memory Map:\n");
+                var it = iter;
+                while (it.next()) |entry| {
+                    puts("    - [");
+                    putHex(entry.addr);
+                    puts(" .. ");
+                    putHex(entry.addr + entry.len);
+                    puts("] type=");
+                    putDecimal(entry.entry_type);
+                    if (entry.entry_type == 1) puts(" (Usable)");
+                    puts("\n");
+                }
+            }
+        },
     }
 }
 
@@ -398,21 +423,31 @@ fn testPolerCore() void {
 // ============================================================================
 
 export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(.C) void {
+    // Detect multiboot protocol type from magic value
+    const mb_type: pmm.MultibootType = if (multiboot_magic == multiboot2.BOOTLOADER_MAGIC)
+        pmm.MultibootType.mb2
+    else if (multiboot_magic == multiboot1.BOOTLOADER_MAGIC)
+        pmm.MultibootType.mb1
+    else
+        pmm.MultibootType.mb2; // fallback — assume MB2 for unknown loaders
+
     // 0. Detect and Initialize Framebuffer if available from Multiboot2
-    const parser = multiboot2.Parser.init(multiboot_info);
-    if (parser.findTag(8)) |tag_addr| {
-        const fb_tag: *const multiboot2.FramebufferTag = @ptrFromInt(tag_addr);
-        if (fb_tag.fb_addr != 0 and fb_tag.fb_width > 0 and fb_tag.fb_height > 0) {
-            framebuffer.init_from_multiboot(
-                fb_tag.fb_addr,
-                fb_tag.fb_pitch,
-                fb_tag.fb_width,
-                fb_tag.fb_height,
-                fb_tag.fb_bpp,
-                fb_tag.fb_type,
-            );
-            framebuffer.clear();
-            use_fb = true;
+    if (mb_type == .mb2) {
+        const parser = multiboot2.Parser.init(multiboot_info);
+        if (parser.findTag(8)) |tag_addr| {
+            const fb_tag: *const multiboot2.FramebufferTag = @ptrFromInt(tag_addr);
+            if (fb_tag.fb_addr != 0 and fb_tag.fb_width > 0 and fb_tag.fb_height > 0) {
+                framebuffer.init_from_multiboot(
+                    fb_tag.fb_addr,
+                    fb_tag.fb_pitch,
+                    fb_tag.fb_width,
+                    fb_tag.fb_height,
+                    fb_tag.fb_bpp,
+                    fb_tag.fb_type,
+                );
+                framebuffer.clear();
+                use_fb = true;
+            }
         }
     }
 
@@ -424,9 +459,11 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     // 2. Print banner
     print_banner();
 
-    // 3. Verify Multiboot2 magic
-    if (multiboot_magic == 0x36D76289) {
+    // 3. Identify bootloader type
+    if (multiboot_magic == multiboot2.BOOTLOADER_MAGIC) {
         puts("[BOOT] Multiboot2 loaded successfully\n");
+    } else if (multiboot_magic == multiboot1.BOOTLOADER_MAGIC) {
+        puts("[BOOT] Multiboot1 loaded successfully\n");
     } else {
         vga_setcolor(0x0C);
         puts("[BOOT] WARNING: Unknown bootloader (magic=");
@@ -450,7 +487,7 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
 
     // 7. Memory info
     puts("[BOOT] Memory layout:\n");
-    printMemoryInfo(multiboot_info);
+    printMemoryInfo(multiboot_info, mb_type);
 
     // 8. Test POLER Core
     testPolerCore();
@@ -614,18 +651,26 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     puts("Timer: APIC periodic, tick count will increment in idle loop\n");
 
     // 8.5a. Initialize Dual-Personality Subsystem Dispatcher
+    puts("[BOOT] Initializing subsystem dispatcher...\n");
     subsys.init();
+    puts("[BOOT] Subsystem dispatcher OK\n");
 
     // 8.5a-2. Initialize Kernel Integration Layer (VFS↔FAT32, ProcessMgr, mmap, POLER Auth)
+    puts("[BOOT] Initializing kernel integration...\n");
     ki.kernelIntegrateInit();
+    puts("[BOOT] Kernel integration OK\n");
 
     // 8.5b. Initialize Syscalls — now routes through subsystem dispatcher
+    puts("[BOOT] Initializing syscalls...\n");
     syscall_int.print_fn = &puts;
     syscall_int.clear_screen_fn = &clear_screen;
     hal.initSyscalls(@intFromPtr(&syscall_entry));
+    puts("[BOOT] Syscalls OK\n");
 
     // 8.6. Initialize Scheduler & Preemptive Multitasking
+    puts("[BOOT] Initializing scheduler...\n");
     scheduler.init();
+    puts("[BOOT] Scheduler initialized\n");
 
     // Create two test tasks (which will run in Ring 3 / User space)
     _ = scheduler.createTask(@intFromPtr(&task1)) catch |err| {

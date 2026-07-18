@@ -198,7 +198,7 @@ pub fn init() void {
     hal.Serial.puts("[SUBSYSTEM] Initializing dual-personality subsystem dispatcher\n");
 
     // Initialize Object Manager (shared between NT and POSIX)
-    global_objmgr = objmgr.ObjectManager.init();
+    global_objmgr.init();
     hal.Serial.puts("[SUBSYSTEM] Object Manager initialized\n");
 
     // Initialize NT subsystem

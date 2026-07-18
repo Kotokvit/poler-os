@@ -18,6 +18,7 @@
 // ============================================================================
 
 const multiboot2 = @import("multiboot2.zig");
+const multiboot1 = @import("multiboot1.zig");
 const hal = @import("hal.zig");
 
 const PAGE_SIZE: u64 = 4096;
@@ -50,40 +51,20 @@ var refcounts: [MAX_PAGES]u32 = undefined;
 extern var _kernel_start: anyopaque;
 extern var _kernel_end: anyopaque;
 
-pub fn init(mbi_ptr: u64) void {
+/// Multiboot protocol type — determines how to parse the info structure
+pub const MultibootType = enum { mb1, mb2 };
+
+pub fn init(mbi_ptr: u64, mb_type: MultibootType) void {
     // 1. Mark all memory as reserved initially
     @memset(&bitmap, 0xFF);
 
     // 2. Zero all reference counts
     @memset(&refcounts, 0);
 
-    const parser = multiboot2.Parser.init(mbi_ptr);
-
-    // 3. Parse basic memory info tag if present
-    if (parser.findTag(4)) |tag_addr| {
-        const mem_tag: *const multiboot2.BasicMemTag = @ptrFromInt(tag_addr);
-        total_ram_bytes = @as(u64, mem_tag.mem_upper) * 1024 + 1024 * 1024;
-    }
-
-    // 4. Parse memory map tag (type 6) — mark usable regions as free
-    if (parser.findTag(6)) |tag_addr| {
-        const mmap_tag: *const multiboot2.MmapTag = @ptrFromInt(tag_addr);
-        const entries = mmap_tag.getEntries();
-
-        for (entries) |entry| {
-            if (entry.entry_type == 1) {
-                var addr = entry.addr;
-                const end_addr = entry.addr + entry.len;
-                addr = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-
-                while (addr + PAGE_SIZE <= end_addr) : (addr += PAGE_SIZE) {
-                    if (addr < MAX_MEM_SUPPORTED) {
-                        freePageInternal(addr);
-                        usable_pages += 1;
-                    }
-                }
-            }
-        }
+    // 3. Parse memory info based on multiboot type
+    switch (mb_type) {
+        .mb2 => initFromMB2(mbi_ptr),
+        .mb1 => initFromMB1(mbi_ptr),
     }
 
     // 5. Protect the first 1MB (BIOS, VGA, early tables)
@@ -101,20 +82,105 @@ pub fn init(mbi_ptr: u64) void {
         setPageInternal(addr);
     }
 
-    // 7. Protect the Multiboot2 info structure
-    const mbi_header: *const multiboot2.InfoHeader = @ptrFromInt(mbi_ptr);
-    const mbi_size = mbi_header.total_size;
-    const mbi_end = (mbi_ptr + mbi_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    addr = mbi_ptr & ~(PAGE_SIZE - 1);
-    while (addr < mbi_end) : (addr += PAGE_SIZE) {
-        if (addr < MAX_MEM_SUPPORTED) {
-            setPageInternal(addr);
-        }
+    // 7. Protect the Multiboot info structure
+    switch (mb_type) {
+        .mb2 => {
+            const mbi_header: *const multiboot2.InfoHeader = @ptrFromInt(mbi_ptr);
+            const mbi_size = mbi_header.total_size;
+            const mbi_end = (mbi_ptr + mbi_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+            addr = mbi_ptr & ~(PAGE_SIZE - 1);
+            while (addr < mbi_end) : (addr += PAGE_SIZE) {
+                if (addr < MAX_MEM_SUPPORTED) {
+                    setPageInternal(addr);
+                }
+            }
+        },
+        .mb1 => {
+            // MB1 info structure doesn't have an explicit size.
+            // Protect 256 bytes starting at the aligned mbi_ptr —
+            // the structure is at most ~90 bytes, 256 gives safe margin.
+            const mbi_end = (mbi_ptr + 256 + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+            addr = mbi_ptr & ~(PAGE_SIZE - 1);
+            while (addr < mbi_end) : (addr += PAGE_SIZE) {
+                if (addr < MAX_MEM_SUPPORTED) {
+                    setPageInternal(addr);
+                }
+            }
+            // Also protect the MB1 memory map data if present
+            const mb1_parser = multiboot1.Parser.init(mbi_ptr);
+            if (mb1_parser.getMmapInfo()) |mmap_info| {
+                const mmap_end_aligned = (mmap_info.addr + mmap_info.length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+                addr = mmap_info.addr & ~(PAGE_SIZE - 1);
+                while (addr < mmap_end_aligned) : (addr += PAGE_SIZE) {
+                    if (addr < MAX_MEM_SUPPORTED) {
+                        setPageInternal(addr);
+                    }
+                }
+            }
+        },
     }
 
     // allocated_pages will be incremented on each allocPage() call
     allocated_pages = 0;
     next_free_hint = 0;
+}
+
+/// Parse memory from Multiboot2 info structure (tag-based)
+fn initFromMB2(mbi_ptr: u64) void {
+    const parser = multiboot2.Parser.init(mbi_ptr);
+
+    // Parse basic memory info tag if present
+    if (parser.findTag(4)) |tag_addr| {
+        const mem_tag: *const multiboot2.BasicMemTag = @ptrFromInt(tag_addr);
+        total_ram_bytes = @as(u64, mem_tag.mem_upper) * 1024 + 1024 * 1024;
+    }
+
+    // Parse memory map tag (type 6) — mark usable regions as free
+    if (parser.findTag(6)) |tag_addr| {
+        const mmap_tag: *const multiboot2.MmapTag = @ptrFromInt(tag_addr);
+        const entries = mmap_tag.getEntries();
+
+        for (entries) |entry| {
+            if (entry.entry_type == 1) {
+                markRangeFree(entry.addr, entry.len);
+            }
+        }
+    }
+}
+
+/// Parse memory from Multiboot1 info structure (flags + mmap)
+fn initFromMB1(mbi_ptr: u64) void {
+    const parser = multiboot1.Parser.init(mbi_ptr);
+
+    // Parse basic memory info (mem_lower/mem_upper)
+    if (parser.getBasicMemInfo()) |mem_info| {
+        total_ram_bytes = @as(u64, mem_info.mem_upper) * 1024 + 1024 * 1024;
+    }
+
+    // Parse memory map entries if available (flags bit 6)
+    if (parser.getMmapIterator()) |iter| {
+        var it = iter;
+        while (it.next()) |entry| {
+            if (entry.entry_type == 1) {
+                markRangeFree(entry.addr, entry.len);
+            }
+        }
+    }
+}
+
+/// Mark a range of physical memory as free (usable)
+fn markRangeFree(base_addr: u64, length: u64) void {
+    var addr = base_addr;
+    const end_addr = base_addr + length;
+    // Page-align the start address upward
+    addr = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    while (addr + PAGE_SIZE <= end_addr) : (addr += PAGE_SIZE) {
+        if (addr < MAX_MEM_SUPPORTED) {
+            freePageInternal(addr);
+            usable_pages += 1;
+        }
+    }
 }
 
 /// Allocate a single physical page. Sets refcount to 1.

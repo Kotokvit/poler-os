@@ -2,6 +2,8 @@
 // POLER-OS Multiboot2 Specification Parser — x86_64
 // ============================================================================
 
+pub const BOOTLOADER_MAGIC: u32 = 0x36D76289;
+
 pub const Tag = extern struct {
     type: u32,
     size: u32,
