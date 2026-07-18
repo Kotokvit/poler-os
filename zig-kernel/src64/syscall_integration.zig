@@ -34,6 +34,7 @@ const LEGACY_READ_KEY: u64 = 2;
 const LEGACY_CLEAR_SCREEN: u64 = 3;
 const LEGACY_EXIT: u64 = 4;
 const LEGACY_YIELD: u64 = 5;
+const LEGACY_READ_SERIAL: u64 = 6;
 
 // ============================================================================
 // Print and screen functions — registered by main64.zig
@@ -101,6 +102,22 @@ pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, sy
         },
         LEGACY_YIELD => {
             // Syscall 5: Yield
+            return 0;
+        },
+        LEGACY_READ_SERIAL => {
+            // Syscall 6: Read serial character (non-blocking)
+            // Returns 0 if no serial data available, or the ASCII character.
+            // Used for -serial stdio interactive mode.
+            // Also falls back to polling COM1 LSR if interrupt missed.
+            if (hal.serial_has_data()) {
+                return hal.serial_pop();
+            }
+            // Poll COM1 directly (fallback if interrupt was not delivered)
+            if ((hal.inb(0x3F8 + 5) & 0x01) != 0) {
+                const ch = hal.inb(0x3F8);
+                if (ch == '\r') return '\n';
+                return ch;
+            }
             return 0;
         },
         else => {

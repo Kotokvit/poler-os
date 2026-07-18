@@ -430,12 +430,16 @@ pub fn init() VblkError!void {
 
 fn readBlkConfig() void {
     const config_offset = VIRTIO_PCI_CONFIG;
-    var buf: [@sizeOf(VirtBlkConfig)]u8 align(4) = undefined;
+    var buf: [@sizeOf(VirtBlkConfig)]u8 align(@alignOf(VirtBlkConfig)) = undefined;
 
     var i: u16 = 0;
     while (i < @sizeOf(VirtBlkConfig)) : (i += 4) {
         const val = read32(config_offset + i);
-        @as(*u32, @ptrCast(@alignCast(&buf[i]))).* = val;
+        // Safe byte-level write to avoid alignment panics
+        buf[i] = @truncate(val);
+        buf[i + 1] = @truncate(val >> 8);
+        buf[i + 2] = @truncate(val >> 16);
+        buf[i + 3] = @truncate(val >> 24);
     }
 
     vblk_state.config = @as(*VirtBlkConfig, @ptrCast(@alignCast(&buf[0]))).*;

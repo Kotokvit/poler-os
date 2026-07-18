@@ -84,25 +84,42 @@ pub const Parser = struct {
     info_ptr: u64,
 
     pub fn init(info_ptr: u64) Parser {
-        const header: *const InfoHeader = @ptrFromInt(info_ptr);
+        // GRUB may place the multiboot2 info at an unaligned address.
+        // Read the header fields using volatile byte-level access
+        // to avoid Zig's alignment safety checks panicking.
+        const ptr: [*]const volatile u8 = @ptrFromInt(info_ptr);
+        const total_size: u32 = @as(u32, ptr[0]) |
+            (@as(u32, ptr[1]) << 8) |
+            (@as(u32, ptr[2]) << 16) |
+            (@as(u32, ptr[3]) << 24);
         return Parser{
-            .total_size = header.total_size,
+            .total_size = total_size,
             .info_ptr = info_ptr,
         };
+    }
+
+    /// Read a u32 from potentially unaligned address (volatile, byte-level)
+    fn readU32(addr: u64) u32 {
+        const ptr: [*]const volatile u8 = @ptrFromInt(addr);
+        return @as(u32, ptr[0]) |
+            (@as(u32, ptr[1]) << 8) |
+            (@as(u32, ptr[2]) << 16) |
+            (@as(u32, ptr[3]) << 24);
     }
 
     pub fn findTag(self: *const Parser, tag_type: u32) ?u64 {
         var offset: u64 = 8; // skip InfoHeader
         while (offset < self.total_size) {
-            const tag: *const Tag = @ptrFromInt(self.info_ptr + offset);
-            if (tag.type == tag_type) {
+            const tag_type_val = readU32(self.info_ptr + offset);
+            const tag_size = readU32(self.info_ptr + offset + 4);
+            if (tag_type_val == tag_type) {
                 return self.info_ptr + offset;
             }
-            if (tag.type == 0 and tag.size == 8) {
+            if (tag_type_val == 0 and tag_size == 8) {
                 break; // End tag
             }
             // Align tag size to 8-byte boundary
-            offset += (tag.size + 7) & ~@as(u32, 7);
+            offset += (tag_size + 7) & ~@as(u32, 7);
         }
         return null;
     }
@@ -110,14 +127,15 @@ pub const Parser = struct {
     pub fn findModuleTag(self: *const Parser, start_offset: *u64) ?*const ModuleTag {
         var offset = start_offset.*;
         while (offset < self.total_size) {
-            const tag: *const Tag = @ptrFromInt(self.info_ptr + offset);
-            if (tag.type == 0 and tag.size == 8) {
+            const tag_type_val = readU32(self.info_ptr + offset);
+            const tag_size = readU32(self.info_ptr + offset + 4);
+            if (tag_type_val == 0 and tag_size == 8) {
                 break; // End tag
             }
-            const next_offset = offset + ((tag.size + 7) & ~@as(u32, 7));
-            if (tag.type == 3) {
+            const next_offset = offset + ((tag_size + 7) & ~@as(u32, 7));
+            if (tag_type_val == 3) {
                 start_offset.* = next_offset;
-                const module_ptr: *const ModuleTag = @ptrCast(tag);
+                const module_ptr: *const ModuleTag = @ptrFromInt(self.info_ptr + offset);
                 return module_ptr;
             }
             offset = next_offset;

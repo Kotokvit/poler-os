@@ -362,6 +362,26 @@ pub fn processMgrCreateProcess(parent_pid: u32, subsystem_id: subsys.SubsystemId
     };
     pcb.task_id = task_id;
 
+    // v1.1.0: Allocate TCB (Thread Control Block) for TLS support.
+    // Every user thread must have its own TCB with FS_BASE pointing to it.
+    const tcb_vaddr: u64 = dynlink.allocateTcbForThread(user_cr3, @intCast(task_id)) catch blk: {
+        hal.Serial.puts("[PROC] WARNING: TCB alloc failed for PID=");
+        hal.Serial.putDecimal(pid);
+        hal.Serial.puts(" (TLS will not work)\n");
+        break :blk 0;
+    };
+    if (tcb_vaddr != 0) {
+        scheduler.tasks[task_id].tcb_vaddr = tcb_vaddr;
+        scheduler.tasks[task_id].fs_base = tcb_vaddr;
+        hal.Serial.puts("[PROC] TCB for PID=");
+        hal.Serial.putDecimal(pid);
+        hal.Serial.puts(" task=");
+        hal.Serial.putDecimal(task_id);
+        hal.Serial.puts(" at vaddr=0x");
+        hal.Serial.putHex(tcb_vaddr);
+        hal.Serial.puts("\n");
+    }
+
     // Generate POLER authentication token
     generateProcessToken(pcb);
 
@@ -444,6 +464,21 @@ pub fn processMgrFork(parent_pid: u32) ?u32 {
         return null;
     };
     child.task_id = task_id;
+
+    // v1.1.0: Allocate TCB for forked child thread (TLS support)
+    const fork_tcb_vaddr: u64 = dynlink.allocateTcbForThread(child_cr3, @intCast(task_id)) catch blk: {
+        hal.Serial.puts("[PROC] WARNING: TCB alloc failed for forked child\n");
+        break :blk 0;
+    };
+    if (fork_tcb_vaddr != 0) {
+        scheduler.tasks[task_id].tcb_vaddr = fork_tcb_vaddr;
+        scheduler.tasks[task_id].fs_base = fork_tcb_vaddr;
+        hal.Serial.puts("[PROC] TCB for forked child task=");
+        hal.Serial.putDecimal(task_id);
+        hal.Serial.puts(" at vaddr=0x");
+        hal.Serial.putHex(fork_tcb_vaddr);
+        hal.Serial.puts("\n");
+    }
 
     // Copy file descriptor table (shallow copy — increments handle refs)
     child.fd_table = parent.fd_table;

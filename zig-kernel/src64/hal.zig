@@ -642,9 +642,68 @@ fn handleKeyboard(frame: *InterruptFrame) void {
     }
 }
 
+/// Serial input ring buffer — characters received from COM1 (QEMU -serial stdio)
+var serial_rx_buffer: [256]u8 = undefined;
+var serial_rx_head: usize = 0;
+var serial_rx_tail: usize = 0;
+
+/// Push a character into the serial receive ring buffer.
+/// Called from handleSerial() ISR and from serialPollInput().
+pub fn serial_push(ch: u8) void {
+    const next = (serial_rx_head + 1) % serial_rx_buffer.len;
+    if (next != serial_rx_tail) {
+        serial_rx_buffer[serial_rx_head] = ch;
+        serial_rx_head = next;
+    }
+}
+
+/// Pop a character from the serial receive ring buffer (non-blocking).
+/// Returns 0 if buffer is empty.
+pub fn serial_pop() u8 {
+    if (serial_rx_head == serial_rx_tail) return 0;
+    const ch = serial_rx_buffer[serial_rx_tail];
+    serial_rx_tail = (serial_rx_tail + 1) % serial_rx_buffer.len;
+    return ch;
+}
+
+/// Check if serial input is available
+pub fn serial_has_data() bool {
+    return serial_rx_head != serial_rx_tail;
+}
+
 fn handleSerial(frame: *InterruptFrame) void {
     _ = frame;
-    // TODO: Serial port interrupt handler
+    // COM1 Interrupt Handler — IRQ4 (vector 36)
+    // When QEMU runs with -serial stdio, typing in the terminal
+    // generates IRQ4 with data available in COM1 receive buffer.
+    const COM1_BASE: u16 = 0x3F8;
+
+    // Read IIR (Interrupt Identification Register) to determine cause
+    const iir = inb(COM1_BASE + 2); // IIR at COM1+2
+    // Bits [2:1] identify the interrupt type:
+    //   00b = Modem status
+    //   01b = Transmit holding register empty
+    //   10b = Data available (received data)
+    //   11b = Line status (overrun/parity/framing error)
+    //   06b = Character timeout (FIFO mode)
+    const int_type = (iir >> 1) & 0x07;
+
+    if (int_type == 0x02 or int_type == 0x06) {
+        // Data available — read all bytes from FIFO
+        while ((inb(COM1_BASE + 5) & 0x01) != 0) {
+            const ch = inb(COM1_BASE);
+            // Convert CR to LF for terminal compatibility
+            if (ch == '\r') {
+                serial_push('\n');
+            } else {
+                serial_push(ch);
+            }
+        }
+    }
+    // For line status errors (int_type == 0x03), read LSR to clear
+    if (int_type == 0x03) {
+        _ = inb(COM1_BASE + 5);
+    }
 }
 
 // ============================================================================
@@ -680,10 +739,12 @@ pub const PIC = struct {
         outb(PIC1_DATA, ICW4_8086);
         outb(PIC2_DATA, ICW4_8086);
 
-        // Mask all PIC interrupts — we use APIC timer (vector 32)
-        // and IO-APIC for keyboard. Only unmask IRQ1 (keyboard) as fallback.
-        // IRQ0 (PIT) is masked because APIC timer replaces it.
-        outb(PIC1_DATA, 0xFD); // Mask all except IRQ1 (keyboard)
+        // Mask PIC interrupts — we use APIC timer (vector 48)
+        // and IO-APIC for keyboard. Unmask:
+        //   IRQ1 (keyboard) — bit 1 = 0
+        //   IRQ4 (COM1 serial) — bit 4 = 0 (for -serial stdio interactive input)
+        // All others masked. 0xFD & ~(1<<4) = 0xED
+        outb(PIC1_DATA, 0xED); // Unmask IRQ1 + IRQ4
         outb(PIC2_DATA, 0xFF); // Mask all slave
     }
 
@@ -1121,13 +1182,18 @@ pub const Serial = struct {
     const COM1: u16 = 0x3F8;
 
     pub fn init() void {
-        outb(COM1 + 1, 0x00); // Disable interrupts
+        outb(COM1 + 1, 0x00); // Disable interrupts during setup
         outb(COM1 + 3, 0x80); // Enable DLAB
         outb(COM1 + 0, 0x01); // Baud divisor low = 1 → 115200
         outb(COM1 + 1, 0x00); // Baud divisor high = 0
         outb(COM1 + 3, 0x03); // 8N1
         outb(COM1 + 2, 0xC7); // Enable FIFO, clear, 14-byte threshold
         outb(COM1 + 4, 0x0B); // Enable RTS/DSR/DTR
+
+        // Enable receive data interrupt (bit 0 = Data Available)
+        // This allows IRQ4 to fire when data arrives on COM1,
+        // enabling interactive serial input via -serial stdio
+        outb(COM1 + 1, 0x01); // IER: enable received data available interrupt
     }
 
     pub fn puts(str: []const u8) void {
