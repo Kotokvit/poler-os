@@ -45,7 +45,7 @@ pub fn build(b: *std.Build) void {
 
     // ═══ Run 32-bit kernel in QEMU ═══════════════════════════════════════
     const run32_cmd = b.addSystemCommand(&.{
-        "qemu-system-x86_64",
+        "/home/z/my-project/qemu-portable/qemu-portable.sh",
         "-kernel",
         "zig-out/bin/poler-os32",
         "-m", "128M",
@@ -59,7 +59,7 @@ pub fn build(b: *std.Build) void {
 
     // ═══ Run 64-bit kernel in QEMU ═══════════════════════════════════════
     const run64_cmd = b.addSystemCommand(&.{
-        "qemu-system-x86_64",
+        "/home/z/my-project/qemu-portable/qemu-portable.sh",
         "-kernel",
         "zig-out/bin/poler-os64",
         "-m", "256M",
@@ -73,7 +73,7 @@ pub fn build(b: *std.Build) void {
 
     // ═══ Run 64-bit kernel headless (serial only) ═════════════════════════
     const run64_headless_cmd = b.addSystemCommand(&.{
-        "qemu-system-x86_64",
+        "/home/z/my-project/qemu-portable/qemu-portable.sh",
         "-kernel",
         "zig-out/bin/poler-os64",
         "-m", "256M",
@@ -87,7 +87,7 @@ pub fn build(b: *std.Build) void {
 
     // ═══ Run 64-bit kernel with virtio-blk disk ═════════════════════════
     const run64_blk_cmd = b.addSystemCommand(&.{
-        "qemu-system-x86_64",
+        "/home/z/my-project/qemu-portable/qemu-portable.sh",
         "-kernel",
         "zig-out/bin/poler-os64",
         "-m", "256M",
@@ -102,7 +102,7 @@ pub fn build(b: *std.Build) void {
 
     // ═══ Run 64-bit kernel headless with virtio-blk ═════════════════════
     const run64_blk_headless_cmd = b.addSystemCommand(&.{
-        "qemu-system-x86_64",
+        "/home/z/my-project/qemu-portable/qemu-portable.sh",
         "-kernel",
         "zig-out/bin/poler-os64",
         "-m", "256M",
@@ -117,7 +117,7 @@ pub fn build(b: *std.Build) void {
 
     // ═══ Run from ISO (CDROM boot) ══════════════════════════════════════
     const run64_iso_cmd = b.addSystemCommand(&.{
-        "qemu-system-x86_64",
+        "/home/z/my-project/qemu-portable/qemu-portable.sh",
         "-cdrom", "poler-os64.iso",
         "-m", "256M",
         "-serial", "stdio",
@@ -131,7 +131,7 @@ pub fn build(b: *std.Build) void {
 
     // ═══ Run from ISO with virtio-blk disk ══════════════════════════════
     const run64_iso_blk_cmd = b.addSystemCommand(&.{
-        "qemu-system-x86_64",
+        "/home/z/my-project/qemu-portable/qemu-portable.sh",
         "-cdrom", "poler-os64.iso",
         "-m", "256M",
         "-serial", "stdio",

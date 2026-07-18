@@ -107,13 +107,13 @@ pub const ObjectManager = struct {
 
     const Self = @This();
 
-    pub fn init() Self {
-        var om = Self{
+    pub fn init(self: *Self) void {
+        self.* = Self{
             .handles = undefined,
             .next_handle = NT_HANDLE_BASE,
             .lock = 0,
         };
-        for (&om.handles) |*entry| {
+        for (&self.handles) |*entry| {
             entry.* = HandleEntry{};
         }
 
@@ -121,12 +121,10 @@ pub const ObjectManager = struct {
         // Handle 0-3: reserved (like Windows, handles 0-3 are invalid)
         // Handle 4+: available for allocation
 
-        om.handles[0] = HandleEntry{ .in_use = true, .obj_type = .Free }; // Reserved
-        om.handles[1] = HandleEntry{ .in_use = true, .obj_type = .Free }; // Reserved
-        om.handles[2] = HandleEntry{ .in_use = true, .obj_type = .Free }; // Reserved
-        om.handles[3] = HandleEntry{ .in_use = true, .obj_type = .Free }; // Reserved
-
-        return om;
+        self.handles[0] = HandleEntry{ .in_use = true, .obj_type = .Free }; // Reserved
+        self.handles[1] = HandleEntry{ .in_use = true, .obj_type = .Free }; // Reserved
+        self.handles[2] = HandleEntry{ .in_use = true, .obj_type = .Free }; // Reserved
+        self.handles[3] = HandleEntry{ .in_use = true, .obj_type = .Free }; // Reserved
     }
 
     /// Create a new handle for the given object type

@@ -24,6 +24,10 @@ SECTIONS
     /* ========================================================================
      * Boot section — 32-bit entry, page tables, GDT
      * ======================================================================== */
+    .multiboot ALIGN(8) : {
+        *(.multiboot)
+    } :boot
+
     .multiboot2 ALIGN(8) : {
         *(.multiboot2)
     } :boot
@@ -44,7 +48,7 @@ SECTIONS
         pml4_addr = .; . += 4096;
         pdpt_addr = .; . += 4096;
         pd_addr   = .; . += 16384;
-        stack_bottom = .; . += 16384;
+        stack_bottom = .; . += 262144;
         stack_top = .;
         *(.bss.boot)
     } :boot
