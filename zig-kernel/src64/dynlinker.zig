@@ -1444,7 +1444,10 @@ pub fn allocateTcbForThread(cr3: u64, thread_id: u32) DynLinkError!u64 {
 
     var i: u64 = 0;
     while (i < num_pages) : (i += 1) {
-        vmm.mapPageInPML4(cr3, tcb_vaddr + i * 4096, phys + i * 4096, vmm.PTE_PRESENT | vmm.PTE_WRITABLE | vmm.PTE_USER);
+        vmm.mapPageInPML4(cr3, tcb_vaddr + i * 4096, phys + i * 4096, vmm.PTE_PRESENT | vmm.PTE_WRITABLE | vmm.PTE_USER) catch {
+            hal.Serial.puts("[DYNLINK] ERROR: failed to map TCB page\n");
+            return DynLinkError.MapFailed;
+        };
     }
 
     // Zero the TCB + TLS block
@@ -1466,7 +1469,7 @@ pub fn allocateTcbForThread(cr3: u64, thread_id: u32) DynLinkError!u64 {
     const dtv_phys = pmm.allocContiguousPages((dtv_size + 4095) / 4096) orelse {
         return DynLinkError.OutOfMemory;
     };
-    const dtv: [*]volatile DtvEntry = @ptrFromInt(dtv_phys);
+    const dtv: [*]DtvEntry = @ptrFromInt(dtv_phys);
     dtv[0].counter = tls_generation;
     dtv[0].pointer = null;
 

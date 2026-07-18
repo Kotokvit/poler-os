@@ -516,8 +516,34 @@ pub fn processMgrCreateThread(pid: u32, start_routine: u64, arg: u64) ?u32 {
         vmm.mapPageInPML4(pcb.cr3, stack_page, phys, vmm.PTE_PRESENT | vmm.PTE_WRITABLE | vmm.PTE_USER) catch return null;
     }
 
-    _ = scheduler.createUserTask(start_routine, pcb.cr3, THREAD_STACK_TOP) catch return null;
+    const task_id = scheduler.createUserTask(start_routine, pcb.cr3, THREAD_STACK_TOP) catch return null;
     _ = arg;
+
+    // v1.1.0: Allocate TCB (Thread Control Block) for TLS support.
+    // This creates a per-thread TCB at a unique virtual address and
+    // copies TLS initialization images from all loaded shared libraries.
+    // The FS_BASE MSR will be set by the scheduler on context switch.
+    const dynlink_mod = @import("dynlinker.zig");
+    var tcb_vaddr: u64 = 0;
+    if (dynlink_mod.allocateTcbForThread(pcb.cr3, @intCast(task_id))) |vaddr| {
+        tcb_vaddr = vaddr;
+    } else |_| {
+        hal.Serial.puts("[PROC] WARNING: TCB allocation failed for task ");
+        hal.Serial.putDecimal(task_id);
+        hal.Serial.puts(" (TLS will not work)\n");
+    }
+
+    // Set FS_BASE in the task struct so the scheduler restores it on switch
+    if (tcb_vaddr != 0) {
+        scheduler.tasks[task_id].tcb_vaddr = tcb_vaddr;
+        scheduler.tasks[task_id].fs_base = tcb_vaddr; // FS_BASE = TCB address
+
+        hal.Serial.puts("[PROC] TCB for task ");
+        hal.Serial.putDecimal(task_id);
+        hal.Serial.puts(" at vaddr=0x");
+        hal.Serial.putHex(tcb_vaddr);
+        hal.Serial.puts(" (FS_BASE set)\n");
+    }
 
     hal.Serial.puts("[PROC] Created thread in PID=");
     hal.Serial.putDecimal(pid);
