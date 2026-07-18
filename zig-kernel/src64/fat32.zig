@@ -648,6 +648,14 @@ pub const Fat32Fs = struct {
                 continue;
             }
 
+            // P0 SECURITY: Path traversal protection — reject ".." to prevent
+            // escaping the intended directory hierarchy, and skip "." (no-op).
+            if (component.len == 2 and component[0] == '.' and component[1] == '.') return null;
+            if (component.len == 1 and component[0] == '.') {
+                start = end + 1;
+                continue; // Skip "." — current directory, no traversal needed
+            }
+
             // Is this the last component?
             const remaining = if (end < p.len) p[end + 1 ..] else "";
             var rem_clean = remaining;

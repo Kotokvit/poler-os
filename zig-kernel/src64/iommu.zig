@@ -396,9 +396,26 @@ pub fn mapVirtioDma(pci_bus: u8, pci_slot: u8, dma_phys: u64, dma_size: u64) boo
 
 /// Check if a DMA access is allowed for a device
 pub fn isDmaAllowed(bus: u8, dev: u8, func: u8, phys: u64, size: u64) bool {
-    // If IOMMU is not enabled, all DMA is allowed (legacy mode)
-    if (!vtd_state.is_enabled) return true;
+    // Only allow all DMA if VT-d was never detected on this system
+    if (!vtd_state.is_available) return true;
 
+    // If available but not enabled (e.g. QEMU 7.0 MMIO bug), enforce
+    // the software allowlist so that only explicitly-approved DMA regions
+    // are accessible.  This prevents a compromised device from DMAing to
+    // arbitrary physical addresses when hardware IOMMU could not be set up.
+    if (!vtd_state.is_enabled) {
+        // Check software allowlist
+        for (vtd_state.approved_regions[0..vtd_state.approved_count]) |region| {
+            if (region.active and region.bus == bus and region.dev == dev and region.func == func) {
+                if (phys >= region.phys_start and phys + size <= region.phys_start + region.size) {
+                    return true;
+                }
+            }
+        }
+        return false; // DMA not in allowlist — BLOCKED
+    }
+
+    // IOMMU is fully enabled — check hardware-approved regions
     for (vtd_state.approved_regions[0..vtd_state.approved_count]) |region| {
         if (region.active and region.bus == bus and region.dev == dev and region.func == func) {
             if (phys >= region.phys_start and phys + size <= region.phys_start + region.size) {

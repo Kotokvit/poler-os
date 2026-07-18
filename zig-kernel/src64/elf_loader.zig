@@ -88,6 +88,7 @@ pub const ElfError = error{
     NoLoadSegments,
     MapFailed,
     OutOfMemory,
+    InvalidAddress,
 };
 
 // ============================================================================
@@ -153,6 +154,9 @@ fn flagsToPageFlags(p_flags: u32) u64 {
 // for user processes. Kept for compatibility with kernel-mode ELF loading.
 // ============================================================================
 
+/// Maximum user-space virtual address — anything at or above this is kernel space.
+const USER_SPACE_MAX: u64 = 0x0000_8000_0000_0000;
+
 pub fn loadElf(elf_data: []const u8) ElfError!ElfLoadResult {
     if (elf_data.len < @sizeOf(Elf64_Ehdr)) {
         return ElfError.InvalidMagic;
@@ -179,6 +183,10 @@ pub fn loadElf(elf_data: []const u8) ElfError!ElfLoadResult {
 
         const phdr: *const Elf64_Phdr = @ptrCast(@alignCast(elf_data.ptr + phdr_offset));
         if (phdr.p_type != PT_LOAD) continue;
+
+        // P0 SECURITY: Validate that p_vaddr is in user space
+        if (phdr.p_vaddr >= USER_SPACE_MAX) return ElfError.InvalidAddress;
+        if (phdr.p_vaddr + phdr.p_memsz > USER_SPACE_MAX) return ElfError.InvalidAddress;
 
         const page_flags = flagsToPageFlags(phdr.p_flags);
         const vaddr_aligned = phdr.p_vaddr & ~@as(u64, 0xFFF);
@@ -423,6 +431,12 @@ pub fn loadElfIntoPML4_v2(elf_data: []const u8, target_pml4: u64, load_base: u64
 
         const phdr: *const Elf64_Phdr = @ptrCast(@alignCast(elf_data.ptr + phdr_offset));
         if (phdr.p_type != PT_LOAD) continue;
+
+        // P0 SECURITY: Validate that p_vaddr is in user space
+        // For PIE, the effective vaddr is p_vaddr + effective_base, so check that.
+        const eff_vaddr = phdr.p_vaddr + effective_base;
+        if (eff_vaddr >= USER_SPACE_MAX) return ElfError.InvalidAddress;
+        if (eff_vaddr + phdr.p_memsz > USER_SPACE_MAX) return ElfError.InvalidAddress;
 
         // For PIE, add load_base to all virtual addresses
         const seg_vaddr = phdr.p_vaddr + effective_base;

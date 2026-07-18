@@ -25,6 +25,21 @@ const subsys = @import("subsystem/subsystem.zig");
 // Import the scheduler for exit/yield handling (legacy compatibility)
 const scheduler = @import("scheduler.zig");
 
+// Import kernel_integrate for process management (capability checks)
+const kernel_integrate = @import("kernel_integrate.zig");
+
+// ============================================================================
+// User-space pointer validation — prevents kernel address dereference
+// ============================================================================
+
+/// Check that an address lies below the kernel-space boundary.
+/// On x86_64 with canonical addressing, user space is 0x0000000000000000 –
+/// 0x00007FFFFFFFFFFF.  Anything at or above 0x0000_8000_0000_0000 is
+/// kernel space and must NEVER be dereferenced from a user-supplied pointer.
+fn isUserAddress(addr: u64) bool {
+    return addr < 0x0000_8000_0000_0000;
+}
+
 // ============================================================================
 // Legacy syscall numbers (for backward compatibility with v0.7.0 user programs)
 // ============================================================================
@@ -66,9 +81,15 @@ pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, sy
     switch (syscall_num) {
         LEGACY_PRINT => {
             // Syscall 1: Print string
-            const ptr: [*]const u8 = @ptrFromInt(arg1);
-            const len: usize = @intCast(arg2);
-            const slice = ptr[0..len];
+            // P0 SECURITY: Validate that the user-supplied buffer is entirely
+            // within user space.  Without this check, a malicious program could
+            // pass a kernel-space address and leak kernel memory.
+            const ptr_addr: u64 = arg1;
+            const len: u64 = arg2;
+            if (!isUserAddress(ptr_addr)) return 0xFFFFFFFF; // EFAULT
+            if (len > 0 and !isUserAddress(ptr_addr + len - 1)) return 0xFFFFFFFF; // EFAULT
+            const ptr: [*]const u8 = @ptrFromInt(ptr_addr);
+            const slice = ptr[0..@as(usize, @intCast(len))];
             if (print_fn) |f| {
                 f(slice);
             } else {
@@ -78,10 +99,12 @@ pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, sy
         },
         LEGACY_READ_KEY => {
             // Syscall 2: Read key (non-blocking)
+            // TODO: Needs capability check (CAP_RAW_IO) when the system is ready
             return hal.kbd_pop();
         },
         LEGACY_CLEAR_SCREEN => {
             // Syscall 3: Clear screen
+            // TODO: Needs capability check (CAP_DEVICE) when the system is ready
             if (clear_screen_fn) |f| {
                 f();
             }
@@ -89,6 +112,7 @@ pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, sy
         },
         LEGACY_EXIT => {
             // Syscall 4: Exit — terminate the calling user process
+            // TODO: Needs capability check (CAP_PROCESS_EXIT) when the system is ready
             hal.Serial.puts("[SYSCALL] exit(");
             hal.Serial.putDecimal(arg1);
             hal.Serial.puts(") — killing user process\n");
@@ -102,10 +126,12 @@ pub export fn zig_syscall_handler(arg1: u64, arg2: u64, arg3: u64, arg4: u64, sy
         },
         LEGACY_YIELD => {
             // Syscall 5: Yield
+            // TODO: Needs capability check when the system is ready
             return 0;
         },
         LEGACY_READ_SERIAL => {
             // Syscall 6: Read serial character (non-blocking)
+            // TODO: Needs capability check (CAP_RAW_IO) when the system is ready
             // Returns 0 if no serial data available, or the ASCII character.
             // Used for -serial stdio interactive mode.
             // Also falls back to polling COM1 LSR if interrupt missed.

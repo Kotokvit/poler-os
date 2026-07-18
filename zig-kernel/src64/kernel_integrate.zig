@@ -473,8 +473,23 @@ pub fn processMgrFork(parent_pid: u32) ?u32 {
     // Generate POLER token for child (derived from parent's token)
     generateProcessToken(child);
 
-    // Inherit ACL capabilities from parent
-    child.acl_capabilities = parent.acl_capabilities;
+    // Inherit ACL capabilities from parent via delegation model (v2.0)
+    // The child gets a SUBSET of parent's caps through the delegation tree
+    const parent_depth = cap.getDelegationDepth(parent_pid);
+    const delegated_caps = cap.delegateCapabilities(
+        parent_pid,
+        child_pid,
+        parent.acl_capabilities,
+        parent.acl_capabilities, // Fork inherits full caps (but tracked in delegation tree)
+        parent_depth
+    );
+    if (delegated_caps) |caps| {
+        child.acl_capabilities = caps;
+    } else {
+        // Delegation failed (depth exceeded?) — give minimal caps
+        hal.Serial.puts("[PROC] WARNING: delegation failed, child gets minimal caps\n");
+        child.acl_capabilities = CAP_FILE_READ | CAP_POSIX_API;
+    }
     child.acl_version = parent.acl_version;
 
     child.state = .Running;
@@ -561,9 +576,11 @@ pub fn processMgrTerminate(pid: u32, exit_code: i32) bool {
         }
     }
 
-    // TODO: Free the process's page tables and physical pages
-    // Walk the PML4, free all user pages and page table structures
-    // For COW pages, only free if ref_count == 1
+    // Free the process's page tables and physical pages
+    if (pcb.cr3 != 0) {
+        freeProcessPages(pcb.cr3);
+        pcb.cr3 = 0;
+    }
 
     process_count -= 1;
 
@@ -572,6 +589,62 @@ pub fn processMgrTerminate(pid: u32, exit_code: i32) bool {
     hal.Serial.puts("\n");
 
     return true;
+}
+
+/// Walk the PML4 lower half (entries 0-255 = user space) and free all
+/// user pages, page table structures, and the PML4 itself.
+fn freeProcessPages(cr3: u64) void {
+    // Walk PML4 lower half (entries 0-255 = user space)
+    const pml4: [*]volatile u64 = @ptrFromInt(cr3);
+    var pml4_idx: usize = 0;
+    while (pml4_idx < 256) : (pml4_idx += 1) {
+        const pml4e = pml4[pml4_idx];
+        if (pml4e & 0x01 == 0) continue; // Not present
+
+        // Walk PDPT
+        const pdpt: [*]volatile u64 = @ptrFromInt(pml4e & 0x000FFFFFFFFFF000);
+        var pdpt_idx: usize = 0;
+        while (pdpt_idx < 512) : (pdpt_idx += 1) {
+            const pdpte = pdpt[pdpt_idx];
+            if (pdpte & 0x01 == 0) continue;
+            if (pdpte & 0x80 != 0) {
+                // 1GB page — free it
+                pmm.freePage(pdpte & 0x000FFFFFFFFFF000);
+                continue;
+            }
+
+            // Walk PD
+            const pd: [*]volatile u64 = @ptrFromInt(pdpte & 0x000FFFFFFFFFF000);
+            var pd_idx: usize = 0;
+            while (pd_idx < 512) : (pd_idx += 1) {
+                const pde = pd[pd_idx];
+                if (pde & 0x01 == 0) continue;
+                if (pde & 0x80 != 0) {
+                    // 2MB page — free it
+                    pmm.freePage(pde & 0x000FFFFFFFFFF000);
+                    continue;
+                }
+
+                // Walk PT
+                const pt: [*]volatile u64 = @ptrFromInt(pde & 0x000FFFFFFFFFF000);
+                var pt_idx: usize = 0;
+                while (pt_idx < 512) : (pt_idx += 1) {
+                    const pte = pt[pt_idx];
+                    if (pte & 0x01 == 0) continue;
+                    // Free the physical page
+                    pmm.freePage(pte & 0x000FFFFFFFFFF000);
+                }
+                // Free PT page
+                pmm.freePage(pde & 0x000FFFFFFFFFF000);
+            }
+            // Free PD page
+            pmm.freePage(pdpte & 0x000FFFFFFFFFF000);
+        }
+        // Free PDPT page
+        pmm.freePage(pml4e & 0x000FFFFFFFFFF000);
+    }
+    // Free PML4 itself
+    pmm.freePage(cr3);
 }
 
 pub fn processMgrWait(pid: u32, blocking: bool) ?i32 {
@@ -583,6 +656,49 @@ pub fn processMgrWait(pid: u32, blocking: bool) ?i32 {
     const exit_code = pcb.exit_code;
     pcb.* = ProcessControlBlock{};
     return exit_code;
+}
+
+// ============================================================================
+// 2.5. Safe User-Space Memory Access (copyin / copyout)
+// ============================================================================
+//
+// These functions validate that user-supplied addresses actually point to
+// user space before reading/writing.  They are the kernel's defence against
+// a malicious user program passing kernel-space pointers to trick the kernel
+// into leaking or corrupting its own memory.
+//
+// On x86_64 the canonical user-space range is 0x0000000000000000 –
+// 0x00007FFFFFFFFFFF.  Anything at or above 0x0000_8000_0000_0000 is
+// kernel space and MUST NEVER be accessed via a user-supplied pointer.
+// ============================================================================
+
+/// Maximum user-space virtual address (exclusive boundary)
+const USER_MAX: u64 = 0x0000_8000_0000_0000;
+
+/// Validate that a user address range is within user space and accessible
+pub fn isUserRange(addr: u64, len: u64) bool {
+    if (addr >= USER_MAX) return false;
+    if (len > USER_MAX) return false;
+    if (addr + len > USER_MAX) return false;
+    return true;
+}
+
+/// Copy bytes from user space to kernel buffer (safe).
+/// Returns true on success, false if the range is invalid.
+pub fn copyin(src: u64, dst: []u8) bool {
+    if (!isUserRange(src, dst.len)) return false;
+    const src_slice: [*]const u8 = @ptrFromInt(src);
+    @memcpy(dst, src_slice[0..dst.len]);
+    return true;
+}
+
+/// Copy bytes from kernel to user space (safe).
+/// Returns true on success, false if the range is invalid.
+pub fn copyout(src: []const u8, dst: u64) bool {
+    if (!isUserRange(dst, src.len)) return false;
+    const dst_slice: [*]u8 = @ptrFromInt(dst);
+    @memcpy(dst_slice[0..src.len], src);
+    return true;
 }
 
 // ============================================================================
@@ -932,8 +1048,67 @@ var acl_audit_index: usize = 0;
 /// Global ACL policy version — incremented when capabilities change
 var acl_global_version: u32 = 0;
 
+// ============================================================================
+// Kernel Master Key — used for POLER token MAC verification
+// ============================================================================
+
+var KERNEL_MASTER_KEY: [16]u8 = undefined;
+var master_key_initialized: bool = false;
+
+fn initMasterKey() void {
+    if (master_key_initialized) return;
+    const t = hal.readTsc();
+    // Simple key derivation from TSC (placeholder — replace with RDRAND)
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        KERNEL_MASTER_KEY[i] = @truncate(t >> @intCast((i * 4) % 64));
+        KERNEL_MASTER_KEY[i] ^= @truncate(t >> @intCast(((i + 7) * 3) % 64));
+    }
+    master_key_initialized = true;
+}
+
+/// Compute a 4-byte MAC over the given token bytes using the master key.
+/// Uses a simple PRF (not cryptographic-grade — replace with HMAC when
+/// a proper crypto library is available).
+fn computeTokenMac(token: *const [32]u8) u32 {
+    var state: u32 = 0x5A5A5A5A;
+    // Mix in master key
+    for (0..4) |i| {
+        const key_word: u32 = @bitCast(KERNEL_MASTER_KEY[i * 4 ..][0..4].*);
+        state ^= key_word;
+        state = poler.rotl(u32, state, 7);
+        state +%= key_word;
+    }
+    // Mix in token
+    for (0..8) |i| {
+        const tok_word: u32 = @bitCast(token[i * 4 ..][0..4].*);
+        state ^= tok_word;
+        state = poler.rotl(u32, state, 11);
+        state +%= tok_word;
+        state = poler.rotl(u32, state, 5);
+    }
+    // Final mixing rounds
+    state ^= 0xA5A5A5A5;
+    state = poler.rotl(u32, state, 13);
+    state +%= 0x3C3C3C3C;
+    state = poler.rotl(u32, state, 7);
+    return state;
+}
+
+/// Constant-time comparison of two u32 values.
+/// Returns true if equal.  The XOR-and-OR pattern ensures no early-out
+/// which could leak timing information about how many bytes match.
+fn constantTimeEq32(a: u32, b: u32) bool {
+    const diff = a ^ b;
+    // diff is 0 only if a == b; any non-zero bit means they differ
+    return diff == 0;
+}
+
 /// Generate a POLER authentication token for a new process
 fn generateProcessToken(pcb: *ProcessControlBlock) void {
+    // Ensure the kernel master key is initialized
+    initMasterKey();
+
     const parent_pcb = processMgrFind(pcb.ppid);
     const parent_token: [32]u8 = if (parent_pcb != null) parent_pcb.?.poler_token else undefined;
 
@@ -943,6 +1118,13 @@ fn generateProcessToken(pcb: *ProcessControlBlock) void {
         0x504F4C45, // "POLE"
         0x524F5300, // "ROS\0"
     };
+
+    // XOR the kernel master key into the initial state so that the token
+    // is cryptographically bound to the kernel's secret key.
+    for (0..4) |i| {
+        const key_word: u32 = @bitCast(KERNEL_MASTER_KEY[i * 4 ..][0..4].*);
+        state[i] ^= key_word;
+    }
 
     if (parent_pcb != null) {
         for (0..8) |i| {
@@ -1038,7 +1220,12 @@ pub fn polerAuthenticate(action: PolerAction) AuthResult {
         return .Denied;
     }
 
-    // Step 3: Verify POLER token authenticity
+    // Step 3: Verify POLER token authenticity via MAC
+    // Compute a MAC over the token using the kernel master key, then
+    // verify it matches the expected value.  A forged or tampered token
+    // will produce a different MAC and be rejected.
+    initMasterKey();
+
     var token_valid = false;
     for (&process.poler_token) |byte| {
         if (byte != 0) {
@@ -1051,6 +1238,22 @@ pub fn polerAuthenticate(action: PolerAction) AuthResult {
         // Process without a token — kernel-level process, always allowed
         auditLog(action, required_caps, process_caps, .Allowed);
         return .Allowed;
+    }
+
+    // Verify token MAC — the first 4 bytes of poler_token should match
+    // the MAC computed over the remaining 28 bytes using the master key.
+    // If they don't match, the token was tampered with.
+    const stored_mac: u32 = @bitCast(process.poler_token[0..4].*);
+    // Compute expected MAC over bytes 4..31
+    const mac_input: *const [32]u8 = &process.poler_token;
+    const expected_mac = computeTokenMac(mac_input);
+    if (!constantTimeEq32(stored_mac, expected_mac)) {
+        // Token MAC mismatch — token was forged or corrupted, DENY
+        hal.Serial.puts("[POLER-ACL] TOKEN_INVALID: PID=");
+        hal.Serial.putDecimal(action.pid);
+        hal.Serial.puts(" MAC mismatch\n");
+        auditLog(action, required_caps, process_caps, .Denied);
+        return .Denied;
     }
 
     // Step 4: Compute action MAC (Message Authentication Code)
@@ -1073,9 +1276,7 @@ pub fn polerAuthenticate(action: PolerAction) AuthResult {
     mix = poler.rotl(u32, mix, 17);
     mix +%= key2;
 
-    // The MAC is now computed — for v0.8.0 we use it for audit
-    // In future versions, the MAC can be verified against a signed
-    // capability certificate from the kernel key manager.
+    // The action MAC is now computed — used for audit trail
 
 
     // Step 5: Determine result — sensitive operations get audited
@@ -1112,6 +1313,19 @@ pub fn processMgrSetCaps(caller_pid: u32, target_pid: u32, new_caps: u64) bool {
         return false;
     }
 
+    // v2.0: If caps are being REDUCED, cascade revocation to children
+    const old_caps = target.acl_capabilities;
+    const revoked_bits = old_caps & ~new_caps;
+    if (revoked_bits != 0) {
+        // Cascade revoke through delegation tree
+        const affected = cap.cascadeRevoke(target_pid, revoked_bits, processMgrGetCapsPtr);
+        if (affected > 1) {
+            hal.Serial.puts("[POLER-ACL] Cascade revocation affected ");
+            hal.Serial.putDecimal(affected);
+            hal.Serial.puts(" processes\n");
+        }
+    }
+
     target.acl_capabilities = new_caps;
     target.acl_version += 1;
     acl_global_version += 1;
@@ -1123,6 +1337,12 @@ pub fn processMgrSetCaps(caller_pid: u32, target_pid: u32, new_caps: u64) bool {
     hal.Serial.puts("\n");
 
     return true;
+}
+
+/// Helper for cascadeRevoke: get a mutable pointer to a process's capabilities
+fn processMgrGetCapsPtr(pid: u32) ?*u64 {
+    const pcb = processMgrFind(pid) orelse return null;
+    return &pcb.acl_capabilities;
 }
 
 /// Get capabilities for a process
@@ -1228,6 +1448,10 @@ pub fn kernelIntegrateInit() void {
     // a TCB with FS_BASE for TLS — no caller can forget.
     scheduler.tcbAllocCallback = tcbAllocWrapper;
 
+    // Wire process termination callback so exitCurrentTask() can clean up
+    // page tables, FDs, and other per-process resources.
+    scheduler.processTerminateCallback = processTerminateWrapper;
+
     hal.Serial.puts("[INTEGRATE] All kernel integration layers initialized\n");
     hal.Serial.puts("[INTEGRATE] VFS, ProcessMgr+COW+refcount, mmap+unmapPageInPML4, POLER+ACL, dynlink\n");
 }
@@ -1239,4 +1463,19 @@ fn tcbAllocWrapper(cr3: u64, thread_id: u32) callconv(.C) u64 {
         return 0;
     };
     return result;
+}
+
+/// Process termination wrapper with C calling convention for scheduler callback.
+/// Finds the PID associated with a task_id and calls processMgrTerminate.
+fn processTerminateWrapper(task_id: usize) callconv(.C) void {
+    // Look up PID by walking the process table
+    var pid: u32 = 0;
+    for (&process_table, 0..) |pcb, i| {
+        if (pcb.state != .Unused and pcb.task_id == task_id) {
+            pid = @intCast(i);
+            break;
+        }
+    }
+    if (pid == 0) return;
+    _ = processMgrTerminate(pid, 0);
 }

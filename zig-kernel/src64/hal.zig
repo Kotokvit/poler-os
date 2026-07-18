@@ -118,6 +118,14 @@ pub fn readCr4() u64 {
     );
 }
 
+pub fn writeCr4(val: u64) void {
+    asm volatile ("mov %[val], %%cr4"
+        :
+        : [val] "r" (val),
+        : "memory"
+    );
+}
+
 pub fn writeCr3(val: u64) void {
     asm volatile ("mov %[val], %%cr3"
         :
@@ -1309,6 +1317,20 @@ pub fn init() void {
     GDT.init();
     Serial.puts("[HAL] GDT loaded\n");
 
+    // 2.5. Enable SMEP (bit 20) in CR4 — prevents kernel from executing user-space code
+    // SMEP is safe to enable early since kernel should never execute user pages.
+    // SMAP (bit 21) is deferred until after IDT setup and scheduler init, because
+    // the kernel legitimately reads multiboot info from potentially user-accessible
+    // pages during early init. SMAP requires stac/clac guards on all copyin/copyout.
+    const cr4 = readCr4();
+    Serial.puts("[HAL] CR4=0x");
+    Serial.putHex(cr4);
+    Serial.puts("\n");
+    // NOTE: SMEP enable deferred to after IDT init on QEMU 7.0 — some QEMU
+    // configurations fault on SMEP before IDT is ready. Will enable in
+    // enableSMEP_SMAP() called from main64.zig after full initialization.
+    // writeCr4(cr4 | (1 << 20)); // SMEP only for now
+
     // 3. Initialize IDT (using ISR stubs from isr64.S)
     IDT.init();
     Serial.puts("[HAL] IDT loaded\n");
@@ -1336,6 +1358,17 @@ pub fn init() void {
     // 7. Enable interrupts!
     sti();
     Serial.puts("[HAL] Interrupts enabled\n");
+}
+
+/// Enable SMEP (Supervisor Mode Execution Prevention) and SMAP (Supervisor Mode
+/// Access Prevention) after full kernel initialization is complete.
+/// Must be called AFTER IDT is set up (page fault handler required for SMAP).
+/// SMEP: prevents Ring 0 from executing user-space pages (UX bit in PTE).
+/// SMAP: prevents Ring 0 from reading/writing user-space pages without stac/clac.
+pub fn enableSMEP_SMAP() void {
+    const cr4 = readCr4();
+    writeCr4(cr4 | (1 << 20) | (1 << 21));
+    Serial.puts("[HAL] SMEP + SMAP enabled\n");
 }
 
 // ============================================================================

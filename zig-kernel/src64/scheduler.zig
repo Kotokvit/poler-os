@@ -28,6 +28,12 @@ pub const MAX_TASKS = 64;
 // Parameters: (cr3, thread_id) → tcb_vaddr (0 on failure)
 pub var tcbAllocCallback: ?*const fn (u64, u32) callconv(.C) u64 = null;
 
+// Process terminate callback — registered by kernel_integrate at init.
+// Breaks circular dependency: scheduler.zig ↔ kernel_integrate.zig via function pointer.
+// Called from exitCurrentTask() so that the process manager can clean up
+// page tables, file descriptors, etc.  Parameter: task_id.
+pub var processTerminateCallback: ?*const fn (usize) callconv(.C) void = null;
+
 pub const TaskState = enum {
     Ready,
     Running,
@@ -118,6 +124,11 @@ pub fn exitCurrentTask() callconv(.C) void {
     hal.Serial.putHex(current_task_id);
     hal.Serial.puts("\n");
     tasks[current_task_id].state = .Killed;
+
+    // Notify process manager so it can clean up page tables, FDs, etc.
+    if (processTerminateCallback) |cb| {
+        cb(current_task_id);
+    }
 }
 
 /// Mark a task as Killed. The idle task (id 0) CANNOT be killed —
