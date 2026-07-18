@@ -1,0 +1,47 @@
+[
+  {
+    "url": "https://github.com/cdong1012/IDAPython-Malware-Scripts/blob/master/Lockbit/lockbit_dropped_files/Registry.pol",
+    "name": "Registry.pol - IDAPython-Malware-Scripts - GitHub",
+    "snippet": "-Malware-Scripts development by creating an account on GitHub. Edit and raw actions PReg \\Windows Defender;DisableAntiSpyware; © 2026 GitHub, Inc.",
+    "host_name": "github.com",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/jtpereyda/regpol",
+    "name": "jtpereyda/regpol: Read Registry.pol files on Linux, or anywhere  - GitHub",
+    "snippet": "Read Registry.pol files on Linux (or anywhere Python runs!). Not to be confused with regpol. Install Requires Python 3.7 or greater. Missing: Kotokvit os-",
+    "host_name": "github.com",
+    "rank": 1,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/goldstar611/registry.pol",
+    "name": "Windows registry.pol viewer/editor - GitHub",
+    "snippet": "Windows registry.pol viewer/editor. Contribute to goldstar611/registry.pol development by creating an account on GitHub. Search code, repositories, users, ... Missing: Kotokvit os-",
+    "host_name": "github.com",
+    "rank": 2,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/PowerShell/GPRegistryPolicyParser",
+    "name": "PowerShell/GPRegistryPolicyParser - GitHub",
+    "snippet": "These cmdlets will allow you to work with .POL files, which contain the registry keys enacted by Group Policy. Missing: Kotokvit os-",
+    "host_name": "github.com",
+    "rank": 3,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://gist.github.com/iDigitalFlame/5489d8db0f684d1ee48486bfcb12443a",
+    "name": "Registry \".pol\" file reader/writer to assist with debugging complex setups",
+    "snippet": "file reader/writer to assist with debugging complex setups. Instantly share code, notes, and snippets. Download ZIP Registry \".pol\" file reader/writer to ... Missing: Kotokvit os- data",
+    "host_name": "gist.github.com",
+    "rank": 4,
+    "date": "",
+    "favicon": ""
+  }
+]
