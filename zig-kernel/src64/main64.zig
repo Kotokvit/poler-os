@@ -749,56 +749,44 @@ fn sys_print(str: []const u8) void {
 }
 
 fn task1() noreturn {
-    sys_print("\n=== POLER-OS v0.8.0 Interactive Shell ===\n");
-    sys_print("Type 'help' for commands. Serial input enabled (-serial stdio).\n\n");
+    // v1.2.0: Kernel tasks must NOT use syscalls (SYSCALL/SYSRET assumes Ring 3 → Ring 0
+    // transition). Kernel tasks run in Ring 0, so we call kernel functions directly.
+    // All shell I/O uses hal.Serial.puts() and hal.Serial.readChar().
+    hal.Serial.puts("\n=== POLER-OS v0.8.0 Interactive Shell ===\n");
+    hal.Serial.puts("Type 'help' for commands.\n\n");
     
     var buf: [128]u8 = undefined;
     var len: usize = 0;
     
-    sys_print("poler> ");
+    hal.Serial.puts("poler> ");
     
     while (true) {
-        // Dual input: check both keyboard and serial
-        var ch: u8 = 0;
-        
-        // Try keyboard first (syscall 2)
-        ch = sys_read_key();
-        
-        // If no keyboard input, try serial (syscall 6)
-        if (ch == 0) {
-            ch = sys_read_serial();
-        }
-        
+        const ch = hal.Serial.readChar();
         if (ch != 0) {
-            if (ch == '\n') {
-                sys_print("\n");
+            if (ch == '\n' or ch == '\r') {
+                hal.Serial.puts("\n");
                 if (len > 0) {
                     const cmd = buf[0..len];
                     execute_command(cmd);
                     len = 0;
                 }
-                sys_print("poler> ");
-            } else if (ch == '\x08') { // Backspace
+                hal.Serial.puts("poler> ");
+            } else if (ch == '\x08' or ch == '\x7F') {
                 if (len > 0) {
                     len -= 1;
-                    sys_print("\x08 \x08");
-                }
-            } else if (ch == '\x7F') { // DEL (common in serial terminals)
-                if (len > 0) {
-                    len -= 1;
-                    sys_print("\x08 \x08");
+                    hal.Serial.puts("\x08 \x08");
                 }
             } else if (len < buf.len - 1) {
                 buf[len] = ch;
                 len += 1;
                 const ech = [1]u8{ch};
-                sys_print(&ech);
+                hal.Serial.puts(&ech);
             }
         } else {
-            // Yield CPU (prevent 100% host core usage under softemu)
+            // Yield CPU
             var i: usize = 0;
-            while (i < 50000) : (i += 1) {
-                asm volatile ("nop");
+            while (i < 100000) : (i += 1) {
+                asm volatile ("pause");
             }
         }
     }
@@ -834,29 +822,29 @@ fn sys_clear_screen() void {
 
 fn execute_command(cmd: []const u8) void {
     if (eq(cmd, "help")) {
-        sys_print("Available commands:\n");
-        sys_print("  help      - Show this help menu\n");
-        sys_print("  about     - About POLER-OS\n");
-        sys_print("  clear     - Clear screen\n");
-        sys_print("  poler     - Run POLER core self-tests\n");
-        sys_print("  ls        - List files in root dir\n");
-        sys_print("  ls <dir>  - List files in subdirectory\n");
-        sys_print("  cat <f>   - Read a file (supports paths)\n");
-        sys_print("  mkdir <d> - Create a directory\n");
-        sys_print("  touch <f> - Create an empty file\n");
-        sys_print("  write <f> <text> - Write text to a file\n");
-        sys_print("  rm <f>    - Delete a file\n");
-        sys_print("  disk      - Show disk info\n");
+        hal.Serial.puts("Available commands:\n");
+        hal.Serial.puts("  help      - Show this help menu\n");
+        hal.Serial.puts("  about     - About POLER-OS\n");
+        hal.Serial.puts("  clear     - Clear screen\n");
+        hal.Serial.puts("  poler     - Run POLER core self-tests\n");
+        hal.Serial.puts("  ls        - List files in root dir\n");
+        hal.Serial.puts("  ls <dir>  - List files in subdirectory\n");
+        hal.Serial.puts("  cat <f>   - Read a file (supports paths)\n");
+        hal.Serial.puts("  mkdir <d> - Create a directory\n");
+        hal.Serial.puts("  touch <f> - Create an empty file\n");
+        hal.Serial.puts("  write <f> <text> - Write text to a file\n");
+        hal.Serial.puts("  rm <f>    - Delete a file\n");
+        hal.Serial.puts("  disk      - Show disk info\n");
     } else if (eq(cmd, "about")) {
-        sys_print("POLER-OS v0.8.0 (x86_64 Long Mode)\n");
-        sys_print("Cognitive Semantic Runtime Environment.\n");
-        sys_print("Dual-personality: NT API + POSIX. Serial input enabled.\n");
+        hal.Serial.puts("POLER-OS v0.8.0 (x86_64 Long Mode)\n");
+        hal.Serial.puts("Cognitive Semantic Runtime Environment.\n");
+        hal.Serial.puts("Dual-personality: NT API + POSIX. Serial input enabled.\n");
     } else if (eq(cmd, "clear")) {
-        sys_clear_screen();
+        clear_screen();
     } else if (eq(cmd, "poler")) {
-        sys_print("Running POLER core PND mix...\n");
-        sys_print("pndMix(42, 17, 1) = 0x6448728B\n");
-        sys_print("pndMixAlt(42, 17, 1) = 0x000002CD\n");
+        hal.Serial.puts("Running POLER core PND mix...\n");
+        hal.Serial.puts("pndMix(42, 17, 1) = 0x6448728B\n");
+        hal.Serial.puts("pndMixAlt(42, 17, 1) = 0x000002CD\n");
     } else if (eq(cmd, "ls")) {
         cmd_ls("");
     } else if (startsWith(cmd, "ls ")) {
@@ -874,9 +862,9 @@ fn execute_command(cmd: []const u8) void {
     } else if (startsWith(cmd, "rm ")) {
         cmd_rm(cmd[3..]);
     } else {
-        sys_print("Unknown command: ");
-        sys_print(cmd);
-        sys_print("\n");
+        hal.Serial.puts("Unknown command: ");
+        hal.Serial.puts(cmd);
+        hal.Serial.puts("\n");
     }
 }
 
@@ -890,7 +878,7 @@ fn startsWith(str: []const u8, prefix: []const u8) bool {
 
 fn cmd_ls(dir_path: []const u8) void {
     const fs = fat32.getFs() orelse {
-        sys_print("No filesystem mounted\n");
+        hal.Serial.puts("No filesystem mounted\n");
         return;
     };
 
@@ -898,15 +886,15 @@ fn cmd_ls(dir_path: []const u8) void {
     var dir_cluster: u32 = fs.root_cluster;
     if (dir_path.len > 0) {
         const dir_file = fs.openFile(dir_path) orelse {
-            sys_print("Directory not found: ");
-            sys_print(dir_path);
-            sys_print("\n");
+            hal.Serial.puts("Directory not found: ");
+            hal.Serial.puts(dir_path);
+            hal.Serial.puts("\n");
             return;
         };
         if (!dir_file.is_directory) {
-            sys_print("Not a directory: ");
-            sys_print(dir_path);
-            sys_print("\n");
+            hal.Serial.puts("Not a directory: ");
+            hal.Serial.puts(dir_path);
+            hal.Serial.puts("\n");
             return;
         }
         dir_cluster = if (dir_file.first_cluster >= 2) dir_file.first_cluster else fs.root_cluster;
@@ -923,19 +911,19 @@ fn lsCallback(ctx_opaque: *anyopaque, info: *const fat32.DirEntryInfo) void {
     _ = ctx;
 
     if (info.is_directory) {
-        sys_print("  [DIR] ");
+        hal.Serial.puts("  [DIR] ");
     } else {
-        sys_print("       ");
+        hal.Serial.puts("       ");
     }
 
     // Print name
     if (info.name_len > 0) {
-        sys_print(info.name[0..info.name_len]);
+        hal.Serial.puts(info.name[0..info.name_len]);
     }
 
     // Print size for files
     if (!info.is_directory) {
-        sys_print(" (");
+        hal.Serial.puts(" (");
         // Simple decimal conversion
         var buf: [16]u8 = undefined;
         var len: usize = 0;
@@ -957,36 +945,36 @@ fn lsCallback(ctx_opaque: *anyopaque, info: *const fat32.DirEntryInfo) void {
                 len += 1;
             }
         }
-        sys_print(buf[0..len]);
-        sys_print(" bytes)");
+        hal.Serial.puts(buf[0..len]);
+        hal.Serial.puts(" bytes)");
     }
-    sys_print("\n");
+    hal.Serial.puts("\n");
 }
 
 fn cmd_cat(filename: []const u8) void {
     const fs = fat32.getFs() orelse {
-        sys_print("No filesystem mounted\n");
+        hal.Serial.puts("No filesystem mounted\n");
         return;
     };
 
     // Open the file
     var file = fs.openFile(filename) orelse {
-        sys_print("File not found: ");
-        sys_print(filename);
-        sys_print("\n");
+        hal.Serial.puts("File not found: ");
+        hal.Serial.puts(filename);
+        hal.Serial.puts("\n");
         return;
     };
 
     if (file.is_directory) {
-        sys_print("Is a directory: ");
-        sys_print(filename);
-        sys_print("\n");
+        hal.Serial.puts("Is a directory: ");
+        hal.Serial.puts(filename);
+        hal.Serial.puts("\n");
         return;
     }
 
     // Allocate a DMA buffer for reading
     const buf_phys = pmm.allocPage() orelse {
-        sys_print("Out of memory\n");
+        hal.Serial.puts("Out of memory\n");
         return;
     };
     const buf: [*]u8 = @ptrFromInt(@as(usize, @intCast(buf_phys)));
@@ -1000,17 +988,17 @@ fn cmd_cat(filename: []const u8) void {
 
         // Print the data (truncate to reasonable length for terminal)
         if (total_read + bytes_read <= 2048) {
-            sys_print(buf[0..bytes_read]);
+            hal.Serial.puts(buf[0..bytes_read]);
         } else if (total_read < 2048) {
             const show = 2048 - total_read;
-            sys_print(buf[0..@intCast(show)]);
-            sys_print("\n... (truncated)\n");
+            hal.Serial.puts(buf[0..@intCast(show)]);
+            hal.Serial.puts("\n... (truncated)\n");
         }
         total_read += bytes_read;
     }
 
     if (total_read == 0) {
-        sys_print("(empty file)\n");
+        hal.Serial.puts("(empty file)\n");
     }
 
     pmm.freePage(buf_phys);
@@ -1018,12 +1006,12 @@ fn cmd_cat(filename: []const u8) void {
 
 fn cmd_disk() void {
     if (!virtio_blk.isInitialized()) {
-        sys_print("No disk driver found\n");
+        hal.Serial.puts("No disk driver found\n");
         return;
     }
 
-    sys_print("VirtIO Block Device:\n");
-    sys_print("  Capacity: ");
+    hal.Serial.puts("VirtIO Block Device:\n");
+    hal.Serial.puts("  Capacity: ");
     var buf: [20]u8 = undefined;
     var len: usize = 0;
     var val = virtio_blk.getCapacityBytes();
@@ -1044,10 +1032,10 @@ fn cmd_disk() void {
             len += 1;
         }
     }
-    sys_print(buf[0..len]);
-    sys_print(" bytes\n");
+    hal.Serial.puts(buf[0..len]);
+    hal.Serial.puts(" bytes\n");
 
-    sys_print("  Sectors: 0x");
+    hal.Serial.puts("  Sectors: 0x");
     // Hex for sector count
     const sectors = virtio_blk.getCapacitySectors();
     var hex_buf: [16]u8 = undefined;
@@ -1071,16 +1059,16 @@ fn cmd_disk() void {
             hex_buf[hex_len - 1 - i] = tmp;
         }
     }
-    sys_print(hex_buf[0..hex_len]);
-    sys_print("\n");
+    hal.Serial.puts(hex_buf[0..hex_len]);
+    hal.Serial.puts("\n");
 
     const fs = fat32.getFs() orelse {
-        sys_print("  No FAT32 filesystem mounted\n");
+        hal.Serial.puts("  No FAT32 filesystem mounted\n");
         return;
     };
 
-    sys_print("  Filesystem: FAT32\n");
-    sys_print("  Cluster size: ");
+    hal.Serial.puts("  Filesystem: FAT32\n");
+    hal.Serial.puts("  Cluster size: ");
     // Decimal for cluster size
     len = 0;
     val = fs.cluster_size;
@@ -1101,18 +1089,18 @@ fn cmd_disk() void {
             len += 1;
         }
     }
-    sys_print(buf[0..len]);
-    sys_print(" bytes\n");
+    hal.Serial.puts(buf[0..len]);
+    hal.Serial.puts(" bytes\n");
 }
 
 fn cmd_mkdir(dirname: []const u8) void {
     const fs = fat32.getFs() orelse {
-        sys_print("No filesystem mounted\n");
+        hal.Serial.puts("No filesystem mounted\n");
         return;
     };
 
     if (virtio_blk.isReadOnly()) {
-        sys_print("Device is read-only\n");
+        hal.Serial.puts("Device is read-only\n");
         return;
     }
 
@@ -1122,7 +1110,7 @@ fn cmd_mkdir(dirname: []const u8) void {
     while (path.len > 0 and path[0] == '/') path = path[1..];
 
     if (path.len == 0) {
-        sys_print("Invalid directory name\n");
+        hal.Serial.puts("Invalid directory name\n");
         return;
     }
 
@@ -1140,22 +1128,22 @@ fn cmd_mkdir(dirname: []const u8) void {
         const parent_path = path[0..last_slash];
         dir_name = path[last_slash + 1 ..];
         if (dir_name.len == 0) {
-            sys_print("Invalid directory name\n");
+            hal.Serial.puts("Invalid directory name\n");
             return;
         }
         parent_cluster = fs.resolveDirCluster(parent_path) orelse {
-            sys_print("Parent directory not found: ");
-            sys_print(parent_path);
-            sys_print("\n");
+            hal.Serial.puts("Parent directory not found: ");
+            hal.Serial.puts(parent_path);
+            hal.Serial.puts("\n");
             return;
         };
     }
 
     const result = fs.createDir(parent_cluster, dir_name);
     if (result) |cluster| {
-        sys_print("Created directory: ");
-        sys_print(dirname);
-        sys_print(" (cluster ");
+        hal.Serial.puts("Created directory: ");
+        hal.Serial.puts(dirname);
+        hal.Serial.puts(" (cluster ");
         var buf: [16]u8 = undefined;
         var len: usize = 0;
         var val: u32 = cluster;
@@ -1176,23 +1164,23 @@ fn cmd_mkdir(dirname: []const u8) void {
                 len += 1;
             }
         }
-        sys_print(buf[0..len]);
-        sys_print(")\n");
+        hal.Serial.puts(buf[0..len]);
+        hal.Serial.puts(")\n");
     } else {
-        sys_print("Failed to create directory: ");
-        sys_print(dirname);
-        sys_print("\n");
+        hal.Serial.puts("Failed to create directory: ");
+        hal.Serial.puts(dirname);
+        hal.Serial.puts("\n");
     }
 }
 
 fn cmd_touch(filename: []const u8) void {
     const fs = fat32.getFs() orelse {
-        sys_print("No filesystem mounted\n");
+        hal.Serial.puts("No filesystem mounted\n");
         return;
     };
 
     if (virtio_blk.isReadOnly()) {
-        sys_print("Device is read-only\n");
+        hal.Serial.puts("Device is read-only\n");
         return;
     }
 
@@ -1201,7 +1189,7 @@ fn cmd_touch(filename: []const u8) void {
     while (path.len > 0 and path[0] == '/') path = path[1..];
 
     if (path.len == 0) {
-        sys_print("Invalid file name\n");
+        hal.Serial.puts("Invalid file name\n");
         return;
     }
 
@@ -1218,37 +1206,37 @@ fn cmd_touch(filename: []const u8) void {
         const parent_path = path[0..last_slash];
         file_name = path[last_slash + 1 ..];
         if (file_name.len == 0) {
-            sys_print("Invalid file name\n");
+            hal.Serial.puts("Invalid file name\n");
             return;
         }
         parent_cluster = fs.resolveDirCluster(parent_path) orelse {
-            sys_print("Parent directory not found: ");
-            sys_print(parent_path);
-            sys_print("\n");
+            hal.Serial.puts("Parent directory not found: ");
+            hal.Serial.puts(parent_path);
+            hal.Serial.puts("\n");
             return;
         };
     }
 
     const file = fs.createFile(parent_cluster, file_name);
     if (file) |_| {
-        sys_print("Created file: ");
-        sys_print(filename);
-        sys_print("\n");
+        hal.Serial.puts("Created file: ");
+        hal.Serial.puts(filename);
+        hal.Serial.puts("\n");
     } else {
-        sys_print("Failed to create file: ");
-        sys_print(filename);
-        sys_print("\n");
+        hal.Serial.puts("Failed to create file: ");
+        hal.Serial.puts(filename);
+        hal.Serial.puts("\n");
     }
 }
 
 fn cmd_write(args: []const u8) void {
     const fs = fat32.getFs() orelse {
-        sys_print("No filesystem mounted\n");
+        hal.Serial.puts("No filesystem mounted\n");
         return;
     };
 
     if (virtio_blk.isReadOnly()) {
-        sys_print("Device is read-only\n");
+        hal.Serial.puts("Device is read-only\n");
         return;
     }
 
@@ -1258,7 +1246,7 @@ fn cmd_write(args: []const u8) void {
     while (space_pos < args.len and args[space_pos] != ' ') : (space_pos += 1) {}
 
     if (space_pos == 0 or space_pos >= args.len) {
-        sys_print("Usage: write <filename> <text>\n");
+        hal.Serial.puts("Usage: write <filename> <text>\n");
         return;
     }
 
@@ -1266,7 +1254,7 @@ fn cmd_write(args: []const u8) void {
     const text = args[space_pos + 1 ..];
 
     if (text.len == 0) {
-        sys_print("No text provided\n");
+        hal.Serial.puts("No text provided\n");
         return;
     }
 
@@ -1289,13 +1277,13 @@ fn cmd_write(args: []const u8) void {
                 const parent_path = path[0..last_slash];
                 file_name = path[last_slash + 1 ..];
                 parent_cluster = fs.resolveDirCluster(parent_path) orelse {
-                    sys_print("Parent directory not found\n");
+                    hal.Serial.puts("Parent directory not found\n");
                     return;
                 };
             }
 
             break :blk fs.createFile(parent_cluster, file_name) orelse {
-                sys_print("Failed to create file\n");
+                hal.Serial.puts("Failed to create file\n");
                 return;
             };
         };
@@ -1304,7 +1292,7 @@ fn cmd_write(args: []const u8) void {
 
     // Write the text
     const written = fs.writeFile(&file, text);
-    sys_print("Wrote ");
+    hal.Serial.puts("Wrote ");
     var buf: [16]u8 = undefined;
     var len: usize = 0;
     var val: u32 = written;
@@ -1325,10 +1313,10 @@ fn cmd_write(args: []const u8) void {
             len += 1;
         }
     }
-    sys_print(buf[0..len]);
-    sys_print(" bytes to ");
-    sys_print(filename);
-    sys_print("\n");
+    hal.Serial.puts(buf[0..len]);
+    hal.Serial.puts(" bytes to ");
+    hal.Serial.puts(filename);
+    hal.Serial.puts("\n");
 }
 
 fn eq(a: []const u8, b: []const u8) bool {
@@ -1350,23 +1338,23 @@ fn task2() noreturn {
 
 fn cmd_rm(filename: []const u8) void {
     const fs = fat32.getFs() orelse {
-        sys_print("No filesystem mounted\n");
+        hal.Serial.puts("No filesystem mounted\n");
         return;
     };
 
     if (filename.len == 0) {
-        sys_print("Usage: rm <file>\n");
+        hal.Serial.puts("Usage: rm <file>\n");
         return;
     }
 
     if (fs.deleteFile(filename)) {
-        sys_print("Deleted: ");
-        sys_print(filename);
-        sys_print("\n");
+        hal.Serial.puts("Deleted: ");
+        hal.Serial.puts(filename);
+        hal.Serial.puts("\n");
     } else {
-        sys_print("Failed to delete: ");
-        sys_print(filename);
-        sys_print(" (not found or is a directory)\n");
+        hal.Serial.puts("Failed to delete: ");
+        hal.Serial.puts(filename);
+        hal.Serial.puts(" (not found or is a directory)\n");
     }
 }
 

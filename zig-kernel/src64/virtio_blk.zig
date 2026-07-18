@@ -425,6 +425,13 @@ pub fn init() VblkError!void {
     write8(VIRTIO_PCI_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
 
     vblk_state.initialized = true;
+
+    // v0.8.1: Register IRQ callback so HAL can acknowledge VirtIO interrupts
+    // from handleIRQ (vector 49).  This clears the ISR register and prevents
+    // interrupt storms.  Without it, the first VirtIO interrupt causes #GP
+    // because vector 49 had no IDT entry.
+    hal.virtioBlkIrqCallback = handleIrq;
+
     hal.Serial.puts("[VBLK] Initialization complete!\n");
 }
 
@@ -605,8 +612,22 @@ fn setupDmaSlots() VblkError!void {
 /// Read sectors from the block device into a buffer.
 /// The buffer can be in any accessible memory — data is DMA'd into a
 /// dedicated DMA slot first, then copied to the caller's buffer.
+///
+/// v0.8.1 FIX: Interrupts are disabled (cli) for the entire I/O operation
+/// to prevent the scheduler from switching tasks mid-I/O.  Without this,
+/// the APIC timer fires during waitForCompletion(), schedule() switches to
+/// another task, and when we return the DMA slot / descriptor chain may be
+/// in an inconsistent state — causing #GP faults or data corruption.
 pub fn readSectors(sector: u64, num_sectors: u32, buffer: []u8) VblkError!void {
     if (!vblk_state.initialized) return VblkError.NoDevice;
+
+    // v0.8.1: Disable interrupts for the entire I/O operation.
+    // This prevents scheduler preemption during the critical section
+    // (descriptor setup → submit → poll → copy).  VirtIO is polled,
+    // so we don't need interrupts enabled during waitForCompletion().
+    // The device completes DMA regardless of CPU interrupt state.
+    hal.cli();
+    defer hal.sti();
 
     const slot = allocDmaSlot() orelse return VblkError.NoDmaSlot;
     defer freeDmaSlot(slot);
@@ -653,16 +674,6 @@ pub fn readSectors(sector: u64, num_sectors: u32, buffer: []u8) VblkError!void {
     // Submit and wait
     submitChain(head);
 
-    hal.Serial.puts("[VBLK-READ] Submitted: sector=");
-    hal.Serial.putHex(sector);
-    hal.Serial.puts(" n=");
-    hal.Serial.putHex(num_sectors);
-    hal.Serial.puts(" head=");
-    hal.Serial.putHex(head);
-    hal.Serial.puts(" data_phys=0x");
-    hal.Serial.putHex(data_phys);
-    hal.Serial.puts("\n");
-
     const completed = waitForCompletion(50_000_000) orelse {
         // Debug: dump virtqueue state on timeout
         const used_dbg = getUsed();
@@ -678,11 +689,6 @@ pub fn readSectors(sector: u64, num_sectors: u32, buffer: []u8) VblkError!void {
         hal.Serial.putHex(isr);
         hal.Serial.puts(" dev_status=0x");
         hal.Serial.putHex(read8(VIRTIO_PCI_STATUS));
-        hal.Serial.puts("\n");
-        hal.Serial.puts("[VBLK-READ] PFN=0x");
-        hal.Serial.putHex(@as(u32, @truncate(vblk_state.desc_phys >> 12)));
-        hal.Serial.puts(" vq_base=0x");
-        hal.Serial.putHex(vblk_state.vq_phys);
         hal.Serial.puts("\n");
         freeDescChain(head);
         return VblkError.Timeout;
@@ -709,9 +715,14 @@ pub fn readSectors(sector: u64, num_sectors: u32, buffer: []u8) VblkError!void {
 }
 
 /// Write sectors from a buffer to the block device.
+/// v0.8.1 FIX: Interrupts disabled during I/O (same reason as readSectors).
 pub fn writeSectors(sector: u64, num_sectors: u32, buffer: []const u8) VblkError!void {
     if (!vblk_state.initialized) return VblkError.NoDevice;
     if (vblk_state.is_read_only) return VblkError.WriteFailed;
+
+    // v0.8.1: Disable interrupts to prevent scheduler preemption mid-I/O
+    hal.cli();
+    defer hal.sti();
 
     const slot = allocDmaSlot() orelse return VblkError.NoDmaSlot;
     defer freeDmaSlot(slot);
@@ -756,12 +767,6 @@ pub fn writeSectors(sector: u64, num_sectors: u32, buffer: []const u8) VblkError
     status_ptr.* = 0xFF;
 
     submitChain(head);
-
-    hal.Serial.puts("[VBLK-WRITE] Submitted: sector=");
-    hal.Serial.putHex(sector);
-    hal.Serial.puts(" n=");
-    hal.Serial.putHex(num_sectors);
-    hal.Serial.puts("\n");
 
     const completed = waitForCompletion(50_000_000) orelse {
         const used_dbg = getUsed();

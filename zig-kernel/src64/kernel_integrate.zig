@@ -362,25 +362,9 @@ pub fn processMgrCreateProcess(parent_pid: u32, subsystem_id: subsys.SubsystemId
     };
     pcb.task_id = task_id;
 
-    // v1.1.0: Allocate TCB (Thread Control Block) for TLS support.
-    // Every user thread must have its own TCB with FS_BASE pointing to it.
-    const tcb_vaddr: u64 = dynlink.allocateTcbForThread(user_cr3, @intCast(task_id)) catch blk: {
-        hal.Serial.puts("[PROC] WARNING: TCB alloc failed for PID=");
-        hal.Serial.putDecimal(pid);
-        hal.Serial.puts(" (TLS will not work)\n");
-        break :blk 0;
-    };
-    if (tcb_vaddr != 0) {
-        scheduler.tasks[task_id].tcb_vaddr = tcb_vaddr;
-        scheduler.tasks[task_id].fs_base = tcb_vaddr;
-        hal.Serial.puts("[PROC] TCB for PID=");
-        hal.Serial.putDecimal(pid);
-        hal.Serial.puts(" task=");
-        hal.Serial.putDecimal(task_id);
-        hal.Serial.puts(" at vaddr=0x");
-        hal.Serial.putHex(tcb_vaddr);
-        hal.Serial.puts("\n");
-    }
+    // v1.2.0: TCB allocation is now automatic inside createUserTask()
+    // (via scheduler.tcbAllocCallback). No manual wiring needed here.
+    // The task's tcb_vaddr and fs_base are already set by the scheduler.
 
     // Generate POLER authentication token
     generateProcessToken(pcb);
@@ -465,20 +449,8 @@ pub fn processMgrFork(parent_pid: u32) ?u32 {
     };
     child.task_id = task_id;
 
-    // v1.1.0: Allocate TCB for forked child thread (TLS support)
-    const fork_tcb_vaddr: u64 = dynlink.allocateTcbForThread(child_cr3, @intCast(task_id)) catch blk: {
-        hal.Serial.puts("[PROC] WARNING: TCB alloc failed for forked child\n");
-        break :blk 0;
-    };
-    if (fork_tcb_vaddr != 0) {
-        scheduler.tasks[task_id].tcb_vaddr = fork_tcb_vaddr;
-        scheduler.tasks[task_id].fs_base = fork_tcb_vaddr;
-        hal.Serial.puts("[PROC] TCB for forked child task=");
-        hal.Serial.putDecimal(task_id);
-        hal.Serial.puts(" at vaddr=0x");
-        hal.Serial.putHex(fork_tcb_vaddr);
-        hal.Serial.puts("\n");
-    }
+    // v1.2.0: TCB allocation is now automatic inside createUserTask()
+    // (via scheduler.tcbAllocCallback). No manual wiring needed here.
 
     // Copy file descriptor table (shallow copy — increments handle refs)
     child.fd_table = parent.fd_table;
@@ -551,34 +523,13 @@ pub fn processMgrCreateThread(pid: u32, start_routine: u64, arg: u64) ?u32 {
         vmm.mapPageInPML4(pcb.cr3, stack_page, phys, vmm.PTE_PRESENT | vmm.PTE_WRITABLE | vmm.PTE_USER) catch return null;
     }
 
-    const task_id = scheduler.createUserTask(start_routine, pcb.cr3, THREAD_STACK_TOP) catch return null;
+    const _task_id = scheduler.createUserTask(start_routine, pcb.cr3, THREAD_STACK_TOP) catch return null;
     _ = arg;
+    _ = _task_id;
 
-    // v1.1.0: Allocate TCB (Thread Control Block) for TLS support.
-    // This creates a per-thread TCB at a unique virtual address and
-    // copies TLS initialization images from all loaded shared libraries.
-    // The FS_BASE MSR will be set by the scheduler on context switch.
-    const dynlink_mod = @import("dynlinker.zig");
-    var tcb_vaddr: u64 = 0;
-    if (dynlink_mod.allocateTcbForThread(pcb.cr3, @intCast(task_id))) |vaddr| {
-        tcb_vaddr = vaddr;
-    } else |_| {
-        hal.Serial.puts("[PROC] WARNING: TCB allocation failed for task ");
-        hal.Serial.putDecimal(task_id);
-        hal.Serial.puts(" (TLS will not work)\n");
-    }
-
-    // Set FS_BASE in the task struct so the scheduler restores it on switch
-    if (tcb_vaddr != 0) {
-        scheduler.tasks[task_id].tcb_vaddr = tcb_vaddr;
-        scheduler.tasks[task_id].fs_base = tcb_vaddr; // FS_BASE = TCB address
-
-        hal.Serial.puts("[PROC] TCB for task ");
-        hal.Serial.putDecimal(task_id);
-        hal.Serial.puts(" at vaddr=0x");
-        hal.Serial.putHex(tcb_vaddr);
-        hal.Serial.puts(" (FS_BASE set)\n");
-    }
+    // v1.2.0: TCB allocation is now automatic inside createUserTask()
+    // (via scheduler.tcbAllocCallback). No manual wiring needed here.
+    // The task's tcb_vaddr and fs_base are already set by the scheduler.
 
     hal.Serial.puts("[PROC] Created thread in PID=");
     hal.Serial.putDecimal(pid);
@@ -1215,6 +1166,20 @@ pub fn kernelIntegrateInit() void {
     // v0.9.0: Initialize dynamic linker
     dynlink.init();
 
+    // v1.2.0: Wire TCB allocation into scheduler task creation path.
+    // Any call to scheduler.createUserTask() will now automatically allocate
+    // a TCB with FS_BASE for TLS — no caller can forget.
+    scheduler.tcbAllocCallback = tcbAllocWrapper;
+
     hal.Serial.puts("[INTEGRATE] All kernel integration layers initialized\n");
     hal.Serial.puts("[INTEGRATE] VFS, ProcessMgr+COW+refcount, mmap+unmapPageInPML4, POLER+ACL, dynlink\n");
+}
+
+/// TCB allocation wrapper with C calling convention for scheduler callback.
+/// Returns TCB virtual address on success, 0 on failure.
+fn tcbAllocWrapper(cr3: u64, thread_id: u32) callconv(.C) u64 {
+    const result = dynlink.allocateTcbForThread(cr3, thread_id) catch {
+        return 0;
+    };
+    return result;
 }

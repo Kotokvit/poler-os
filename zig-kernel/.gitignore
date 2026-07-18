@@ -3,3 +3,7 @@ disk_blank.img
 poler-os64.iso
 poler-os64-flat.bin
 poler-os64-mb32.elf
+.zig-cache/
+zig-out/
+*.iso
+iso/boot/grub/i386-pc/

@@ -22,6 +22,12 @@ const hal = @import("hal.zig");
 
 pub const MAX_TASKS = 8;
 
+// v1.2.0: TCB allocation callback — registered by kernel_integrate at init.
+// Breaks circular dependency: scheduler.zig ↔ dynlinker.zig via function pointer.
+// Called automatically from createUserTask() to wire TLS into every user thread.
+// Parameters: (cr3, thread_id) → tcb_vaddr (0 on failure)
+pub var tcbAllocCallback: ?*const fn (u64, u32) callconv(.C) u64 = null;
+
 pub const TaskState = enum {
     Ready,
     Running,
@@ -92,6 +98,12 @@ pub fn init() void {
     // Breaks circular dependency hal.zig ↔ scheduler.zig via function pointer.
     hal.exitCallback = exitCurrentTask;
 
+    // v1.2.0: Register timer tick callback — APIC timer calls this on every tick.
+    // This is the heart of preemptive multitasking: the timer fires (vector 48),
+    // HAL calls schedule(), which picks the next Ready task and returns its RSP.
+    // Without this, kernel tasks are created but never scheduled!
+    hal.timerTickCallback = schedule;
+
     hal.Serial.puts("[SCHED] Scheduler initialized (v0.7.0 Ring 3 + exit syscall)\n");
 }
 
@@ -153,7 +165,16 @@ pub fn createTask(entry_point: u64) !usize {
     frame_ptr.rip = entry_point;
     frame_ptr.cs = 0x08; // Kernel code segment selector (Ring 0)
     frame_ptr.rflags = 0x202; // IF (Interrupt Enable Flag) set
-    frame_ptr.rsp = kstack_top - 176; // Use stack below the frame as the task's RSP
+    // v1.2.0: Stack alignment fix — the System V AMD64 ABI requires RSP to be
+    // 16-byte aligned BEFORE the call instruction. After IRETQ pops the frame,
+    // the task starts with this RSP. The function prologue does push rbp (-8),
+    // then sub rsp, N. For movaps to work, RSP after the prologue must be 16-byte
+    // aligned. Since kstack_top is 16-byte aligned and 176 % 16 == 0,
+    // (kstack_top - 176) is also 16-byte aligned. But the push rbp at function
+    // entry misaligns it by 8. We fix this by subtracting 8 from the initial RSP,
+    // which gives the function entry a misaligned RSP that becomes properly aligned
+    // after push rbp.
+    frame_ptr.rsp = kstack_top - 176 - 8;
     frame_ptr.ss = 0x10; // Kernel data segment selector (Ring 0)
     frame_ptr.vector = 48; // APIC timer vector (matches actual interrupt source)
     frame_ptr.error_code = 0;
@@ -233,6 +254,28 @@ pub fn createUserTask(entry_point: u64, user_cr3: u64, user_stack: u64) !usize {
 
     // Save stack pointer to task control block
     task.rsp = @intFromPtr(frame_ptr);
+
+    // v1.2.0: Automatically allocate TCB for TLS support.
+    // If tcbAllocCallback is registered (by kernel_integrate), every user
+    // task automatically gets a TCB with FS_BASE wired for %fs:0 TLS access.
+    // This ensures no caller can forget to wire TLS — it's built into the
+    // task creation path itself.
+    if (tcbAllocCallback) |cb| {
+        const tcb_vaddr = cb(user_cr3, @intCast(id));
+        if (tcb_vaddr != 0) {
+            task.tcb_vaddr = tcb_vaddr;
+            task.fs_base = tcb_vaddr;
+            hal.Serial.puts("[SCHED] TCB auto-allocated for user task ");
+            hal.Serial.putHex(id);
+            hal.Serial.puts(" at vaddr=0x");
+            hal.Serial.putHex(tcb_vaddr);
+            hal.Serial.puts("\n");
+        } else {
+            hal.Serial.puts("[SCHED] WARNING: TCB alloc failed for user task ");
+            hal.Serial.putHex(id);
+            hal.Serial.puts(" (TLS will not work)\n");
+        }
+    }
 
     hal.Serial.puts("[SCHED] Created user task ");
     hal.Serial.putHex(id);

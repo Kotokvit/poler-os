@@ -85,34 +85,38 @@ pub fn build(b: *std.Build) void {
     const run64_headless_step = b.step("run64-headless", "Run 64-bit kernel headless (serial only)");
     run64_headless_step.dependOn(&run64_headless_cmd.step);
 
-    // ═══ Run 64-bit kernel with virtio-blk disk ═════════════════════════
+    // ═══ Run 64-bit kernel with virtio-blk disk (ISO boot) ════════════
+    // v0.8.1: Changed from -kernel to -cdrom boot because the 64-bit ELF
+    // kernel requires GRUB/multiboot loader. -boot d = boot from CDROM.
     const run64_blk_cmd = b.addSystemCommand(&.{
         "/home/z/my-project/qemu-portable/qemu-portable.sh",
-        "-kernel",
-        "zig-out/bin/poler-os64",
+        "-cdrom", "poler-os64.iso",
         "-m", "256M",
         "-serial", "stdio",
         "-no-reboot",
+        "-boot", "d",
         "-drive", "file=disk.img,if=virtio,format=raw",
     });
     run64_blk_cmd.step.dependOn(b.getInstallStep());
 
-    const run64_blk_step = b.step("run64-blk", "Run 64-bit kernel in QEMU with virtio-blk disk");
+    const run64_blk_step = b.step("run64-blk", "Run 64-bit kernel from ISO in QEMU with virtio-blk disk");
     run64_blk_step.dependOn(&run64_blk_cmd.step);
 
-    // ═══ Run 64-bit kernel headless with virtio-blk ═════════════════════
+    // ═══ Run 64-bit kernel headless with virtio-blk (ISO boot) ════════
+    // v0.8.1: -nographic mode for headless serial testing.
+    // Serial console works via stdin/stdout — type commands directly.
     const run64_blk_headless_cmd = b.addSystemCommand(&.{
         "/home/z/my-project/qemu-portable/qemu-portable.sh",
-        "-kernel",
-        "zig-out/bin/poler-os64",
+        "-cdrom", "poler-os64.iso",
         "-m", "256M",
         "-nographic",
         "-no-reboot",
+        "-boot", "d",
         "-drive", "file=disk.img,if=virtio,format=raw",
     });
     run64_blk_headless_cmd.step.dependOn(b.getInstallStep());
 
-    const run64_blk_headless_step = b.step("run64-blk-headless", "Run 64-bit kernel headless with virtio-blk");
+    const run64_blk_headless_step = b.step("run64-blk-headless", "Run 64-bit kernel headless with virtio-blk (serial console)");
     run64_blk_headless_step.dependOn(&run64_blk_headless_cmd.step);
 
     // ═══ Run from ISO (CDROM boot) ══════════════════════════════════════

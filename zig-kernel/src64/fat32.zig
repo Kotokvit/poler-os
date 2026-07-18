@@ -44,29 +44,29 @@ const ATTR_LFN: u8 = ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_VOLUME_ID
 pub const Bpb = extern struct {
     jmp_boot: [3]u8,
     oem_name: [8]u8,
-    bytes_per_sector: u16,
+    bytes_per_sector: u16 align(1),
     sectors_per_cluster: u8,
-    reserved_sectors: u16,
+    reserved_sectors: u16 align(1),
     num_fats: u8,
-    root_entry_count: u16,
-    total_sectors_16: u16,
+    root_entry_count: u16 align(1),
+    total_sectors_16: u16 align(1),
     media_type: u8,
-    fat_size_16: u16,
-    sectors_per_track: u16,
-    num_heads: u16,
-    hidden_sectors: u32,
-    total_sectors_32: u32,
-    fat_size_32: u32,
-    ext_flags: u16,
-    fs_version: u16,
-    root_cluster: u32,
-    fs_info_sector: u16,
-    backup_boot_sector: u16,
+    fat_size_16: u16 align(1),
+    sectors_per_track: u16 align(1),
+    num_heads: u16 align(1),
+    hidden_sectors: u32 align(1),
+    total_sectors_32: u32 align(1),
+    fat_size_32: u32 align(1),
+    ext_flags: u16 align(1),
+    fs_version: u16 align(1),
+    root_cluster: u32 align(1),
+    fs_info_sector: u16 align(1),
+    backup_boot_sector: u16 align(1),
     reserved: [12]u8,
     drive_number: u8,
     reserved1: u8,
     boot_sig: u8,
-    volume_id: u32,
+    volume_id: u32 align(1),
     volume_label: [11]u8,
     fs_type: [8]u8,
 };
@@ -77,25 +77,25 @@ pub const DirEntry = extern struct {
     attr: u8,
     nt_reserved: u8,
     creation_time_tenth: u8,
-    creation_time: u16,
-    creation_date: u16,
-    last_access_date: u16,
-    first_cluster_hi: u16,
-    last_write_time: u16,
-    last_write_date: u16,
-    first_cluster_lo: u16,
-    file_size: u32,
+    creation_time: u16 align(1),
+    creation_date: u16 align(1),
+    last_access_date: u16 align(1),
+    first_cluster_hi: u16 align(1),
+    last_write_time: u16 align(1),
+    last_write_date: u16 align(1),
+    first_cluster_lo: u16 align(1),
+    file_size: u32 align(1),
 };
 
 pub const LfnEntry = extern struct {
     seq: u8,
-    name1: [5]u16,
+    name1: [5]u16 align(1),
     attr: u8,
     type: u8,
     checksum: u8,
-    name2: [6]u16,
-    first_cluster: u16,
-    name3: [2]u16,
+    name2: [6]u16 align(1),
+    first_cluster: u16 align(1),
+    name3: [2]u16 align(1),
 };
 
 pub const File = struct {
@@ -215,6 +215,18 @@ pub const Fat32Fs = struct {
             return null;
         };
 
+        // v0.8.1 debug: dump first 32 bytes of BPB to diagnose read issues
+        hal.Serial.puts("[FAT32] BPB first 32 bytes:\n  ");
+        var bi: usize = 0;
+        while (bi < 32) : (bi += 1) {
+            hal.Serial.putHex(fs.io_buf[bi]);
+            hal.Serial.puts(" ");
+        }
+        hal.Serial.puts("\n");
+
+        // v0.8.1: Bpb is extern struct with align(1) on u16/u32 fields
+        // to match the on-disk layout (no padding for unaligned multi-byte fields).
+        // @alignCast is safe because io_buf is page-aligned (from PMM).
         const bpb_ptr: *const Bpb = @ptrCast(@alignCast(fs.io_buf));
         fs.bpb = bpb_ptr.*;
 
