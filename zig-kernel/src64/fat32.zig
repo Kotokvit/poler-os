@@ -1442,6 +1442,267 @@ pub const Fat32Fs = struct {
         }
         hal.Serial.puts("\n");
     }
+
+    // ================================================================
+    // FAT32 Formatting (mkfs)
+    // ================================================================
+
+    /// Format a virtio-blk device with a fresh FAT32 filesystem.
+    /// Creates BPB, FAT tables, root directory, and FSInfo sector.
+    /// Destroys all existing data on the device.
+    pub fn format(disk_capacity_bytes: u64) bool {
+        if (!virtio_blk.isInitialized()) {
+            hal.Serial.puts("[FAT32 FORMAT] No virtio-blk driver available\n");
+            return false;
+        }
+        if (virtio_blk.isReadOnly()) {
+            hal.Serial.puts("[FAT32 FORMAT] Device is read-only\n");
+            return false;
+        }
+
+        hal.Serial.puts("[FAT32 FORMAT] Formatting device...\n");
+
+        const SECTOR: u64 = 512;
+
+        // Calculate geometry for a standard FAT32 filesystem
+        const total_sectors = disk_capacity_bytes / SECTOR;
+        if (total_sectors < 32768) {
+            hal.Serial.puts("[FAT32 FORMAT] Device too small (min 16MB)\n");
+            return false;
+        }
+
+        // Choose sectors_per_cluster based on disk size (Microsoft spec)
+        const spc: u8 = if (total_sectors < 532480) @as(u8, 1) // <260MB: 1
+        else if (total_sectors < 16777216) @as(u8, 8) // <8GB: 8
+        else if (total_sectors < 33554432) @as(u8, 16) // <16GB: 16
+        else if (total_sectors < 67108864) @as(u8, 32) // <32GB: 32
+        else @as(u8, 64); // >=32GB: 64
+
+        const reserved_sectors: u16 = 32; // Standard for FAT32
+        const num_fats: u8 = 2;
+        const cluster_size: u32 = @as(u32, spc) * 512;
+
+        // Calculate FAT size using Microsoft's formula:
+        // FAT sectors = ((total_sectors - reserved - root_dir_sectors) / spc * 4 + 511) / 512
+        // Then round up and add safety margin
+        const data_sectors_approx = total_sectors - @as(u64, reserved_sectors);
+        const num_clusters_approx = data_sectors_approx / @as(u64, spc);
+        // Each FAT entry is 4 bytes; each FAT sector holds 128 entries
+        const fat_sectors_approx = (num_clusters_approx * 4 + 511) / 512;
+        // Add 1% safety margin, minimum 1 sector
+        const fat_size_32: u32 = @intCast(fat_sectors_approx + (fat_sectors_approx / 100 + 1));
+
+        const data_start: u64 = @as(u64, reserved_sectors) + @as(u64, num_fats) * @as(u64, fat_size_32);
+        const data_sectors = total_sectors - data_start;
+        const total_data_clusters: u32 = @intCast(data_sectors / @as(u64, spc));
+
+        hal.Serial.puts("[FAT32 FORMAT] Geometry: total_sectors=");
+        hal.Serial.putHex(@as(u32, @intCast(total_sectors)));
+        hal.Serial.puts(" spc=");
+        hal.Serial.putHex(spc);
+        hal.Serial.puts(" fat_size=");
+        hal.Serial.putHex(fat_size_32);
+        hal.Serial.puts(" data_clusters=");
+        hal.Serial.putHex(total_data_clusters);
+        hal.Serial.puts("\n");
+
+        // Allocate temporary buffers
+        const buf_phys = pmm.allocPage() orelse {
+            hal.Serial.puts("[FAT32 FORMAT] ERROR: Failed to allocate buffer\n");
+            return false;
+        };
+        const buf: [*]u8 = @ptrFromInt(@as(usize, @intCast(buf_phys)));
+        defer _ = pmm.freePage(buf_phys);
+
+        // ── Step 1: Write BPB (Boot Sector) at sector 0 ──
+        @memset(buf[0..512], 0);
+
+        // Jump instruction (x86 NOP + short jump)
+        buf[0] = 0xEB; // jmp short
+        buf[1] = 0x58; // offset to bootstrap
+        buf[2] = 0x90; // NOP
+
+        // OEM Name
+        const oem = "POLER-OS";
+        @memcpy(buf[3..11], oem);
+
+        // BPB fields (little-endian)
+        // bytes_per_sector = 512
+        buf[11] = 0x00; buf[12] = 0x02; // 512
+        // sectors_per_cluster
+        buf[13] = spc;
+        // reserved_sectors
+        buf[14] = @truncate(reserved_sectors);
+        buf[15] = @truncate(reserved_sectors >> 8);
+        // num_fats
+        buf[16] = num_fats;
+        // root_entry_count (0 for FAT32)
+        buf[17] = 0; buf[18] = 0;
+        // total_sectors_16 (0 for FAT32)
+        buf[19] = 0; buf[20] = 0;
+        // media_type (0xF8 = hard disk)
+        buf[21] = 0xF8;
+        // fat_size_16 (0 for FAT32)
+        buf[22] = 0; buf[23] = 0;
+        // sectors_per_track (63 standard)
+        buf[24] = 63; buf[25] = 0;
+        // num_heads (255 standard)
+        buf[26] = 255; buf[27] = 0;
+        // hidden_sectors
+        var hs: u32 = 0;
+        @memcpy(buf[28..32], @as([*]const u8, @ptrCast(&hs))[0..4]);
+        // total_sectors_32
+        const ts32: u32 = @intCast(total_sectors);
+        @memcpy(buf[32..36], @as([*]const u8, @ptrCast(&ts32))[0..4]);
+
+        // FAT32-specific fields (starting at offset 36)
+        // fat_size_32
+        @memcpy(buf[36..40], @as([*]const u8, @ptrCast(&fat_size_32))[0..4]);
+        // ext_flags (0 = both FATs active)
+        buf[40] = 0; buf[41] = 0;
+        // fs_version (0)
+        buf[42] = 0; buf[43] = 0;
+        // root_cluster (2)
+        const root_cluster: u32 = 2;
+        @memcpy(buf[44..48], @as([*]const u8, @ptrCast(&root_cluster))[0..4]);
+        // fs_info_sector (1)
+        buf[48] = 1; buf[49] = 0;
+        // backup_boot_sector (6)
+        buf[50] = 6; buf[51] = 0;
+        // reserved (12 bytes, already 0)
+
+        // Drive number
+        buf[64] = 0x80; // Hard disk
+        // reserved1
+        buf[65] = 0;
+        // boot_sig (0x29 = extended boot signature)
+        buf[66] = 0x29;
+        // volume_id
+        const vol_id: u32 = 0x504F4C45; // "POLE"
+        @memcpy(buf[67..71], @as([*]const u8, @ptrCast(&vol_id))[0..4]);
+        // volume_label
+        const vol_label = "POLER-OS   ";
+        @memcpy(buf[71..82], vol_label);
+        // fs_type
+        const fs_type = "FAT32   ";
+        @memcpy(buf[82..90], fs_type);
+
+        // Boot sector signature
+        buf[510] = 0x55;
+        buf[511] = 0xAA;
+
+        virtio_blk.writeSectors(0, 1, buf[0..512]) catch {
+            hal.Serial.puts("[FAT32 FORMAT] ERROR: Failed to write BPB\n");
+            return false;
+        };
+        hal.Serial.puts("[FAT32 FORMAT] BPB written (sector 0)\n");
+
+        // ── Step 2: Write backup BPB at sector 6 ──
+        virtio_blk.writeSectors(6, 1, buf[0..512]) catch {
+            hal.Serial.puts("[FAT32 FORMAT] WARNING: Failed to write backup BPB\n");
+        };
+
+        // ── Step 3: Write FSInfo sector at sector 1 ──
+        @memset(buf[0..512], 0);
+        // Lead signature
+        const lead_sig: u32 = 0x41615252;
+        @memcpy(buf[0..4], @as([*]const u8, @ptrCast(&lead_sig))[0..4]);
+        // Reserved (480 bytes, already 0)
+        // Struct signature
+        const struct_sig: u32 = 0x61417272;
+        @memcpy(buf[484..488], @as([*]const u8, @ptrCast(&struct_sig))[0..4]);
+        // Free cluster count (0xFFFFFFFF = unknown)
+        const free_count: u32 = 0xFFFFFFFF;
+        @memcpy(buf[488..492], @as([*]const u8, @ptrCast(&free_count))[0..4]);
+        // Next free cluster (hint: cluster 3)
+        const next_free: u32 = 3;
+        @memcpy(buf[492..496], @as([*]const u8, @ptrCast(&next_free))[0..4]);
+        // Reserved (12 bytes, already 0)
+        // Trail signature
+        const trail_sig: u32 = 0xAA550000;
+        @memcpy(buf[508..512], @as([*]const u8, @ptrCast(&trail_sig))[0..4]);
+
+        virtio_blk.writeSectors(1, 1, buf[0..512]) catch {
+            hal.Serial.puts("[FAT32 FORMAT] ERROR: Failed to write FSInfo\n");
+            return false;
+        };
+        hal.Serial.puts("[FAT32 FORMAT] FSInfo written (sector 1)\n");
+
+        // ── Step 4: Write backup FSInfo at sector 7 ──
+        virtio_blk.writeSectors(7, 1, buf[0..512]) catch {};
+
+        // ── Step 5: Zero out reserved sectors (2-5, 8-31) ──
+        @memset(buf[0..512], 0);
+        var res_sec: u64 = 2;
+        while (res_sec < reserved_sectors) : (res_sec += 1) {
+            if (res_sec == 6 or res_sec == 7) continue; // Already written
+            virtio_blk.writeSectors(res_sec, 1, buf[0..512]) catch continue;
+        }
+
+        // ── Step 6: Initialize FAT tables ──
+        // First FAT starts at sector 'reserved_sectors'
+        // Second FAT starts at sector 'reserved_sectors + fat_size_32'
+        @memset(buf[0..512], 0);
+
+        // Entry 0: media_type in low byte + 0x0FFFFFF8
+        // 0x0FFFFFF8 means: media byte 0xF8, end-of-chain marker
+        const fat0: u32 = 0x0FFFFFF8;
+        @memcpy(buf[0..4], @as([*]const u8, @ptrCast(&fat0))[0..4]);
+        // Entry 1: end-of-chain marker
+        const fat1: u32 = 0x0FFFFFFF;
+        @memcpy(buf[4..8], @as([*]const u8, @ptrCast(&fat1))[0..4]);
+        // Entry 2: root directory cluster — end-of-chain
+        const fat2: u32 = 0x0FFFFFFF;
+        @memcpy(buf[8..12], @as([*]const u8, @ptrCast(&fat2))[0..4]);
+        // Entries 3+ are 0 (free)
+
+        // Write first sector of each FAT copy
+        var fat_num: u32 = 0;
+        while (fat_num < num_fats) : (fat_num += 1) {
+            const fat_start = @as(u64, reserved_sectors) + @as(u64, fat_num) * @as(u64, fat_size_32);
+            virtio_blk.writeSectors(fat_start, 1, buf[0..512]) catch {
+                hal.Serial.puts("[FAT32 FORMAT] ERROR: Failed to write FAT ");
+                hal.Serial.putHex(fat_num);
+                hal.Serial.puts("\n");
+                return false;
+            };
+
+            // Zero out remaining FAT sectors
+            @memset(buf[0..512], 0);
+            var fat_sec: u64 = 1;
+            while (fat_sec < fat_size_32) : (fat_sec += 1) {
+                virtio_blk.writeSectors(fat_start + fat_sec, 1, buf[0..512]) catch continue;
+            }
+
+            // Re-write the first sector with FAT entries (buf was zeroed)
+            @memset(buf[0..512], 0);
+            @memcpy(buf[0..4], @as([*]const u8, @ptrCast(&fat0))[0..4]);
+            @memcpy(buf[4..8], @as([*]const u8, @ptrCast(&fat1))[0..4]);
+            @memcpy(buf[8..12], @as([*]const u8, @ptrCast(&fat2))[0..4]);
+            virtio_blk.writeSectors(fat_start, 1, buf[0..512]) catch {};
+        }
+        hal.Serial.puts("[FAT32 FORMAT] FAT tables initialized\n");
+
+        // ── Step 7: Zero out root directory cluster (cluster 2) ──
+        @memset(buf[0..512], 0);
+        const root_dir_sector = data_start; // Cluster 2 = first data sector
+        var dir_sec: u64 = 0;
+        while (dir_sec < spc) : (dir_sec += 1) {
+            virtio_blk.writeSectors(root_dir_sector + dir_sec, 1, buf[0..512]) catch continue;
+        }
+        hal.Serial.puts("[FAT32 FORMAT] Root directory initialized (cluster 2)\n");
+
+        hal.Serial.puts("[FAT32 FORMAT] Format complete!\n");
+        hal.Serial.puts("[FAT32 FORMAT]   Volume: POLER-OS\n");
+        hal.Serial.puts("[FAT32 FORMAT]   Cluster size: ");
+        hal.Serial.putHex(cluster_size);
+        hal.Serial.puts(" bytes\n");
+        hal.Serial.puts("[FAT32 FORMAT]   Data clusters: ");
+        hal.Serial.putHex(total_data_clusters);
+        hal.Serial.puts("\n");
+
+        return true;
+    }
 };
 
 // ============================================================================
@@ -1451,8 +1712,31 @@ pub const Fat32Fs = struct {
 var fat32_fs: ?Fat32Fs = null;
 
 pub fn init() bool {
+    // Try to mount existing FAT32 filesystem
     fat32_fs = Fat32Fs.init() orelse {
-        hal.Serial.puts("[FAT32] Failed to initialize\n");
+        hal.Serial.puts("[FAT32] No valid filesystem found\n");
+
+        // Auto-format if virtio-blk is available and writable
+        if (virtio_blk.isInitialized() and !virtio_blk.isReadOnly()) {
+            const capacity = virtio_blk.getCapacityBytes();
+            if (capacity > 0) {
+                hal.Serial.puts("[FAT32] Auto-formatting device (");
+                hal.Serial.putHex(@as(u32, @intCast(capacity)));
+                hal.Serial.puts(" bytes)...\n");
+
+                if (Fat32Fs.format(capacity)) {
+                    hal.Serial.puts("[FAT32] Auto-format successful, mounting...\n");
+                    fat32_fs = Fat32Fs.init() orelse {
+                        hal.Serial.puts("[FAT32] ERROR: Mount failed after format\n");
+                        return false;
+                    };
+                    return true;
+                } else {
+                    hal.Serial.puts("[FAT32] Auto-format failed\n");
+                }
+            }
+        }
+
         return false;
     };
     return true;
