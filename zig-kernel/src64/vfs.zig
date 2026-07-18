@@ -161,7 +161,7 @@ pub const VfsOpenFlags = packed struct(u32) {
 
 pub const VfsOps = struct {
     // File operations
-    open: *const fn (*anyopaque, []const u8, VfsOpenFlags) ?VfsFileHandle,
+    open: *const fn (*anyopaque, []const u8, VfsOpenFlags) ?*VfsFileHandle,
     read: *const fn (*VfsFileHandle, []u8, u64) u64,
     write: *const fn (*VfsFileHandle, []const u8, u64) u64,
     close: *const fn (*VfsFileHandle) void,
@@ -660,7 +660,7 @@ pub const Fat32VfsOps = struct {
 
     // --- VfsOps implementations ---
 
-    fn fat32Open(fs_opaque: *anyopaque, path: []const u8, flags: VfsOpenFlags) ?VfsFileHandle {
+    fn fat32Open(fs_opaque: *anyopaque, path: []const u8, flags: VfsOpenFlags) ?*VfsFileHandle {
         const fs: *fat32.Fat32Fs = @ptrCast(@alignCast(fs_opaque));
 
         const fat32_file = fs.openFile(path) orelse {
@@ -706,7 +706,7 @@ pub const Fat32VfsOps = struct {
             .fs_private = fat32_file.first_cluster,
         };
 
-        return fh.vfs_handle;
+        return &fh.vfs_handle;
     }
 
     fn fat32Read(handle: *VfsFileHandle, buf: []u8, count: u64) u64 {
@@ -907,7 +907,7 @@ pub const CpioVfsOps = struct {
         if (idx < 32) cpio_handles_used[idx] = false;
     }
 
-    fn cpioOpen(fs_opaque: *anyopaque, path: []const u8, _: VfsOpenFlags) ?VfsFileHandle {
+    fn cpioOpen(fs_opaque: *anyopaque, path: []const u8, _: VfsOpenFlags) ?*VfsFileHandle {
         const ctx: *CpioContext = @ptrCast(@alignCast(fs_opaque));
         const archive = ctx.asSlice();
         var parser = cpio.CpioParser.init(archive);
@@ -930,7 +930,7 @@ pub const CpioVfsOps = struct {
                 };
                 @memcpy(fh.vfs_handle.path[0..path.len], path);
                 fh.vfs_handle.path_len = path.len;
-                return fh.vfs_handle;
+                return &fh.vfs_handle;
             }
         }
         return null;
