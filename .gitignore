@@ -1,2 +1,8 @@
 skills/
 node_modules/
+poler-os-drive/
+poler-os-source/
+*.deb
+*.tar.xz
+*.tar.gz
+!zig-kernel/iso/**/*.tar.gz
