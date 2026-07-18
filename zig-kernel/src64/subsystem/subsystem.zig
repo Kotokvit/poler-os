@@ -197,6 +197,12 @@ pub const ProcessSubsystemInfo = struct {
 var initialized: bool = false;
 var global_objmgr: objmgr.ObjectManager = undefined;
 
+/// Get a reference to the global Object Manager.
+/// Used by shell commands and kernel integration layer to inspect handles.
+pub fn getObjectManager() *objmgr.ObjectManager {
+    return &global_objmgr;
+}
+
 pub fn init() void {
     if (initialized) return;
 

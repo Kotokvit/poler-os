@@ -1473,6 +1473,12 @@ pub fn kernelIntegrateInit() void {
     hal.Serial.puts("[INTEGRATE] VFS, ProcessMgr+COW+refcount, mmap+unmapPageInPML4, POLER+ACL, dynlink\n");
 }
 
+/// Get the global Object Manager from the subsystem dispatcher.
+/// Used by the shell 'handles' command to inspect handle tables.
+pub fn getObjectManager() *objmgr.ObjectManager {
+    return subsys.getObjectManager();
+}
+
 /// TCB allocation wrapper with C calling convention for scheduler callback.
 /// Returns TCB virtual address on success, 0 on failure.
 fn tcbAllocWrapper(cr3: u64, thread_id: u32) callconv(.C) u64 {

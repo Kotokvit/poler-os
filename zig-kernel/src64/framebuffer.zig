@@ -255,14 +255,40 @@ pub fn put_pixel(x: u32, y: u32, r: u8, g: u8, b: u8) void {
     if (x >= fb.width or y >= fb.height) return;
     
     const offset = @as(u64, y) * @as(u64, fb.pitch) + @as(u64, x) * @as(u64, fb.bpp / 8);
-    const ptr: [*]volatile u32 = @ptrFromInt(@as(usize, @intCast(fb.addr + offset)));
+    const ptr: [*]volatile u8 = @ptrFromInt(@as(usize, @intCast(fb.addr + offset)));
     
     if (fb.bpp == 32) {
+        const ptr32: [*]volatile u32 = @ptrCast(@alignCast(ptr));
         if (fb.pixel_type == @intFromEnum(PixelFormat.bgr888)) {
-            ptr[0] = @as(u32, b) | (@as(u32, g) << 8) | (@as(u32, r) << 16);
+            ptr32[0] = @as(u32, b) | (@as(u32, g) << 8) | (@as(u32, r) << 16);
         } else {
-            ptr[0] = @as(u32, r) | (@as(u32, g) << 8) | (@as(u32, b) << 16);
+            ptr32[0] = @as(u32, r) | (@as(u32, g) << 8) | (@as(u32, b) << 16);
         }
+    } else if (fb.bpp == 16) {
+        // RGB565: 5 bits red, 6 bits green, 5 bits blue
+        const ptr16: [*]volatile u16 = @ptrCast(@alignCast(ptr));
+        const r5: u16 = @as(u16, r >> 3);
+        const g6: u16 = @as(u16, g >> 2);
+        const b5: u16 = @as(u16, b >> 3);
+        if (fb.pixel_type == @intFromEnum(PixelFormat.rgb565)) {
+            ptr16[0] = (r5 << 11) | (g6 << 5) | b5;
+        } else {
+            // BGR565 or similar — treat as RGB565
+            ptr16[0] = (r5 << 11) | (g6 << 5) | b5;
+        }
+    } else if (fb.bpp == 8) {
+        // Indexed/palette mode — use simple 3-3-2 color mapping
+        // This provides basic color in -vga std 8-bit palette mode
+        // Maps RGB to the standard VGA 256-color palette approximation
+        const r3: u8 = r >> 5;
+        const g3: u8 = g >> 5;
+        const b2: u8 = b >> 6;
+        // Standard VGA palette: 6x6x6 color cube starts at index 16
+        // Map 3-3-2 to the closest 6x6x6 color
+        const r6: u8 = if (r3 > 0) (r3 - 1) else 0;
+        const g6: u8 = if (g3 > 0) (g3 - 1) else 0;
+        const b6: u8 = if (b2 > 0) (b2 - 1) else 0;
+        ptr[0] = 16 + (b6 * 36) + (g6 * 6) + r6;
     }
 }
 
@@ -392,4 +418,34 @@ fn scroll_up() void {
 pub fn set_cursor(x: u32, y: u32) void {
     cursor_x = x;
     cursor_y = y;
+}
+
+/// Get framebuffer address
+pub fn getAddr() u64 {
+    return fb.addr;
+}
+
+/// Get framebuffer width
+pub fn getWidth() u32 {
+    return fb.width;
+}
+
+/// Get framebuffer height
+pub fn getHeight() u32 {
+    return fb.height;
+}
+
+/// Get bits per pixel
+pub fn getBpp() u8 {
+    return fb.bpp;
+}
+
+/// Get pitch (bytes per scanline)
+pub fn getPitch() u32 {
+    return fb.pitch;
+}
+
+/// Get pixel type (0=indexed, 1=rgb888, 2=bgr888, 3=rgb565)
+pub fn getPixelType() u8 {
+    return fb.pixel_type;
 }

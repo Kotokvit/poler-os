@@ -787,11 +787,107 @@ pub const Fat32Fs = struct {
         if (p.len == 0) return self.root_cluster;
 
         // Open the path — if it's a directory, return its cluster
-        const f = self.openFile(path) orelse return null; // Return null instead of silently falling back to root
-        if (f.is_directory and f.first_cluster >= 2) {
-            return f.first_cluster;
+        const f = self.openFile(path) orelse return null;
+        if (!f.is_directory) return null; // Not a directory
+
+        // Root directory's first_cluster is always >= 2 on FAT32,
+        // but subdirectories also always have first_cluster >= 2
+        return if (f.first_cluster >= 2) f.first_cluster else self.root_cluster;
+    }
+
+    /// Resolve a path into (parent_dir_cluster, base_name).
+    /// For "dir/subdir/file.txt" → returns (cluster of "dir/subdir", "file.txt")
+    /// For "file.txt" → returns (root_cluster, "file.txt")
+    /// Returns null if the parent directory doesn't exist.
+    pub const PathParts = struct { parent_cluster: u32, base_name: []const u8 };
+
+    pub fn resolveParentDir(self: *Fat32Fs, path: []const u8) ?PathParts {
+        var p = path;
+        while (p.len > 0 and p[0] == '/') p = p[1..]; // Strip leading /
+
+        if (p.len == 0) return null; // Empty path
+
+        // Find the last slash
+        var last_slash: usize = 0;
+        var i: usize = 0;
+        while (i < p.len) : (i += 1) {
+            if (p[i] == '/') last_slash = i;
         }
-        return null; // Not a directory — return null
+
+        if (last_slash == 0) {
+            // No subdirectory — parent is root
+            return PathParts{
+                .parent_cluster = self.root_cluster,
+                .base_name = p,
+            };
+        }
+
+        const parent_path = p[0..last_slash];
+        const base_name = p[last_slash + 1 ..];
+        if (base_name.len == 0) return null;
+
+        const parent_cluster = self.resolveDirCluster(parent_path) orelse return null;
+        return PathParts{
+            .parent_cluster = parent_cluster,
+            .base_name = base_name,
+        };
+    }
+
+    /// Copy a file from src_path to dst_path.
+    /// Returns the number of bytes copied, or 0 on failure.
+    pub fn copyFile(self: *Fat32Fs, src_path: []const u8, dst_path: []const u8) u32 {
+        // Open source file
+        var src_file = self.openFile(src_path) orelse return 0;
+        if (src_file.is_directory) return 0;
+
+        // Resolve destination parent directory
+        const dst_parts = self.resolveParentDir(dst_path) orelse return 0;
+
+        // Check if destination already exists
+        if (self.findEntryInDir(dst_parts.parent_cluster, dst_parts.base_name) != null) {
+            hal.Serial.puts("[FAT32] Destination already exists: ");
+            hal.Serial.puts(dst_parts.base_name);
+            hal.Serial.puts("\n");
+            return 0;
+        }
+
+        // Create destination file
+        var dst_file = self.createFile(dst_parts.parent_cluster, dst_parts.base_name) orelse return 0;
+
+        // Allocate DMA buffer for copying
+        const buf_phys = pmm.allocPage() orelse return 0;
+        const buf: [*]u8 = @ptrFromInt(@as(usize, @intCast(buf_phys)));
+
+        var total_copied: u32 = 0;
+        while (total_copied < src_file.file_size) {
+            const to_read = if (src_file.file_size - total_copied > 4000) @as(u32, 4000) else src_file.file_size - total_copied;
+            const bytes_read = self.readFile(&src_file, buf[0..to_read], to_read);
+            if (bytes_read == 0) break;
+
+            const bytes_written = self.writeFile(&dst_file, buf[0..bytes_read]);
+            if (bytes_written == 0) break;
+            total_copied += bytes_written;
+        }
+
+        pmm.freePage(buf_phys);
+        return total_copied;
+    }
+
+    /// Move (rename) a file from src_path to dst_path.
+    /// Returns true on success, false on failure.
+    /// Implementation: copy + delete (simple but functional).
+    pub fn moveFile(self: *Fat32Fs, src_path: []const u8, dst_path: []const u8) bool {
+        // First copy the file
+        const copied = self.copyFile(src_path, dst_path);
+        if (copied == 0) return false;
+
+        // Then delete the source
+        if (!self.deleteFile(src_path)) {
+            // Copy succeeded but delete failed — try to clean up destination
+            _ = self.deleteFile(dst_path);
+            return false;
+        }
+        return true;
     }
 
     // ================================================================

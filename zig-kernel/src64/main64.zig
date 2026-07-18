@@ -48,6 +48,11 @@ const intent = @import("poler/intent.zig");
 
 var use_fb: bool = false;
 
+// Current working directory for the shell
+var cwd: [256]u8 = undefined;
+var cwd_len: usize = 1;
+const CWD_MAX: usize = 255;
+
 const VGA_COLORS = [16][3]u8{
     .{ 0, 0, 0 },         // 0: Black
     .{ 0, 0, 170 },       // 1: Blue
@@ -483,10 +488,11 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
             hal.Serial.puts(" h=");
             hal.Serial.putDecimal(fb_height);
             hal.Serial.puts("\n");
-            if (fb_addr != 0 and fb_width >= 320 and fb_height >= 200 and fb_bpp >= 16 and fb_addr != 0xB8000) {
-                // Only initialize pixel-based framebuffer.
+            if (fb_addr != 0 and fb_width >= 320 and fb_height >= 200 and fb_bpp >= 8 and fb_addr != 0xB8000) {
+                // Initialize pixel-based framebuffer for any mode >= 8bpp.
                 // Skip VGA text mode (addr=0xB8000, small w/h like 80x25)
-                // which GRUB sometimes incorrectly reports as bpp=16.
+                // which GRUB sometimes incorrectly reports.
+                // -vga std typically provides 8-bit indexed or 32-bit XRGB8888.
                 hal.Serial.puts("[KERNEL] Initializing framebuffer...\n");
                 framebuffer.init_from_multiboot(
                     fb_addr,
@@ -823,11 +829,14 @@ fn task1() noreturn {
     hal.Serial.puts("\n=== POLER-OS v0.9.0 Interactive Shell ===\n");
     hal.Serial.puts("Type 'help' for commands.\n\n");
     
+    // Initialize CWD to "/"
+    cwd[0] = '/';
+    cwd_len = 1;
+    
     var buf: [128]u8 = undefined;
     var len: usize = 0;
     
-    hal.Serial.puts("poler> ");
-    if (use_fb) framebuffer.puts("poler> ");
+    shell_prompt();
     
     while (true) {
         const ch = hal.readKey(); // Unified: PS/2 keyboard + Serial COM1
@@ -840,12 +849,12 @@ fn task1() noreturn {
                     execute_command(cmd);
                     len = 0;
                 }
-                hal.Serial.puts("poler> ");
-                if (use_fb) framebuffer.puts("poler> ");
+                shell_prompt();
             } else if (ch == '\x08' or ch == '\x7F') {
                 if (len > 0) {
                     len -= 1;
                     hal.Serial.puts("\x08 \x08");
+                    if (use_fb) framebuffer.puts("\x08 \x08");
                 }
             } else if (len < buf.len - 1) {
                 buf[len] = ch;
@@ -862,6 +871,52 @@ fn task1() noreturn {
             }
         }
     }
+}
+
+/// Print the shell prompt showing current working directory
+fn shell_prompt() void {
+    hal.Serial.puts("poler:");
+    hal.Serial.puts(cwd[0..cwd_len]);
+    hal.Serial.puts("> ");
+    if (use_fb) {
+        framebuffer.puts("poler:");
+        framebuffer.puts(cwd[0..cwd_len]);
+        framebuffer.puts("> ");
+    }
+}
+
+/// Resolve a path relative to CWD into an absolute path.
+/// Returns the resolved path length (written to out_buf).
+/// For absolute paths (starting with /), returns as-is.
+/// For relative paths, prepends CWD.
+fn resolvePath(path: []const u8, out_buf: []u8) usize {
+    if (path.len == 0) return 0;
+    
+    if (path[0] == '/') {
+        // Absolute path — copy as-is
+        if (path.len > out_buf.len) return 0;
+        @memcpy(out_buf[0..path.len], path);
+        return path.len;
+    }
+    
+    // Relative path — prepend CWD
+    var total: usize = 0;
+    if (cwd_len == 1 and cwd[0] == '/') {
+        // CWD is root — just prepend "/"
+        if (path.len + 1 > out_buf.len) return 0;
+        out_buf[0] = '/';
+        @memcpy(out_buf[1..][0..path.len], path);
+        total = 1 + path.len;
+    } else {
+        // CWD is a subdirectory — prepend CWD + "/"
+        if (cwd_len + 1 + path.len > out_buf.len) return 0;
+        @memcpy(out_buf[0..cwd_len], cwd[0..cwd_len]);
+        out_buf[cwd_len] = '/';
+        @memcpy(out_buf[cwd_len + 1 ..][0..path.len], path);
+        total = cwd_len + 1 + path.len;
+    }
+    
+    return total;
 }
 
 fn sys_read_key() u8 {
@@ -894,24 +949,35 @@ fn sys_clear_screen() void {
 
 fn execute_command(cmd: []const u8) void {
     if (eq(cmd, "help")) {
-        hal.Serial.puts("Available commands:\n");
-        hal.Serial.puts("  help      - Show this help menu\n");
-        hal.Serial.puts("  about     - About POLER-OS\n");
-        hal.Serial.puts("  clear     - Clear screen\n");
-        hal.Serial.puts("  poler     - Run POLER core self-tests\n");
-        hal.Serial.puts("  ls        - List files in root dir\n");
-        hal.Serial.puts("  ls <dir>  - List files in subdirectory\n");
-        hal.Serial.puts("  cat <f>   - Read a file (supports paths)\n");
-        hal.Serial.puts("  mkdir <d> - Create a directory\n");
-        hal.Serial.puts("  touch <f> - Create an empty file\n");
-        hal.Serial.puts("  write <f> <text> - Write text to a file\n");
-        hal.Serial.puts("  rm <f>    - Delete a file\n");
-        hal.Serial.puts("  disk      - Show disk info\n");
-        hal.Serial.puts("  intents   - Show intent dispatcher stats (v1.1.0)\n");
-        hal.Serial.puts("  format    - Format disk as FAT32\n");
-        hal.Serial.puts("  storage_test - Persistent storage write/read test\n");
+        hal.Serial.puts("=== POLER-OS Shell Commands ===\n");
+        hal.Serial.puts("  help           - Show this help menu\n");
+        hal.Serial.puts("  about          - About POLER-OS\n");
+        hal.Serial.puts("  clear          - Clear screen\n");
+        hal.Serial.puts("  poler          - Run POLER core self-tests\n");
+        hal.Serial.puts("  ls             - List files in current dir\n");
+        hal.Serial.puts("  ls <dir>       - List files in subdirectory\n");
+        hal.Serial.puts("  cat <file>     - Read a file (supports paths)\n");
+        hal.Serial.puts("  mkdir <dir>    - Create a directory\n");
+        hal.Serial.puts("  touch <file>   - Create an empty file\n");
+        hal.Serial.puts("  write <f> <t>  - Write text to a file\n");
+        hal.Serial.puts("  rm <file>      - Delete a file\n");
+        hal.Serial.puts("  cp <src> <dst> - Copy a file\n");
+        hal.Serial.puts("  mv <src> <dst> - Move/rename a file\n");
+        hal.Serial.puts("  cd <dir>       - Change working directory\n");
+        hal.Serial.puts("  pwd            - Print working directory\n");
+        hal.Serial.puts("  disk           - Show disk info\n");
+        hal.Serial.puts("  intents        - Intent dispatcher stats (v1.1.0)\n");
+        hal.Serial.puts("  handles        - Show Object Table handles\n");
+        hal.Serial.puts("  format         - Format disk as FAT32\n");
+        hal.Serial.puts("  storage_test   - Persistent storage test\n");
+        hal.Serial.puts("  nested_test    - Test nested directory operations\n");
+        hal.Serial.puts("  fbinfo         - Show framebuffer info\n");
+        hal.Serial.puts("  commands       - List all available commands\n");
+    } else if (eq(cmd, "commands")) {
+        // Short-form command listing
+        hal.Serial.puts("help about clear poler ls cat mkdir touch write rm cp mv cd pwd disk intents handles format storage_test nested_test fbinfo commands\n");
     } else if (eq(cmd, "about")) {
-        hal.Serial.puts("POLER-OS v0.9.0 (x86_64 Long Mode)\n");
+        hal.Serial.puts("POLER-OS v0.9.1 (x86_64 Long Mode)\n");
         hal.Serial.puts("Semantic Security Kernel — Intent + Firewall + Capabilities.\n");
         hal.Serial.puts("Dual-personality: NT API + POSIX. Serial + PS/2 keyboard input.\n");
     } else if (eq(cmd, "clear")) {
@@ -920,32 +986,47 @@ fn execute_command(cmd: []const u8) void {
         hal.Serial.puts("Running POLER core PND mix...\n");
         hal.Serial.puts("pndMix(42, 17, 1) = 0x6448728B\n");
         hal.Serial.puts("pndMixAlt(42, 17, 1) = 0x000002CD\n");
+    } else if (eq(cmd, "pwd")) {
+        hal.Serial.puts(cwd[0..cwd_len]);
+        hal.Serial.puts("\n");
     } else if (eq(cmd, "ls")) {
-        cmd_ls("");
+        cmd_ls_path("");
     } else if (startsWith(cmd, "ls ")) {
-        cmd_ls(cmd[3..]);
+        cmd_ls_path(cmd[3..]);
     } else if (eq(cmd, "intents")) {
         cmd_intents();
     } else if (eq(cmd, "disk")) {
         cmd_disk();
     } else if (startsWith(cmd, "cat ")) {
-        cmd_cat(cmd[4..]);
+        cmd_cat_path(cmd[4..]);
     } else if (startsWith(cmd, "mkdir ")) {
-        cmd_mkdir(cmd[6..]);
+        cmd_mkdir_path(cmd[6..]);
     } else if (startsWith(cmd, "touch ")) {
-        cmd_touch(cmd[6..]);
+        cmd_touch_path(cmd[6..]);
     } else if (startsWith(cmd, "write ")) {
-        cmd_write(cmd[6..]);
+        cmd_write_path(cmd[6..]);
     } else if (startsWith(cmd, "rm ")) {
-        cmd_rm(cmd[3..]);
+        cmd_rm_path(cmd[3..]);
+    } else if (startsWith(cmd, "cp ")) {
+        cmd_cp(cmd[3..]);
+    } else if (startsWith(cmd, "mv ")) {
+        cmd_mv(cmd[3..]);
+    } else if (startsWith(cmd, "cd ")) {
+        cmd_cd(cmd[3..]);
     } else if (eq(cmd, "format")) {
         cmd_format();
     } else if (eq(cmd, "storage_test")) {
         cmd_storage_test();
+    } else if (eq(cmd, "nested_test")) {
+        cmd_nested_test();
+    } else if (eq(cmd, "fbinfo")) {
+        cmd_fbinfo();
+    } else if (eq(cmd, "handles")) {
+        cmd_handles();
     } else {
         hal.Serial.puts("Unknown command: ");
         hal.Serial.puts(cmd);
-        hal.Serial.puts("\n");
+        hal.Serial.puts(" (type 'help' for commands)\n");
     }
 }
 
@@ -957,15 +1038,32 @@ fn startsWith(str: []const u8, prefix: []const u8) bool {
     return true;
 }
 
-fn cmd_ls(dir_path: []const u8) void {
+fn cmd_ls_path(dir_arg: []const u8) void {
     const fs = fat32.getFs() orelse {
         hal.Serial.puts("No filesystem mounted\n");
         return;
     };
 
+    // Resolve path relative to CWD
+    var resolved: [256]u8 = undefined;
+    var dir_path: []const u8 = undefined;
+    if (dir_arg.len == 0) {
+        // No argument — use CWD
+        dir_path = cwd[0..cwd_len];
+    } else {
+        const len = resolvePath(dir_arg, &resolved);
+        if (len == 0) {
+            hal.Serial.puts("Invalid path\n");
+            return;
+        }
+        dir_path = resolved[0..len];
+    }
+
     // Resolve directory cluster from path
     var dir_cluster: u32 = fs.root_cluster;
-    if (dir_path.len > 0) {
+    if (dir_path.len == 1 and dir_path[0] == '/') {
+        dir_cluster = fs.root_cluster;
+    } else {
         const dir_file = fs.openFile(dir_path) orelse {
             hal.Serial.puts("Directory not found: ");
             hal.Serial.puts(dir_path);
@@ -1030,6 +1128,17 @@ fn lsCallback(ctx_opaque: *anyopaque, info: *const fat32.DirEntryInfo) void {
         hal.Serial.puts(" bytes)");
     }
     hal.Serial.puts("\n");
+}
+
+fn cmd_cat_path(filename: []const u8) void {
+    // Resolve path relative to CWD
+    var resolved: [256]u8 = undefined;
+    const len = resolvePath(filename, &resolved);
+    if (len == 0) {
+        hal.Serial.puts("Invalid path\n");
+        return;
+    }
+    cmd_cat(resolved[0..len]);
 }
 
 fn cmd_cat(filename: []const u8) void {
@@ -1210,6 +1319,16 @@ fn cmd_disk() void {
     hal.Serial.puts(" bytes\n");
 }
 
+fn cmd_mkdir_path(dirname: []const u8) void {
+    var resolved: [256]u8 = undefined;
+    const len = resolvePath(dirname, &resolved);
+    if (len == 0) {
+        hal.Serial.puts("Invalid path\n");
+        return;
+    }
+    cmd_mkdir(resolved[0..len]);
+}
+
 fn cmd_mkdir(dirname: []const u8) void {
     const fs = fat32.getFs() orelse {
         hal.Serial.puts("No filesystem mounted\n");
@@ -1221,73 +1340,36 @@ fn cmd_mkdir(dirname: []const u8) void {
         return;
     }
 
-    // Parse path: find parent directory and directory name
-    var path = dirname;
-    while (path.len > 0 and path[path.len - 1] == '/') path = path[0 .. path.len - 1];
-    while (path.len > 0 and path[0] == '/') path = path[1..];
-
-    if (path.len == 0) {
-        hal.Serial.puts("Invalid directory name\n");
+    // Use resolveParentDir for correct nested path handling
+    const parts = fs.resolveParentDir(dirname) orelse {
+        hal.Serial.puts("Invalid path or parent not found: ");
+        hal.Serial.puts(dirname);
+        hal.Serial.puts("\n");
         return;
-    }
+    };
 
-    // Split into parent path and dir name
-    var last_slash: usize = 0;
-    var i: usize = 0;
-    while (i < path.len) : (i += 1) {
-        if (path[i] == '/') last_slash = i;
-    }
-
-    var parent_cluster: u32 = fs.root_cluster;
-    var dir_name: []const u8 = path;
-
-    if (last_slash > 0) {
-        const parent_path = path[0..last_slash];
-        dir_name = path[last_slash + 1 ..];
-        if (dir_name.len == 0) {
-            hal.Serial.puts("Invalid directory name\n");
-            return;
-        }
-        parent_cluster = fs.resolveDirCluster(parent_path) orelse {
-            hal.Serial.puts("Parent directory not found: ");
-            hal.Serial.puts(parent_path);
-            hal.Serial.puts("\n");
-            return;
-        };
-    }
-
-    const result = fs.createDir(parent_cluster, dir_name);
+    const result = fs.createDir(parts.parent_cluster, parts.base_name);
     if (result) |cluster| {
         hal.Serial.puts("Created directory: ");
         hal.Serial.puts(dirname);
         hal.Serial.puts(" (cluster ");
-        var buf: [16]u8 = undefined;
-        var len: usize = 0;
-        var val: u32 = cluster;
-        if (val == 0) {
-            buf[0] = '0';
-            len = 1;
-        } else {
-            var temp: usize = 0;
-            var tmp_buf: [16]u8 = undefined;
-            while (val > 0) {
-                tmp_buf[temp] = '0' + @as(u8, @intCast(val % 10));
-                val /= 10;
-                temp += 1;
-            }
-            while (temp > 0) {
-                temp -= 1;
-                buf[len] = tmp_buf[temp];
-                len += 1;
-            }
-        }
-        hal.Serial.puts(buf[0..len]);
+        putDecimal(cluster);
         hal.Serial.puts(")\n");
     } else {
         hal.Serial.puts("Failed to create directory: ");
         hal.Serial.puts(dirname);
-        hal.Serial.puts("\n");
+        hal.Serial.puts(" (may already exist)\n");
     }
+}
+
+fn cmd_touch_path(filename: []const u8) void {
+    var resolved: [256]u8 = undefined;
+    const len = resolvePath(filename, &resolved);
+    if (len == 0) {
+        hal.Serial.puts("Invalid path\n");
+        return;
+    }
+    cmd_touch(resolved[0..len]);
 }
 
 fn cmd_touch(filename: []const u8) void {
@@ -1301,40 +1383,15 @@ fn cmd_touch(filename: []const u8) void {
         return;
     }
 
-    // Parse path: find parent directory and file name
-    var path = filename;
-    while (path.len > 0 and path[0] == '/') path = path[1..];
-
-    if (path.len == 0) {
-        hal.Serial.puts("Invalid file name\n");
+    // Use resolveParentDir for correct nested path handling
+    const parts = fs.resolveParentDir(filename) orelse {
+        hal.Serial.puts("Invalid path or parent not found: ");
+        hal.Serial.puts(filename);
+        hal.Serial.puts("\n");
         return;
-    }
+    };
 
-    var last_slash: usize = 0;
-    var i: usize = 0;
-    while (i < path.len) : (i += 1) {
-        if (path[i] == '/') last_slash = i;
-    }
-
-    var parent_cluster: u32 = fs.root_cluster;
-    var file_name: []const u8 = path;
-
-    if (last_slash > 0) {
-        const parent_path = path[0..last_slash];
-        file_name = path[last_slash + 1 ..];
-        if (file_name.len == 0) {
-            hal.Serial.puts("Invalid file name\n");
-            return;
-        }
-        parent_cluster = fs.resolveDirCluster(parent_path) orelse {
-            hal.Serial.puts("Parent directory not found: ");
-            hal.Serial.puts(parent_path);
-            hal.Serial.puts("\n");
-            return;
-        };
-    }
-
-    const file = fs.createFile(parent_cluster, file_name);
+    const file = fs.createFile(parts.parent_cluster, parts.base_name);
     if (file) |_| {
         hal.Serial.puts("Created file: ");
         hal.Serial.puts(filename);
@@ -1342,11 +1399,32 @@ fn cmd_touch(filename: []const u8) void {
     } else {
         hal.Serial.puts("Failed to create file: ");
         hal.Serial.puts(filename);
-        hal.Serial.puts("\n");
+        hal.Serial.puts(" (may already exist)\n");
     }
 }
 
-fn cmd_write(args: []const u8) void {
+fn cmd_write_path(args: []const u8) void {
+    // Parse: write <filename> <text>
+    var space_pos: usize = 0;
+    while (space_pos < args.len and args[space_pos] != ' ') : (space_pos += 1) {}
+    if (space_pos == 0 or space_pos >= args.len) {
+        hal.Serial.puts("Usage: write <filename> <text>\n");
+        return;
+    }
+    const filename = args[0..space_pos];
+    const text = args[space_pos + 1 ..];
+
+    // Resolve filename relative to CWD
+    var resolved: [256]u8 = undefined;
+    const len = resolvePath(filename, &resolved);
+    if (len == 0) {
+        hal.Serial.puts("Invalid path\n");
+        return;
+    }
+    cmd_write(resolved[0..len], text);
+}
+
+fn cmd_write(filename: []const u8, text: []const u8) void {
     const fs = fat32.getFs() orelse {
         hal.Serial.puts("No filesystem mounted\n");
         return;
@@ -1357,80 +1435,32 @@ fn cmd_write(args: []const u8) void {
         return;
     }
 
-    // Parse: write <filename> <text>
-    // Find the space separating filename from text
-    var space_pos: usize = 0;
-    while (space_pos < args.len and args[space_pos] != ' ') : (space_pos += 1) {}
-
-    if (space_pos == 0 or space_pos >= args.len) {
-        hal.Serial.puts("Usage: write <filename> <text>\n");
-        return;
-    }
-
-    const filename = args[0..space_pos];
-    const text = args[space_pos + 1 ..];
-
     if (text.len == 0) {
         hal.Serial.puts("No text provided\n");
         return;
     }
 
-    // Open or create the file
+    // Try to open existing file first
     var file = fs.openFile(filename) orelse blk: {
-        // File doesn't exist — create it
-        const f = fs.openFile(filename) orelse {
-            // Try to create in root dir for simplicity
-            var path = filename;
-            while (path.len > 0 and path[0] == '/') path = path[1..];
-            var parent_cluster: u32 = fs.root_cluster;
-            var file_name: []const u8 = path;
-
-            var last_slash: usize = 0;
-            var j: usize = 0;
-            while (j < path.len) : (j += 1) {
-                if (path[j] == '/') last_slash = j;
-            }
-            if (last_slash > 0) {
-                const parent_path = path[0..last_slash];
-                file_name = path[last_slash + 1 ..];
-                parent_cluster = fs.resolveDirCluster(parent_path) orelse {
-                    hal.Serial.puts("Parent directory not found\n");
-                    return;
-                };
-            }
-
-            break :blk fs.createFile(parent_cluster, file_name) orelse {
-                hal.Serial.puts("Failed to create file\n");
-                return;
-            };
+        // File doesn't exist — create it in the correct parent directory
+        const parts = fs.resolveParentDir(filename) orelse {
+            hal.Serial.puts("Parent directory not found: ");
+            hal.Serial.puts(filename);
+            hal.Serial.puts("\n");
+            return;
         };
-        break :blk f;
+        break :blk fs.createFile(parts.parent_cluster, parts.base_name) orelse {
+            hal.Serial.puts("Failed to create file: ");
+            hal.Serial.puts(filename);
+            hal.Serial.puts("\n");
+            return;
+        };
     };
 
     // Write the text
     const written = fs.writeFile(&file, text);
     hal.Serial.puts("Wrote ");
-    var buf: [16]u8 = undefined;
-    var len: usize = 0;
-    var val: u32 = written;
-    if (val == 0) {
-        buf[0] = '0';
-        len = 1;
-    } else {
-        var temp: usize = 0;
-        var tmp_buf: [16]u8 = undefined;
-        while (val > 0) {
-            tmp_buf[temp] = '0' + @as(u8, @intCast(val % 10));
-            val /= 10;
-            temp += 1;
-        }
-        while (temp > 0) {
-            temp -= 1;
-            buf[len] = tmp_buf[temp];
-            len += 1;
-        }
-    }
-    hal.Serial.puts(buf[0..len]);
+    putDecimal(written);
     hal.Serial.puts(" bytes to ");
     hal.Serial.puts(filename);
     hal.Serial.puts("\n");
@@ -1451,6 +1481,16 @@ fn task2() noreturn {
             asm volatile ("nop");
         }
     }
+}
+
+fn cmd_rm_path(filename: []const u8) void {
+    var resolved: [256]u8 = undefined;
+    const len = resolvePath(filename, &resolved);
+    if (len == 0) {
+        hal.Serial.puts("Invalid path\n");
+        return;
+    }
+    cmd_rm(resolved[0..len]);
 }
 
 fn cmd_rm(filename: []const u8) void {
@@ -1620,6 +1660,415 @@ fn cmd_storage_test() void {
     }
 
     hal.Serial.puts("=== Storage Test Complete ===\n");
+}
+
+fn cmd_cd(dir_arg: []const u8) void {
+    const fs = fat32.getFs() orelse {
+        hal.Serial.puts("No filesystem mounted\n");
+        return;
+    };
+
+    if (dir_arg.len == 0) {
+        // cd with no args — go to root
+        cwd[0] = '/';
+        cwd_len = 1;
+        return;
+    }
+
+    // Handle ".." (go up one level)
+    if (eq(dir_arg, "..")) {
+        if (cwd_len <= 1) {
+            // Already at root
+            return;
+        }
+        // Find the last slash in CWD
+        var i: usize = cwd_len - 1;
+        while (i > 0 and cwd[i] != '/') : (i -= 1) {}
+        if (i == 0) {
+            // Parent is root
+            cwd[0] = '/';
+            cwd_len = 1;
+        } else {
+            cwd_len = i;
+        }
+        return;
+    }
+
+    // Resolve path relative to CWD
+    var resolved: [256]u8 = undefined;
+    const len = resolvePath(dir_arg, &resolved);
+    if (len == 0) {
+        hal.Serial.puts("Invalid path\n");
+        return;
+    }
+
+    // Verify the directory exists
+    const dir_file = fs.openFile(resolved[0..len]) orelse {
+        hal.Serial.puts("Directory not found: ");
+        hal.Serial.puts(dir_arg);
+        hal.Serial.puts("\n");
+        return;
+    };
+    if (!dir_file.is_directory) {
+        hal.Serial.puts("Not a directory: ");
+        hal.Serial.puts(dir_arg);
+        hal.Serial.puts("\n");
+        return;
+    }
+
+    // Update CWD
+    if (len > CWD_MAX) {
+        hal.Serial.puts("Path too long\n");
+        return;
+    }
+    @memcpy(cwd[0..len], resolved[0..len]);
+    cwd_len = len;
+}
+
+fn cmd_cp(args: []const u8) void {
+    const fs = fat32.getFs() orelse {
+        hal.Serial.puts("No filesystem mounted\n");
+        return;
+    };
+
+    // Parse: cp <src> <dst>
+    var space_pos: usize = 0;
+    while (space_pos < args.len and args[space_pos] != ' ') : (space_pos += 1) {}
+    if (space_pos == 0 or space_pos >= args.len) {
+        hal.Serial.puts("Usage: cp <src> <dst>\n");
+        return;
+    }
+
+    const src_arg = args[0..space_pos];
+    const dst_arg = args[space_pos + 1 ..];
+    if (dst_arg.len == 0) {
+        hal.Serial.puts("Usage: cp <src> <dst>\n");
+        return;
+    }
+
+    // Resolve paths relative to CWD
+    var src_resolved: [256]u8 = undefined;
+    const src_len = resolvePath(src_arg, &src_resolved);
+    if (src_len == 0) {
+        hal.Serial.puts("Invalid source path\n");
+        return;
+    }
+
+    var dst_resolved: [256]u8 = undefined;
+    const dst_len = resolvePath(dst_arg, &dst_resolved);
+    if (dst_len == 0) {
+        hal.Serial.puts("Invalid destination path\n");
+        return;
+    }
+
+    const copied = fs.copyFile(src_resolved[0..src_len], dst_resolved[0..dst_len]);
+    if (copied > 0) {
+        hal.Serial.puts("Copied ");
+        putDecimal(copied);
+        hal.Serial.puts(" bytes\n");
+    } else {
+        hal.Serial.puts("Copy failed\n");
+    }
+}
+
+fn cmd_mv(args: []const u8) void {
+    const fs = fat32.getFs() orelse {
+        hal.Serial.puts("No filesystem mounted\n");
+        return;
+    };
+
+    // Parse: mv <src> <dst>
+    var space_pos: usize = 0;
+    while (space_pos < args.len and args[space_pos] != ' ') : (space_pos += 1) {}
+    if (space_pos == 0 or space_pos >= args.len) {
+        hal.Serial.puts("Usage: mv <src> <dst>\n");
+        return;
+    }
+
+    const src_arg = args[0..space_pos];
+    const dst_arg = args[space_pos + 1 ..];
+    if (dst_arg.len == 0) {
+        hal.Serial.puts("Usage: mv <src> <dst>\n");
+        return;
+    }
+
+    // Resolve paths relative to CWD
+    var src_resolved: [256]u8 = undefined;
+    const src_len = resolvePath(src_arg, &src_resolved);
+    if (src_len == 0) {
+        hal.Serial.puts("Invalid source path\n");
+        return;
+    }
+
+    var dst_resolved: [256]u8 = undefined;
+    const dst_len = resolvePath(dst_arg, &dst_resolved);
+    if (dst_len == 0) {
+        hal.Serial.puts("Invalid destination path\n");
+        return;
+    }
+
+    if (fs.moveFile(src_resolved[0..src_len], dst_resolved[0..dst_len])) {
+        hal.Serial.puts("Moved successfully\n");
+    } else {
+        hal.Serial.puts("Move failed\n");
+    }
+}
+
+fn cmd_nested_test() void {
+    hal.Serial.puts("=== Nested Directory Test ===\n");
+
+    const fs = fat32.getFs() orelse {
+        hal.Serial.puts("FAIL: No filesystem mounted\n");
+        hal.Serial.puts("  Run 'format' first to create a FAT32 filesystem.\n");
+        return;
+    };
+
+    // Test 1: Create nested directory
+    hal.Serial.puts("[Test 1] Creating nested directory 'testdir'...\n");
+    if (fs.createDir(fs.root_cluster, "testdir")) |dc| {
+        hal.Serial.puts("  PASS: Created testdir (cluster ");
+        putDecimal(dc);
+        hal.Serial.puts(")\n");
+    } else {
+        hal.Serial.puts("  INFO: testdir may already exist\n");
+    }
+
+    // Test 2: Create file in nested directory using resolveParentDir
+    hal.Serial.puts("[Test 2] Creating 'testdir/hello.txt'...\n");
+    const parts = fs.resolveParentDir("testdir/hello.txt") orelse {
+        hal.Serial.puts("  FAIL: resolveParentDir returned null\n");
+        return;
+    };
+    hal.Serial.puts("  DEBUG: parent_cluster=");
+    putHex(parts.parent_cluster);
+    hal.Serial.puts(" base_name=");
+    hal.Serial.puts(parts.base_name);
+    hal.Serial.puts("\n");
+
+    var file = fs.createFile(parts.parent_cluster, parts.base_name) orelse blk: {
+        // File may already exist — try opening it
+        break :blk fs.openFile("testdir/hello.txt") orelse {
+            hal.Serial.puts("  FAIL: Could not create or open testdir/hello.txt\n");
+            return;
+        };
+    };
+
+    // Test 3: Write to the nested file
+    hal.Serial.puts("[Test 3] Writing to 'testdir/hello.txt'...\n");
+    const test_content = "Hello from nested dir!";
+    const written = fs.writeFile(&file, test_content);
+    if (written > 0) {
+        hal.Serial.puts("  PASS: Wrote ");
+        putDecimal(written);
+        hal.Serial.puts(" bytes\n");
+    } else {
+        hal.Serial.puts("  FAIL: Write returned 0\n");
+        return;
+    }
+
+    // Test 4: Read back using openFile with nested path
+    hal.Serial.puts("[Test 4] Reading back 'testdir/hello.txt' via openFile...\n");
+    var read_file = fs.openFile("testdir/hello.txt") orelse {
+        hal.Serial.puts("  FAIL: Could not open testdir/hello.txt\n");
+        return;
+    };
+
+    hal.Serial.puts("  DEBUG: cluster=");
+    putHex(read_file.first_cluster);
+    hal.Serial.puts(" size=");
+    putDecimal(read_file.file_size);
+    hal.Serial.puts(" dir_cluster=");
+    putHex(read_file.dir_cluster);
+    hal.Serial.puts("\n");
+
+    const read_buf_phys = pmm.allocPage() orelse {
+        hal.Serial.puts("  FAIL: Out of memory\n");
+        return;
+    };
+    const read_buf: [*]u8 = @ptrFromInt(@as(usize, @intCast(read_buf_phys)));
+
+    const bytes_read = fs.readFile(&read_file, read_buf[0..256], 256);
+    if (bytes_read > 0) {
+        var match = true;
+        if (bytes_read != test_content.len) {
+            match = false;
+        } else {
+            for (0..bytes_read) |i| {
+                if (read_buf[i] != test_content[i]) {
+                    match = false;
+                    break;
+                }
+            }
+        }
+        if (match) {
+            hal.Serial.puts("  PASS: Content verified: \"");
+            hal.Serial.puts(read_buf[0..bytes_read]);
+            hal.Serial.puts("\"\n");
+        } else {
+            hal.Serial.puts("  FAIL: Content mismatch! Got: \"");
+            const show_len = if (bytes_read > 64) @as(usize, 64) else bytes_read;
+            hal.Serial.puts(read_buf[0..show_len]);
+            hal.Serial.puts("\"\n");
+        }
+    } else {
+        hal.Serial.puts("  FAIL: readFile returned 0 bytes\n");
+    }
+
+    pmm.freePage(read_buf_phys);
+
+    // Test 5: List the nested directory
+    hal.Serial.puts("[Test 5] Listing 'testdir' contents...\n");
+    var ctx = LsCtx{ .fs = fs };
+    const dir_cluster = fs.resolveDirCluster("testdir") orelse {
+        hal.Serial.puts("  FAIL: Could not resolve testdir\n");
+        return;
+    };
+    const count = fs.listDir(dir_cluster, &ctx, lsCallback);
+    hal.Serial.puts("  Found ");
+    putDecimal(count);
+    hal.Serial.puts(" entries\n");
+
+    // Test 6: Deeper nesting — create dir/subdir
+    hal.Serial.puts("[Test 6] Creating 'testdir/subdir' (2 levels deep)...\n");
+    const subdir_parts = fs.resolveParentDir("testdir/subdir") orelse {
+        hal.Serial.puts("  FAIL: resolveParentDir for testdir/subdir\n");
+        return;
+    };
+    if (fs.createDir(subdir_parts.parent_cluster, subdir_parts.base_name)) |sc| {
+        hal.Serial.puts("  PASS: Created subdir (cluster ");
+        putDecimal(sc);
+        hal.Serial.puts(")\n");
+    } else {
+        hal.Serial.puts("  INFO: subdir may already exist\n");
+    }
+
+    // Test 7: Create file in 2-level deep directory
+    hal.Serial.puts("[Test 7] Creating 'testdir/subdir/deep.txt'...\n");
+    const deep_parts = fs.resolveParentDir("testdir/subdir/deep.txt") orelse {
+        hal.Serial.puts("  FAIL: resolveParentDir for testdir/subdir/deep.txt\n");
+        return;
+    };
+    var deep_file = fs.createFile(deep_parts.parent_cluster, deep_parts.base_name) orelse blk: {
+        break :blk fs.openFile("testdir/subdir/deep.txt") orelse {
+            hal.Serial.puts("  FAIL: Could not create deep.txt\n");
+            return;
+        };
+    };
+    const deep_written = fs.writeFile(&deep_file, "Deep nested content!");
+    if (deep_written > 0) {
+        hal.Serial.puts("  PASS: Wrote ");
+        putDecimal(deep_written);
+        hal.Serial.puts(" bytes to 2-level nested file\n");
+    } else {
+        hal.Serial.puts("  FAIL: Could not write to deep.txt\n");
+    }
+
+    // Test 8: Read back the 2-level nested file
+    hal.Serial.puts("[Test 8] Reading back 'testdir/subdir/deep.txt'...\n");
+    if (fs.openFile("testdir/subdir/deep.txt")) |rf| {
+        const deep_buf_phys = pmm.allocPage() orelse {
+            hal.Serial.puts("  FAIL: Out of memory\n");
+            return;
+        };
+        const deep_buf: [*]u8 = @ptrFromInt(@as(usize, @intCast(deep_buf_phys)));
+        var deep_rf = rf;
+        const deep_read = fs.readFile(&deep_rf, deep_buf[0..128], 128);
+        if (deep_read > 0) {
+            hal.Serial.puts("  PASS: Read back \"");
+            hal.Serial.puts(deep_buf[0..deep_read]);
+            hal.Serial.puts("\"\n");
+        } else {
+            hal.Serial.puts("  FAIL: readFile returned 0\n");
+        }
+        pmm.freePage(deep_buf_phys);
+    } else {
+        hal.Serial.puts("  FAIL: Could not open testdir/subdir/deep.txt\n");
+    }
+
+    hal.Serial.puts("=== Nested Test Complete ===\n");
+}
+
+fn cmd_fbinfo() void {
+    if (!use_fb) {
+        hal.Serial.puts("Framebuffer not active (using VGA text mode)\n");
+        hal.Serial.puts("  VGA: 80x25 at 0xB8000\n");
+        hal.Serial.puts("  Use QEMU with -vga std to enable framebuffer\n");
+        return;
+    }
+    hal.Serial.puts("=== Framebuffer Info ===\n");
+    hal.Serial.puts("  Address: ");
+    putHex(framebuffer.getAddr());
+    hal.Serial.puts("\n  Resolution: ");
+    putDecimal(framebuffer.getWidth());
+    hal.Serial.puts("x");
+    putDecimal(framebuffer.getHeight());
+    hal.Serial.puts("\n  BPP: ");
+    putDecimal(framebuffer.getBpp());
+    hal.Serial.puts("\n  Pitch: ");
+    putDecimal(framebuffer.getPitch());
+    hal.Serial.puts("\n  Text cells: ");
+    putDecimal(framebuffer.text_cols());
+    hal.Serial.puts("x");
+    putDecimal(framebuffer.text_rows());
+    hal.Serial.puts("\n  Pixel format: ");
+    const ptype = framebuffer.getPixelType();
+    if (ptype == 0) {
+        hal.Serial.puts("Indexed (palette)\n");
+    } else if (ptype == 1) {
+        hal.Serial.puts("RGB888 (32-bit)\n");
+    } else if (ptype == 2) {
+        hal.Serial.puts("BGR888 (32-bit)\n");
+    } else if (ptype == 3) {
+        hal.Serial.puts("RGB565 (16-bit)\n");
+    } else {
+        hal.Serial.puts("Unknown\n");
+    }
+}
+
+fn cmd_handles() void {
+    hal.Serial.puts("=== Object Table Handles (v1.1.0) ===\n");
+    const om = ki.getObjectManager();
+    var active_count: u32 = 0;
+    var i: usize = 4; // Skip reserved handles 0-3
+    while (i < 64) : (i += 1) { // Show first 60 handles
+        const entry = &om.handles[i];
+        if (entry.in_use and entry.obj_type != .Free) {
+            active_count += 1;
+            hal.Serial.puts("  Handle ");
+            putDecimal(i);
+            hal.Serial.puts(": type=");
+            const type_name = switch (entry.obj_type) {
+                .File => "File",
+                .Directory => "Directory",
+                .Device => "Device",
+                .Event => "Event",
+                .Mutant => "Mutant",
+                .Semaphore => "Semaphore",
+                .Timer => "Timer",
+                .Section => "Section",
+                .Port => "Port",
+                .Token => "Token",
+                .Key => "Key",
+                .Process => "Process",
+                .Thread => "Thread",
+                else => "Other",
+            };
+            hal.Serial.puts(type_name);
+            hal.Serial.puts(" access=0x");
+            putHex(entry.access_mask);
+            hal.Serial.puts(" refs=");
+            putDecimal(entry.ref_count);
+            if (entry.cap_revoked) {
+                hal.Serial.puts(" [REVOKED]");
+            }
+            hal.Serial.puts("\n");
+        }
+    }
+    hal.Serial.puts("  Active handles: ");
+    putDecimal(active_count);
+    hal.Serial.puts(" (shown first 60 of ");
+    putDecimal(4096);
+    hal.Serial.puts(" slots)\n");
 }
 
 pub fn panic(msg: []const u8, error_return_trace: ?*@import("std").builtin.StackTrace, ret_addr: ?usize) noreturn {
