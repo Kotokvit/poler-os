@@ -36,6 +36,7 @@ const policy = @import("policy_engine.zig");
 const ipc = @import("ipc.zig");
 const ai_capsule = @import("ai_capsule.zig");
 const iommu = @import("iommu.zig");
+const intent = @import("poler/intent.zig");
 
 
 
@@ -747,6 +748,11 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     ai_capsule.init();
     puts("[BOOT] AI capsule manager OK\n");
 
+    // 8.5a-6. Initialize Intent Dispatcher (v1.1.0 — Semantic Security Layer)
+    puts("[BOOT] Initializing intent dispatcher...\n");
+    intent.init();
+    puts("[BOOT] Intent dispatcher OK\n");
+
     // 8.5b. Initialize Syscalls — now routes through subsystem dispatcher
     puts("[BOOT] Initializing syscalls...\n");
     syscall_int.print_fn = &puts;
@@ -882,6 +888,7 @@ fn execute_command(cmd: []const u8) void {
         hal.Serial.puts("  write <f> <text> - Write text to a file\n");
         hal.Serial.puts("  rm <f>    - Delete a file\n");
         hal.Serial.puts("  disk      - Show disk info\n");
+        hal.Serial.puts("  intents   - Show intent dispatcher stats (v1.1.0)\n");
     } else if (eq(cmd, "about")) {
         hal.Serial.puts("POLER-OS v0.8.0 (x86_64 Long Mode)\n");
         hal.Serial.puts("Cognitive Semantic Runtime Environment.\n");
@@ -896,6 +903,8 @@ fn execute_command(cmd: []const u8) void {
         cmd_ls("");
     } else if (startsWith(cmd, "ls ")) {
         cmd_ls(cmd[3..]);
+    } else if (eq(cmd, "intents")) {
+        cmd_intents();
     } else if (eq(cmd, "disk")) {
         cmd_disk();
     } else if (startsWith(cmd, "cat ")) {
@@ -1049,6 +1058,42 @@ fn cmd_cat(filename: []const u8) void {
     }
 
     pmm.freePage(buf_phys);
+}
+
+fn cmd_intents() void {
+    hal.Serial.puts("=== Intent Dispatcher Stats (v1.1.0) ===\n");
+    intent.printStats();
+
+    // Test: create and dispatch a sample intent
+    hal.Serial.puts("\nTest: creating FS_READ intent...\n");
+    var test_intent = intent.intentFsRead(0, 1, 0, 4096);
+    const verdict = intent.dispatch(&test_intent);
+    hal.Serial.puts("  Verdict: ");
+    switch (verdict) {
+        .Allowed => hal.Serial.puts("ALLOWED"),
+        .Denied => hal.Serial.puts("DENIED"),
+        .Blocked => hal.Serial.puts("BLOCKED (nonce mismatch)"),
+        .NoHandle => hal.Serial.puts("NO_HANDLE"),
+        .Insufficient => hal.Serial.puts("INSUFFICIENT"),
+        .RateLimited => hal.Serial.puts("RATE_LIMITED"),
+        .InvalidParams => hal.Serial.puts("INVALID_PARAMS"),
+    }
+    hal.Serial.puts("\n");
+
+    // Test: tampered intent (should be BLOCKED)
+    hal.Serial.puts("Test: tampered intent (nonce check)...\n");
+    var tampered = test_intent;
+    tampered.params[0] = 99999; // Modify after creation
+    const verdict2 = intent.dispatch(&tampered);
+    hal.Serial.puts("  Verdict: ");
+    switch (verdict2) {
+        .Blocked => hal.Serial.puts("BLOCKED (tamper detected!)"),
+        .Allowed => hal.Serial.puts("ALLOWED (BUG: should be blocked!)"),
+        else => hal.Serial.puts("OTHER"),
+    }
+    hal.Serial.puts("\n");
+
+    intent.printStats();
 }
 
 fn cmd_disk() void {
