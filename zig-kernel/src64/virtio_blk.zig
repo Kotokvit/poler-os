@@ -17,6 +17,7 @@
 const hal = @import("hal.zig");
 const pmm = @import("pmm64.zig");
 const pci = @import("pci.zig");
+const iommu = @import("iommu.zig");
 
 // ============================================================================
 // VirtIO PCI Register Offsets (Legacy / Transitional)
@@ -603,6 +604,36 @@ fn setupDmaSlots() VblkError!void {
     }
 
     hal.Serial.puts("[VBLK] DMA slots initialized (identity-mapped)\n");
+
+    // v0.8.0 P0 SECURITY: Register DMA regions with IOMMU if available.
+    // If VT-d is active, only the approved DMA buffers will be accessible
+    // by the device. Without IOMMU, DMA is unrestricted (identity mapping).
+    if (iommu.isAvailable()) {
+        hal.Serial.puts("[VBLK] Registering DMA regions with IOMMU...\n");
+        for (&vblk_state.dma_slots) |*slot| {
+            // Register each DMA slot's physical region with IOMMU
+            _ = iommu.mapVirtioDma(
+                vblk_state.pci_dev.?.bus,
+                vblk_state.pci_dev.?.slot,
+                slot.req_phys, 4096,
+            );
+            _ = iommu.mapVirtioDma(
+                vblk_state.pci_dev.?.bus,
+                vblk_state.pci_dev.?.slot,
+                slot.data_phys, 4096,
+            );
+        }
+        // Also register the virtqueue itself
+        _ = iommu.mapVirtioDma(
+            vblk_state.pci_dev.?.bus,
+            vblk_state.pci_dev.?.slot,
+            vblk_state.vq_phys,
+            VQ_TOTAL_PAGES * 4096,
+        );
+        hal.Serial.puts("[VBLK] DMA regions registered with IOMMU\n");
+    } else {
+        hal.Serial.puts("[VBLK] IOMMU not available — DMA unprotected (identity mapping)\n");
+    }
 }
 
 // ============================================================================
