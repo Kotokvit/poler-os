@@ -81,12 +81,36 @@ pub fn inl(port: u16) u32 {
     );
 }
 
+/// Read RFLAGS register. Used by cliSave() to save previous interrupt state.
+pub fn readFlags() u64 {
+    return asm volatile (
+        "pushfq\n\tpopq %[ret]"
+        : [ret] "=r" (-> u64),
+    );
+}
+
+/// Disable interrupts.
 pub fn cli() void {
     asm volatile ("cli");
 }
 
+/// Disable interrupts and return previous state (true = were enabled).
+/// Use with stiSet() for safe interrupt save/restore.
+pub fn cliSave() bool {
+    const flags = readFlags();
+    asm volatile ("cli");
+    return (flags & 0x200) != 0; // IF flag was set?
+}
+
 pub fn sti() void {
     asm volatile ("sti");
+}
+
+/// Restore interrupt state from a previous cliSave() call.
+pub fn stiSet(was_enabled: bool) void {
+    if (was_enabled) {
+        asm volatile ("sti");
+    }
 }
 
 pub fn hlt() void {

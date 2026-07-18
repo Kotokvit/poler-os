@@ -760,12 +760,15 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
     puts("[BOOT] Scheduler initialized\n");
 
     // Create two test tasks (which will run in Ring 3 / User space)
-    _ = scheduler.createTask(@intFromPtr(&task1)) catch |err| {
+    // Use createTaskSafe() to prevent race condition: APIC timer is already
+    // running and could fire between task.state=Ready and task.rsp=... setup,
+    // causing @ptrFromInt(0) → "cast causes pointer to be null" kernel panic.
+    _ = scheduler.createTaskSafe(@intFromPtr(&task1)) catch |err| {
         puts("[SCHED] Failed to create task1 (shell): ");
         puts(@errorName(err));
         puts("\n");
     };
-    _ = scheduler.createTask(@intFromPtr(&task2)) catch |err| {
+    _ = scheduler.createTaskSafe(@intFromPtr(&task2)) catch |err| {
         puts("[SCHED] Failed to create task2 (bg worker): ");
         puts(@errorName(err));
         puts("\n");

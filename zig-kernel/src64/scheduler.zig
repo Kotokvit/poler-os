@@ -148,14 +148,19 @@ pub fn createTask(entry_point: u64) !usize {
     if (task_count >= MAX_TASKS) return error.OutOfTasks;
 
     const id = task_count;
-    task_count += 1;
+    // NOTE: Do NOT increment task_count yet! If the APIC timer fires
+    // between incrementing and fully initializing the task, schedule()
+    // could pick a partially-initialized task with rsp=0, causing
+    // @ptrFromInt(0) → "cast causes pointer to be null" kernel panic.
+    // We increment task_count LAST, after all fields are set.
 
     const task = &tasks[id];
     task.id = id;
-    task.state = .Ready;
+    task.state = .Killed; // Prevent scheduler from picking this task during init
     task.privilege = .Kernel;
     task.cr3 = 0; // Use kernel CR3
     task.user_stack_top = 0;
+    task.rsp = 0; // Will be set below
 
     // Set up the initial stack frame in the kernel stack.
     // InterruptFrame layout (176 bytes):
@@ -195,6 +200,13 @@ pub fn createTask(entry_point: u64) !usize {
     // Save stack pointer to task control block
     task.rsp = @intFromPtr(frame_ptr);
 
+    // CRITICAL: Make task visible to scheduler ONLY after full initialization.
+    // Order matters: rsp must be valid BEFORE state becomes Ready.
+    // Use a write barrier to ensure the compiler doesn't reorder.
+    @fence(.release);
+    task.state = .Ready;
+    task_count += 1; // Now safe for scheduler to see this task
+
     hal.Serial.puts("[SCHED] Created kernel task ");
     hal.Serial.putHex(id);
     hal.Serial.puts(" at entry ");
@@ -204,6 +216,14 @@ pub fn createTask(entry_point: u64) !usize {
     hal.Serial.puts("\n");
 
     return id;
+}
+
+/// Create a kernel task with interrupts disabled to prevent race conditions.
+/// Use this during boot when the APIC timer is already running.
+pub fn createTaskSafe(entry_point: u64) !usize {
+    const prev = hal.cliSave(); // Disable interrupts
+    defer hal.stiSet(prev); // Restore previous interrupt state
+    return createTask(entry_point);
 }
 
 /// Create a user-mode (Ring 3) task — v0.7.0
@@ -229,14 +249,15 @@ pub fn createUserTask(entry_point: u64, user_cr3: u64, user_stack: u64) !usize {
     if (task_count >= MAX_TASKS) return error.OutOfTasks;
 
     const id = task_count;
-    task_count += 1;
+    // NOTE: Do NOT increment task_count yet — same race condition fix as createTask().
 
     const task = &tasks[id];
     task.id = id;
-    task.state = .Ready;
+    task.state = .Killed; // Prevent scheduler from picking this task during init
     task.privilege = .User;
     task.cr3 = user_cr3; // Per-process page tables!
     task.user_stack_top = user_stack;
+    task.rsp = 0; // Will be set below
 
     // Set up the initial stack frame in the kernel stack.
     // When IRETQ pops this frame and sees CS=0x23 (RPL=3),
@@ -287,6 +308,11 @@ pub fn createUserTask(entry_point: u64, user_cr3: u64, user_stack: u64) !usize {
             hal.Serial.puts(" (TLS will not work)\n");
         }
     }
+
+    // CRITICAL: Make task visible to scheduler ONLY after full initialization.
+    @fence(.release);
+    task.state = .Ready;
+    task_count += 1; // Now safe for scheduler to see this task
 
     hal.Serial.puts("[SCHED] Created user task ");
     hal.Serial.putHex(id);
