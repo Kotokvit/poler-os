@@ -167,13 +167,24 @@ pub fn findVirtioBlk() ?PciDeviceInfo {
             dev.device_id >= 0x1000 and
             dev.device_id <= 0x103F)
         {
-            // Read subsystem ID to identify device type
-            const subsystem_id = pciRead16(dev.bus, dev.slot, dev.func, 0x2C);
+            // For VirtIO legacy/transitional devices:
+            // - device_id 0x1000: generic, need subsystem ID at offset 0x2E
+            // - device_id 0x1001: VirtIO-BLK (type encoded in device_id)
+            // - device_id 0x1040+ : modern VirtIO, subsystem ID at 0x2E
+            const subsystem_id = pciRead16(dev.bus, dev.slot, dev.func, 0x2E);
+            hal.Serial.puts("[PCI] VirtIO device found: device_id=0x");
+            hal.Serial.putHex(dev.device_id);
+            hal.Serial.puts(" subsystem_id=0x");
+            hal.Serial.putHex(subsystem_id);
+            hal.Serial.puts("\n");
+            // Accept device_id 0x1001 directly (transitional virtio-blk)
+            if (dev.device_id == 0x1001) {
+                return dev;
+            }
+            // For other IDs, check subsystem ID (2 = block)
             if (subsystem_id == 2) { // VIRTIO_ID_BLOCK
                 return dev;
             }
-            // Also accept transitional device ID 0x1001 with subsystem 2
-            // Some QEMU versions use device_id = 0x1001 for virtio-blk
         }
     }
     return null;

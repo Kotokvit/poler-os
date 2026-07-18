@@ -423,7 +423,15 @@ fn testPolerCore() void {
 // ============================================================================
 
 export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(.C) void {
+    // Very early debug: confirm we reached Zig code
+    hal.Serial.puts("[KERNEL] Zig entry reached! magic=0x");
+    hal.Serial.putHex(multiboot_magic);
+    hal.Serial.puts(" mbi=0x");
+    hal.Serial.putHex(multiboot_info);
+    hal.Serial.puts("\n");
+
     // Detect multiboot protocol type from magic value
+    hal.Serial.puts("[KERNEL] Detecting multiboot type...\n");
     const mb_type: pmm.MultibootType = if (multiboot_magic == multiboot2.BOOTLOADER_MAGIC)
         pmm.MultibootType.mb2
     else if (multiboot_magic == multiboot1.BOOTLOADER_MAGIC)
@@ -432,24 +440,59 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
         pmm.MultibootType.mb2; // fallback — assume MB2 for unknown loaders
 
     // 0. Detect and Initialize Framebuffer if available from Multiboot2
+    hal.Serial.puts("[KERNEL] Checking framebuffer...\n");
     if (mb_type == .mb2) {
+        hal.Serial.puts("[KERNEL] mb2 path\n");
         const parser = multiboot2.Parser.init(multiboot_info);
+        hal.Serial.puts("[KERNEL] Parser init done\n");
         if (parser.findTag(8)) |tag_addr| {
-            const fb_tag: *const multiboot2.FramebufferTag = @ptrFromInt(tag_addr);
-            if (fb_tag.fb_addr != 0 and fb_tag.fb_width > 0 and fb_tag.fb_height > 0) {
+            hal.Serial.puts("[KERNEL] FB tag found at 0x");
+            hal.Serial.putHex(tag_addr);
+            hal.Serial.puts("\n");
+            // Read framebuffer tag fields using byte-level access to avoid
+            // alignment panics — GRUB may place tags at unaligned addresses
+            const fb_ptr: [*]const volatile u8 = @ptrFromInt(tag_addr);
+            // Tag layout: type(4) + size(4) + fb_addr(8) + fb_pitch(4) + fb_width(4) + fb_height(4) + fb_bpp(1) + fb_type(1) + reserved(2)
+            const fb_addr = @as(u64, fb_ptr[8]) | (@as(u64, fb_ptr[9]) << 8) | (@as(u64, fb_ptr[10]) << 16) | (@as(u64, fb_ptr[11]) << 24) |
+                (@as(u64, fb_ptr[12]) << 32) | (@as(u64, fb_ptr[13]) << 40) | (@as(u64, fb_ptr[14]) << 48) | (@as(u64, fb_ptr[15]) << 56);
+            const fb_pitch = @as(u32, fb_ptr[16]) | (@as(u32, fb_ptr[17]) << 8) | (@as(u32, fb_ptr[18]) << 16) | (@as(u32, fb_ptr[19]) << 24);
+            const fb_width = @as(u32, fb_ptr[20]) | (@as(u32, fb_ptr[21]) << 8) | (@as(u32, fb_ptr[22]) << 16) | (@as(u32, fb_ptr[23]) << 24);
+            const fb_height = @as(u32, fb_ptr[24]) | (@as(u32, fb_ptr[25]) << 8) | (@as(u32, fb_ptr[26]) << 16) | (@as(u32, fb_ptr[27]) << 24);
+            const fb_bpp = fb_ptr[28];
+            const fb_type = fb_ptr[29];
+            hal.Serial.puts("[KERNEL] FB fields read OK\n");
+            hal.Serial.putHex(fb_addr);
+            hal.Serial.puts(" bpp=");
+            hal.Serial.putDecimal(fb_bpp);
+            hal.Serial.puts(" type=");
+            hal.Serial.putDecimal(fb_type);
+            hal.Serial.puts(" w=");
+            hal.Serial.putDecimal(fb_width);
+            hal.Serial.puts(" h=");
+            hal.Serial.putDecimal(fb_height);
+            hal.Serial.puts("\n");
+            if (fb_addr != 0 and fb_width >= 320 and fb_height >= 200 and fb_bpp >= 16 and fb_addr != 0xB8000) {
+                // Only initialize pixel-based framebuffer.
+                // Skip VGA text mode (addr=0xB8000, small w/h like 80x25)
+                // which GRUB sometimes incorrectly reports as bpp=16.
+                hal.Serial.puts("[KERNEL] Initializing framebuffer...\n");
                 framebuffer.init_from_multiboot(
-                    fb_tag.fb_addr,
-                    fb_tag.fb_pitch,
-                    fb_tag.fb_width,
-                    fb_tag.fb_height,
-                    fb_tag.fb_bpp,
-                    fb_tag.fb_type,
+                    fb_addr,
+                    fb_pitch,
+                    fb_width,
+                    fb_height,
+                    fb_bpp,
+                    fb_type,
                 );
+                hal.Serial.puts("[KERNEL] FB init done, clearing...\n");
                 framebuffer.clear();
                 use_fb = true;
             }
+        } else {
+            hal.Serial.puts("[KERNEL] No FB tag found\n");
         }
     }
+    hal.Serial.puts("[KERNEL] Framebuffer check done\n");
 
     // 1. Initialize VGA (if framebuffer not active)
     if (!use_fb) {
@@ -706,8 +749,8 @@ fn sys_print(str: []const u8) void {
 }
 
 fn task1() noreturn {
-    sys_print("\n=== POLER-OS v0.7.0 Interactive Shell ===\n");
-    sys_print("Type 'help' for commands.\n\n");
+    sys_print("\n=== POLER-OS v0.8.0 Interactive Shell ===\n");
+    sys_print("Type 'help' for commands. Serial input enabled (-serial stdio).\n\n");
     
     var buf: [128]u8 = undefined;
     var len: usize = 0;
@@ -715,7 +758,17 @@ fn task1() noreturn {
     sys_print("poler> ");
     
     while (true) {
-        const ch = sys_read_key();
+        // Dual input: check both keyboard and serial
+        var ch: u8 = 0;
+        
+        // Try keyboard first (syscall 2)
+        ch = sys_read_key();
+        
+        // If no keyboard input, try serial (syscall 6)
+        if (ch == 0) {
+            ch = sys_read_serial();
+        }
+        
         if (ch != 0) {
             if (ch == '\n') {
                 sys_print("\n");
@@ -726,6 +779,11 @@ fn task1() noreturn {
                 }
                 sys_print("poler> ");
             } else if (ch == '\x08') { // Backspace
+                if (len > 0) {
+                    len -= 1;
+                    sys_print("\x08 \x08");
+                }
+            } else if (ch == '\x7F') { // DEL (common in serial terminals)
                 if (len > 0) {
                     len -= 1;
                     sys_print("\x08 \x08");
@@ -755,6 +813,16 @@ fn sys_read_key() u8 {
     );
 }
 
+/// Syscall 6: Read serial character (non-blocking)
+fn sys_read_serial() u8 {
+    return asm volatile (
+        "syscall"
+        : [ret] "={rax}" (-> u8),
+        : [num] "{rax}" (@as(u64, 6)),
+        : "rcx", "r11", "memory"
+    );
+}
+
 fn sys_clear_screen() void {
     asm volatile (
         "syscall"
@@ -780,8 +848,9 @@ fn execute_command(cmd: []const u8) void {
         sys_print("  rm <f>    - Delete a file\n");
         sys_print("  disk      - Show disk info\n");
     } else if (eq(cmd, "about")) {
-        sys_print("POLER-OS v0.7.0 (x86_64 Long Mode)\n");
+        sys_print("POLER-OS v0.8.0 (x86_64 Long Mode)\n");
         sys_print("Cognitive Semantic Runtime Environment.\n");
+        sys_print("Dual-personality: NT API + POSIX. Serial input enabled.\n");
     } else if (eq(cmd, "clear")) {
         sys_clear_screen();
     } else if (eq(cmd, "poler")) {
