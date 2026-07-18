@@ -41,6 +41,14 @@ pub const Task = struct {
     kernel_stack: [8192]u8 align(16), // Ring 0 stack (8KB — larger for safety)
     cr3: u64, // Per-process PML4 physical address (0 = use kernel CR3)
     user_stack_top: u64, // Top of user stack (virtual address, for reference/cleanup)
+
+    // v1.1.0: TLS / Thread-Local Storage support
+    // Each thread has its own TCB (Thread Control Block) and FS_BASE
+    // pointing to it. When the scheduler switches to this task,
+    // it restores FS_BASE so the thread can access its TLS variables
+    // via %fs:offset (Local Executable model) or __tls_get_addr (GD model).
+    tcb_vaddr: u64 = 0, // Virtual address of this thread's TCB (0 = no TLS)
+    fs_base: u64 = 0, // Value to load into MSR_FS_BASE on context switch
 };
 
 pub var tasks: [MAX_TASKS]Task = undefined;
@@ -326,6 +334,15 @@ pub fn schedule(current_rsp: u64) callconv(.C) u64 {
     if (next_cr3 != current_cr3) {
         hal.writeCr3(next_cr3);
         current_cr3 = next_cr3;
+    }
+
+    // v1.1.0: Switch FS_BASE for TLS (Thread-Local Storage)
+    // Each thread has its own TCB at a unique virtual address.
+    // The FS_BASE MSR points to the TCB, so %fs:0 accesses the TCB.
+    // This must be done AFTER the CR3 switch so the TCB address
+    // is valid in the new address space.
+    if (next_task.fs_base != 0) {
+        hal.writeFsBase(next_task.fs_base);
     }
 
     return next_task.rsp;
