@@ -513,6 +513,46 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
                     hal.Serial.puts("[KERNEL] FB init done, clearing...\n");
                     framebuffer.clear();
                     use_fb = true;
+
+                    // ── DIAGNOSTIC TEST PATTERN ──
+                    // This draws visual markers so we can diagnose the vertical-text bug.
+                    // After seeing the pattern, we'll know if x/y are swapped or not.
+                    //
+                    // RED horizontal band: top 16 rows (y=0..15) — should appear as a bar across the TOP
+                    // GREEN vertical band: left 8 columns (x=0..7) — should appear as a bar on the LEFT
+                    // If RED appears on the LEFT and GREEN on the TOP → x and y are SWAPPED
+                    {
+                        // Red band at top: all pixels where y < 16
+                        var ty: u32 = 0;
+                        while (ty < 16) : (ty += 1) {
+                            var tx: u32 = 8; // start after green band
+                            while (tx < fb_width) : (tx += 1) {
+                                framebuffer.put_pixel(tx, ty, 0xFF, 0x00, 0x00);
+                            }
+                        }
+                        // Green band on left: all pixels where x < 8
+                        var gy: u32 = 16; // start after red band
+                        while (gy < fb_height) : (gy += 1) {
+                            var gx: u32 = 0;
+                            while (gx < 8) : (gx += 1) {
+                                framebuffer.put_pixel(gx, gy, 0x00, 0xFF, 0x00);
+                            }
+                        }
+                        // Blue square at (100, 100) — 20x20 pixels
+                        var by: u32 = 0;
+                        while (by < 20) : (by += 1) {
+                            var bx: u32 = 0;
+                            while (bx < 20) : (bx += 1) {
+                                framebuffer.put_pixel(100 + bx, 100 + by, 0x00, 0x00, 0xFF);
+                            }
+                        }
+                        // White text "TEST" to check text orientation
+                        framebuffer.set_cursor(20, 32);
+                        framebuffer.puts_color("RED=TOP GREEN=LEFT BLUE=(100,100)", 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00);
+                        framebuffer.set_cursor(20, 52);
+                        framebuffer.puts_color("If RED is LEFT and GREEN is TOP: x/y SWAPPED!", 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00);
+                    }
+                    // ── END DIAGNOSTIC ──
                 }
             }
         } else {
