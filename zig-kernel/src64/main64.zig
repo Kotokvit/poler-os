@@ -511,48 +511,83 @@ export fn poler_kernel_main(multiboot_magic: u32, multiboot_info: u64) callconv(
                         fb_type,
                     );
                     hal.Serial.puts("[KERNEL] FB init done, clearing...\n");
+                    
+                    // ── FIX: Remap framebuffer pages as Uncacheable (PCD=1) ──
+                    // The boot64.S identity map uses 2MB pages with flags 0x87
+                    // (Present+RW+User+PageSize) which enables caching.
+                    // The VGA framebuffer is MMIO — writes must reach the device
+                    // directly, not sit in the CPU cache. Without PCD, the CPU
+                    // caches framebuffer writes and the VGA device never sees them,
+                    // causing the "vertical text" / "invisible text" bug that has
+                    // existed since the first version of POLER-OS.
+                    //
+                    // Fix: Update the PD entry for the framebuffer's 2MB page(s)
+                    // to add PCD (bit 4) and PWT (bit 3) flags.
+                    // New flags: 0x87 | 0x10 (PCD) | 0x08 (PWT) = 0x9F
+                    // Or just PCD: 0x87 | 0x10 = 0x97
+                    {
+                        const fb_phys = framebuffer.getAddr();
+                        const fb_total_size = @as(u64, framebuffer.getHeight()) * @as(u64, framebuffer.getPitch());
+                        
+                        // Calculate which 2MB PD entries cover the framebuffer
+                        const pd_start = fb_phys / 0x200000; // 2MB page index
+                        const pd_end = (fb_phys + fb_total_size + 0x1FFFFF) / 0x200000;
+                        
+                        hal.Serial.puts("[FB-FIX] Remapping FB pages as uncacheable\n");
+                        hal.Serial.puts("[FB-FIX] FB phys=");
+                        hal.Serial.putHex(fb_phys);
+                        hal.Serial.puts(" size=");
+                        hal.Serial.putHex(fb_total_size);
+                        hal.Serial.puts(" PD entries ");
+                        hal.Serial.putDecimal(pd_start);
+                        hal.Serial.puts("-");
+                        hal.Serial.putDecimal(pd_end);
+                        hal.Serial.puts("\n");
+                        
+                        // PD is at pd_addr (defined in linker script / boot64.S)
+                        // We need to find it. It was set up in boot64.S at pd_addr.
+                        // In the kernel, we can compute it from the known layout.
+                        // The PML4 is at pml4_addr, PDPT at pdpt_addr, PD at pd_addr.
+                        // These are in .bss.boot section.
+                        // Since we're identity-mapped, we can use the addresses directly.
+                        
+                        // Get PD base address from the linker symbols
+                        // pd_addr is defined in the linker script as the start of the PD area
+                        // We use @extern to get the address of this linker symbol
+                        const pd_base_addr: usize = @intFromPtr(@extern(*u8, .{ .name = "pd_addr" }));
+                        const pd_base: [*]volatile u64 = @ptrFromInt(pd_base_addr);
+                        
+                        var pd_idx: u64 = pd_start;
+                        while (pd_idx <= pd_end) : (pd_idx += 1) {
+                            const old_entry = pd_base[pd_idx];
+                            // Add PCD (0x10) and PWT (0x08) flags
+                            const new_entry = old_entry | 0x18; // PCD + PWT = Write-Combining hint
+                            pd_base[pd_idx] = new_entry;
+                            
+                            hal.Serial.puts("[FB-FIX] PD[");
+                            hal.Serial.putDecimal(pd_idx);
+                            hal.Serial.puts("] ");
+                            hal.Serial.putHex(old_entry);
+                            hal.Serial.puts(" -> ");
+                            hal.Serial.putHex(new_entry);
+                            hal.Serial.puts("\n");
+                        }
+                        
+                        // Flush TLB for the framebuffer region
+                        // Use invlpg for each 2MB page
+                        pd_idx = pd_start;
+                        while (pd_idx <= pd_end) : (pd_idx += 1) {
+                            const page_addr = pd_idx * 0x200000;
+                            asm volatile ("invlpg (%[addr])"
+                                :
+                                : [addr] "r" (page_addr)
+                            );
+                        }
+                        hal.Serial.puts("[FB-FIX] TLB flushed, FB now uncacheable\n");
+                    }
+                    
                     framebuffer.clear();
                     use_fb = true;
-
-                    // ── DIAGNOSTIC TEST PATTERN ──
-                    // This draws visual markers so we can diagnose the vertical-text bug.
-                    // After seeing the pattern, we'll know if x/y are swapped or not.
-                    //
-                    // RED horizontal band: top 16 rows (y=0..15) — should appear as a bar across the TOP
-                    // GREEN vertical band: left 8 columns (x=0..7) — should appear as a bar on the LEFT
-                    // If RED appears on the LEFT and GREEN on the TOP → x and y are SWAPPED
-                    {
-                        // Red band at top: all pixels where y < 16
-                        var ty: u32 = 0;
-                        while (ty < 16) : (ty += 1) {
-                            var tx: u32 = 8; // start after green band
-                            while (tx < fb_width) : (tx += 1) {
-                                framebuffer.put_pixel(tx, ty, 0xFF, 0x00, 0x00);
-                            }
-                        }
-                        // Green band on left: all pixels where x < 8
-                        var gy: u32 = 16; // start after red band
-                        while (gy < fb_height) : (gy += 1) {
-                            var gx: u32 = 0;
-                            while (gx < 8) : (gx += 1) {
-                                framebuffer.put_pixel(gx, gy, 0x00, 0xFF, 0x00);
-                            }
-                        }
-                        // Blue square at (100, 100) — 20x20 pixels
-                        var by: u32 = 0;
-                        while (by < 20) : (by += 1) {
-                            var bx: u32 = 0;
-                            while (bx < 20) : (bx += 1) {
-                                framebuffer.put_pixel(100 + bx, 100 + by, 0x00, 0x00, 0xFF);
-                            }
-                        }
-                        // White text "TEST" to check text orientation
-                        framebuffer.set_cursor(20, 32);
-                        framebuffer.puts_color("RED=TOP GREEN=LEFT BLUE=(100,100)", 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00);
-                        framebuffer.set_cursor(20, 52);
-                        framebuffer.puts_color("If RED is LEFT and GREEN is TOP: x/y SWAPPED!", 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00);
-                    }
-                    // ── END DIAGNOSTIC ──
                 }
             }
         } else {

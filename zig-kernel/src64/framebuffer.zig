@@ -401,6 +401,13 @@ pub fn puts(str: []const u8) void {
     if (!fb.valid) return;
     
     for (str) |ch| {
+        // Skip UTF-8 continuation bytes (0x80-0xBF).
+        // UTF-8 multi-byte characters (like ╔═╗║╚╝) are 3 bytes each,
+        // but we only render ASCII (0x00-0x7F). Without this skip,
+        // the cursor would advance 3x per Unicode character, causing
+        // premature line wrapping and the "vertical text" bug.
+        if (ch >= 0x80 and ch <= 0xBF) continue;
+        
         if (ch == '\n') {
             cursor_x = 0;
             cursor_y += CHAR_H;
@@ -408,6 +415,17 @@ pub fn puts(str: []const u8) void {
             if (cursor_x >= CHAR_W) {
                 cursor_x -= CHAR_W;
                 draw_char(' ', cursor_x, cursor_y, 0xD4, 0xD4, 0xD4, 0x0B, 0x11, 0x20);
+            }
+        } else if (ch >= 0xC0) {
+            // UTF-8 lead byte (0xC0-0xFF): draw as blank/placeholder
+            // This prevents the cursor from advancing for each byte of
+            // a multi-byte sequence. We draw ONE blank cell for the
+            // entire Unicode character (lead byte only).
+            draw_char(' ', cursor_x, cursor_y, 0xD4, 0xD4, 0xD4, 0x0B, 0x11, 0x20);
+            cursor_x += CHAR_W;
+            if (cursor_x >= fb.width) {
+                cursor_x = 0;
+                cursor_y += CHAR_H;
             }
         } else {
             draw_char(ch, cursor_x, cursor_y, 0xD4, 0xD4, 0xD4, 0x0B, 0x11, 0x20);
@@ -431,6 +449,9 @@ pub fn puts_color(str: []const u8, fg_r: u8, fg_g: u8, fg_b: u8, bg_r: u8, bg_g:
     if (!fb.valid) return;
     
     for (str) |ch| {
+        // Skip UTF-8 continuation bytes (0x80-0xBF)
+        if (ch >= 0x80 and ch <= 0xBF) continue;
+        
         if (ch == '\n') {
             cursor_x = 0;
             cursor_y += CHAR_H;
@@ -438,6 +459,14 @@ pub fn puts_color(str: []const u8, fg_r: u8, fg_g: u8, fg_b: u8, bg_r: u8, bg_g:
             if (cursor_x >= CHAR_W) {
                 cursor_x -= CHAR_W;
                 draw_char(' ', cursor_x, cursor_y, fg_r, fg_g, fg_b, bg_r, bg_g, bg_b);
+            }
+        } else if (ch >= 0xC0) {
+            // UTF-8 lead byte: draw ONE blank cell for the whole character
+            draw_char(' ', cursor_x, cursor_y, fg_r, fg_g, fg_b, bg_r, bg_g, bg_b);
+            cursor_x += CHAR_W;
+            if (cursor_x >= fb.width) {
+                cursor_x = 0;
+                cursor_y += CHAR_H;
             }
         } else {
             draw_char(ch, cursor_x, cursor_y, fg_r, fg_g, fg_b, bg_r, bg_g, bg_b);
