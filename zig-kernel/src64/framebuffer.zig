@@ -472,12 +472,29 @@ fn scroll_up() void {
         dst[i] = src[i];
     }
     
-    // Clear last row
+    // Clear last row with background color (0x0B1120 — POLER-OS dark blue)
     const clear_offset = @as(u64, fb.height - CHAR_H) * @as(u64, fb.pitch);
-    const clear_ptr: [*]volatile u8 = @ptrFromInt(@as(usize, @intCast(fb.addr + clear_offset)));
-    var j: u64 = 0;
-    while (j < @as(u64, CHAR_H) * @as(u64, fb.pitch)) : (j += 1) {
-        clear_ptr[j] = 0;
+    
+    var row: u64 = 0;
+    while (row < CHAR_H) : (row += 1) {
+        const row_ptr: [*]volatile u8 = @ptrFromInt(@as(usize, @intCast(fb.addr + clear_offset + row * @as(u64, fb.pitch))));
+        if (fb.bpp == 32) {
+            const row32: [*]volatile u32 = @ptrCast(@alignCast(row_ptr));
+            const bg_pixel: u32 = if (fb.pixel_type == @intFromEnum(PixelFormat.bgr888))
+                @as(u32, 0x20) | (@as(u32, 0x11) << 8) | (@as(u32, 0x0B) << 16)
+            else
+                @as(u32, 0x0B) | (@as(u32, 0x11) << 8) | (@as(u32, 0x20) << 16);
+            var col: u64 = 0;
+            while (col < fb.width) : (col += 1) {
+                row32[col] = bg_pixel;
+            }
+        } else {
+            // For 8-bit or 16-bit modes, use put_pixel for proper color mapping
+            var col: u32 = 0;
+            while (col < fb.width) : (col += 1) {
+                put_pixel(col, @intCast((fb.height - CHAR_H) + @as(u32, @intCast(row))), 0x0B, 0x11, 0x20);
+            }
+        }
     }
 }
 
